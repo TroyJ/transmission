@@ -58,6 +58,7 @@ class Wishlist::Impl
             , block_span{ mediator->block_span(piece_in) }
             , raw_block_span{ block_span }
             , replication{ mediator->count_piece_replication(piece_in) }
+            , qb_first_last_boosted{ mediator->is_qb_first_last_boosted(piece_in) }
             , priority{ mediator->priority(piece_in) }
             , salt{ salt_in }
         {
@@ -98,6 +99,7 @@ class Wishlist::Impl
         // - calculating their values involves sifting through bitfield(s),
         //   which is expensive.
         size_t replication;
+        bool qb_first_last_boosted;
         tr_priority_t priority;
 
         tr_piece_index_t salt;
@@ -620,6 +622,12 @@ int Wishlist::Impl::Candidate::compare(Candidate const& that) const noexcept
     if (auto const val = tr_compare_3way(std::size(unrequested), std::size(that.unrequested)); val != 0)
     {
         return val;
+    }
+
+    // prefer qB-style first/last boosted pieces over middle pieces
+    if (auto const val = tr_compare_3way(qb_first_last_boosted, that.qb_first_last_boosted); val != 0)
+    {
+        return -val;
     }
 
     // prefer higher priority

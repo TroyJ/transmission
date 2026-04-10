@@ -9,6 +9,7 @@
 #error only libtransmission should #include this header.
 #endif
 
+#include <algorithm>
 #include <cstddef> // size_t
 #include <cstdint> // uint64_t, uint16_t
 #include <ctime>
@@ -429,6 +430,41 @@ struct tr_torrent
     [[nodiscard]] tr_priority_t piece_priority(tr_piece_index_t piece) const
     {
         return file_priorities_.piece_priority(piece);
+    }
+
+    [[nodiscard]] bool piece_is_qb_first_last_boosted(tr_piece_index_t piece) const
+    {
+        auto const piece_size_bytes = uint64_t{ piece_size() };
+        if (piece_size_bytes == 0U)
+        {
+            return false;
+        }
+
+        for (tr_file_index_t file = 0, n = metainfo_.file_count(); file < n; ++file)
+        {
+            if (!file_is_wanted(file))
+            {
+                continue;
+            }
+
+            auto const file_size_bytes = uint64_t{ metainfo_.file_size(file) };
+            if (file_size_bytes == 0U)
+            {
+                continue;
+            }
+
+            auto const [begin, end] = piece_span_for_file(file);
+            auto const piece_count_in_file = end - begin;
+            auto const computed_window_pieces = (file_size_bytes + (piece_size_bytes * 100U) - 1U) / (piece_size_bytes * 100U);
+            auto const window_pieces = std::min<uint64_t>(piece_count_in_file, computed_window_pieces);
+
+            if ((piece >= begin) && (piece < end) && ((piece < (begin + window_pieces)) || (piece >= (end - window_pieces))))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     void set_file_priorities(tr_file_index_t const* files, tr_file_index_t file_count, tr_priority_t priority);

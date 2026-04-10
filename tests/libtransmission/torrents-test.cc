@@ -4,6 +4,7 @@
 // License text can be found in the licenses/ folder.
 
 #include <array>
+#include <cstdint>
 #include <ctime> // time, size_t, time_t
 #include <memory>
 #include <set>
@@ -316,4 +317,55 @@ TEST_F(TorrentsPieceSpanTest, exposesFilePieceSpan)
     auto file_view = tr_torrentFile(tor, 0);
     EXPECT_EQ(file_view.beginPiece, 0);
     EXPECT_EQ(file_view.endPiece, 32);
+}
+
+TEST_F(TorrentsPieceSpanTest, exposesQbFirstLastBoostedPieces)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+
+    auto const is_expected_boosted = [tor](tr_piece_index_t piece)
+    {
+        auto const piece_size_bytes = uint64_t{ tor->piece_size() };
+        auto expected = false;
+
+        for (tr_file_index_t file = 0, n = tor->file_count(); file < n; ++file)
+        {
+            if (!tor->file_is_wanted(file))
+            {
+                continue;
+            }
+
+            auto const file_size_bytes = uint64_t{ tor->file_size(file) };
+            if (file_size_bytes == 0U)
+            {
+                continue;
+            }
+
+            auto const [begin, end] = tor->piece_span_for_file(file);
+            auto const piece_count_in_file = end - begin;
+            auto const computed_window_pieces = (file_size_bytes + (piece_size_bytes * 100U) - 1U) / (piece_size_bytes * 100U);
+            auto const window_pieces = std::min<uint64_t>(piece_count_in_file, computed_window_pieces);
+
+            if ((piece >= begin) && (piece < end) && ((piece < (begin + window_pieces)) || (piece >= (end - window_pieces))))
+            {
+                expected = true;
+                break;
+            }
+        }
+
+        return expected;
+    };
+
+    for (tr_piece_index_t piece = 0, n = tor->piece_count(); piece < n; ++piece)
+    {
+        EXPECT_EQ(is_expected_boosted(piece), tor->piece_is_qb_first_last_boosted(piece)) << "piece=" << piece;
+    }
+
+    auto constexpr File0 = tr_file_index_t{ 0 };
+    tor->set_files_wanted(&File0, 1U, false);
+
+    for (tr_piece_index_t piece = 0, n = tor->piece_count(); piece < n; ++piece)
+    {
+        EXPECT_EQ(is_expected_boosted(piece), tor->piece_is_qb_first_last_boosted(piece)) << "piece=" << piece;
+    }
 }

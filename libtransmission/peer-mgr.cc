@@ -388,6 +388,7 @@ public:
         [[nodiscard]] tr_block_span_t block_span(tr_piece_index_t piece) const override;
         [[nodiscard]] tr_piece_index_t piece_count() const override;
         [[nodiscard]] tr_priority_t priority(tr_piece_index_t piece) const override;
+        [[nodiscard]] bool is_qb_first_last_boosted(tr_piece_index_t piece) const override;
 
         [[nodiscard]] libtransmission::ObserverTag observe_files_wanted_changed(
             libtransmission::SimpleObservable<tr_torrent*, tr_file_index_t const*, tr_file_index_t, bool>::Observer observer)
@@ -1051,6 +1052,11 @@ tr_piece_index_t tr_swarm::WishlistMediator::piece_count() const
 tr_priority_t tr_swarm::WishlistMediator::priority(tr_piece_index_t piece) const
 {
     return tor_.piece_priority(piece);
+}
+
+bool tr_swarm::WishlistMediator::is_qb_first_last_boosted(tr_piece_index_t piece) const
+{
+    return tor_.piece_is_qb_first_last_boosted(piece);
 }
 
 libtransmission::ObserverTag tr_swarm::WishlistMediator::observe_files_wanted_changed(

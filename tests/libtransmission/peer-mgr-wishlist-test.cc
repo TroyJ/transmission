@@ -25,6 +25,7 @@ protected:
     {
         mutable std::map<tr_block_index_t, uint8_t> active_request_count_;
         mutable std::map<tr_piece_index_t, tr_block_span_t> block_span_;
+        mutable std::map<tr_piece_index_t, bool> qb_first_last_boosted_;
         mutable std::map<tr_piece_index_t, tr_priority_t> piece_priority_;
         mutable std::map<tr_piece_index_t, size_t> piece_replication_;
         mutable std::set<tr_block_index_t> client_has_block_;
@@ -83,6 +84,11 @@ protected:
         [[nodiscard]] tr_priority_t priority(tr_piece_index_t piece) const override
         {
             return piece_priority_[piece];
+        }
+
+        [[nodiscard]] bool is_qb_first_last_boosted(tr_piece_index_t piece) const override
+        {
+            return qb_first_last_boosted_[piece];
         }
 
         [[nodiscard]] libtransmission::ObserverTag observe_files_wanted_changed(
@@ -606,6 +612,123 @@ TEST_F(PeerMgrWishlistTest, prefersNearlyCompletePieces)
         EXPECT_EQ(10U, requested.count(0, 100));
         EXPECT_EQ(10U, requested.count(100, 200));
         EXPECT_EQ(0U, requested.count(200, 300));
+    }
+}
+
+TEST_F(PeerMgrWishlistTest, prefersQbBoostedPiecesOverHighPriorityPieces)
+{
+    auto const get_spans = [this](size_t n_wanted)
+    {
+        auto mediator = MockMediator{ *this };
+
+        mediator.block_span_[0] = { 0, 100 };
+        mediator.block_span_[1] = { 100, 200 };
+        mediator.block_span_[2] = { 200, 300 };
+
+        mediator.piece_replication_[0] = 1;
+        mediator.piece_replication_[1] = 1;
+        mediator.piece_replication_[2] = 1;
+
+        for (tr_piece_index_t i = 0; i < mediator.piece_count(); ++i)
+        {
+            mediator.client_wants_piece_.insert(i);
+        }
+
+        mediator.qb_first_last_boosted_[0] = true;
+        mediator.piece_priority_[1] = TR_PRI_HIGH;
+
+        return Wishlist{ mediator }.next(n_wanted, PeerHasAllPieces);
+    };
+
+    static auto constexpr NumRuns = 1000;
+    for (int run = 0; run < NumRuns; ++run)
+    {
+        auto const spans = get_spans(10);
+        auto requested = tr_bitfield{ 300 };
+        for (auto const& [begin, end] : spans)
+        {
+            requested.set_span(begin, end);
+        }
+        EXPECT_EQ(10U, requested.count());
+        EXPECT_EQ(10U, requested.count(0, 100));
+        EXPECT_EQ(0U, requested.count(100, 200));
+        EXPECT_EQ(0U, requested.count(200, 300));
+    }
+}
+
+TEST_F(PeerMgrWishlistTest, prefersPartiallyRequestedPiecesOverQbBoostedPieces)
+{
+    auto mediator = MockMediator{ *this };
+
+    mediator.block_span_[0] = { 0, 100 };
+    mediator.block_span_[1] = { 100, 200 };
+
+    mediator.piece_replication_[0] = 1;
+    mediator.piece_replication_[1] = 1;
+
+    mediator.client_wants_piece_.insert(0);
+    mediator.client_wants_piece_.insert(1);
+
+    mediator.qb_first_last_boosted_[0] = true;
+
+    auto wishlist = Wishlist{ mediator };
+    sent_request_.emit(nullptr, nullptr, { 100, 110 });
+
+    auto const spans = wishlist.next(90, PeerHasAllPieces);
+    auto requested = tr_bitfield{ 200 };
+    for (auto const& [begin, end] : spans)
+    {
+        requested.set_span(begin, end);
+    }
+
+    EXPECT_EQ(90U, requested.count());
+    EXPECT_EQ(0U, requested.count(0, 100));
+    EXPECT_EQ(90U, requested.count(100, 200));
+}
+
+TEST_F(PeerMgrWishlistTest, qbBoostedPiecesRespectSequentialDownloadFromPiece)
+{
+    auto const get_spans = [this](size_t n_wanted)
+    {
+        auto mediator = MockMediator{ *this };
+
+        mediator.block_span_[0] = { 0, 100 };
+        mediator.block_span_[1] = { 100, 200 };
+        mediator.block_span_[2] = { 200, 300 };
+        mediator.block_span_[3] = { 300, 400 };
+
+        mediator.piece_replication_[0] = 1;
+        mediator.piece_replication_[1] = 1;
+        mediator.piece_replication_[2] = 1;
+        mediator.piece_replication_[3] = 1;
+
+        for (tr_piece_index_t i = 0; i < mediator.piece_count(); ++i)
+        {
+            mediator.client_wants_piece_.insert(i);
+        }
+
+        mediator.qb_first_last_boosted_[1] = true;
+        mediator.qb_first_last_boosted_[2] = true;
+        mediator.is_sequential_download_ = true;
+        mediator.sequential_download_from_piece_ = 2;
+
+        return Wishlist{ mediator }.next(n_wanted, PeerHasAllPieces);
+    };
+
+    static auto constexpr NumRuns = 1000;
+    for (int run = 0; run < NumRuns; ++run)
+    {
+        auto const spans = get_spans(100);
+        auto requested = tr_bitfield{ 400 };
+        for (auto const& [begin, end] : spans)
+        {
+            requested.set_span(begin, end);
+        }
+        EXPECT_EQ(100U, requested.count());
+        EXPECT_EQ(0U, requested.count(0, 100));
+        EXPECT_EQ(0U, requested.count(100, 200));
+        EXPECT_EQ(100U, requested.count(200, 300));
+        EXPECT_EQ(0U, requested.count(300, 400));
     }
 }
 
