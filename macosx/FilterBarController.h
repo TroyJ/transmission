@@ -11,6 +11,7 @@ extern FilterType const FilterTypeActive;
 extern FilterType const FilterTypeDownload;
 extern FilterType const FilterTypeSeed;
 extern FilterType const FilterTypePause;
+extern FilterType const FilterTypeMoving;
 extern FilterType const FilterTypeError;
 
 typedef NSString* FilterSearchType NS_TYPED_EXTENSIBLE_ENUM;
@@ -40,6 +41,7 @@ extern NSInteger const kGroupFilterAllTag;
         downloading:(NSUInteger)downloading
             seeding:(NSUInteger)seeding
              paused:(NSUInteger)paused
+             moving:(NSUInteger)moving
               error:(NSUInteger)error;
 
 @end

@@ -1498,6 +1498,12 @@ void tr_sessionClose(tr_session* session, size_t timeout_secs)
     delete session;
 }
 
+void tr_sessionCheckpointRelocations(tr_session* session)
+{
+    TR_ASSERT(session != nullptr);
+    session->checkpoint_relocations_for_shutdown();
+}
+
 namespace
 {
 namespace load_torrents_helpers
@@ -2147,6 +2153,14 @@ void tr_session::relocate_remove(tr_torrent const* const tor)
 bool tr_session::relocate_cancel(tr_torrent const* const tor)
 {
     return relocator_ ? relocator_->cancel(tor->info_hash()) : false;
+}
+
+void tr_session::checkpoint_relocations_for_shutdown()
+{
+    if (relocator_)
+    {
+        relocator_->prepare_shutdown();
+    }
 }
 
 // ---

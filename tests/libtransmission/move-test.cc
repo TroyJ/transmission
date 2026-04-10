@@ -47,6 +47,14 @@ auto constexpr MaxWaitMsec = 5000;
     return state != TR_RELOC_ERROR && state != TR_RELOC_CANCELLED;
 }
 
+[[nodiscard]] bool waitForRelocationState(
+    tr_torrent* const tor,
+    tr_torrent_relocation_state const expected_state,
+    size_t const max_wait_msec)
+{
+    return waitFor([tor, expected_state]() { return tr_torrentStat(tor)->relocationState == expected_state; }, max_wait_msec);
+}
+
 class IncompleteDirTest
     : public SessionTest
     , public ::testing::WithParamInterface<std::pair<std::string, std::string>>
@@ -231,6 +239,54 @@ TEST_F(MoveTest, relocationControlPredicates)
     EXPECT_FALSE(tr_torrentCanRetryRelocation(tor));
     EXPECT_TRUE(tr_torrentCanResumeRelocation(tor));
     EXPECT_FALSE(tr_torrentCanCancelRelocation(tor));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(MoveTest, failedRelocationRestartsRunningTorrent)
+{
+    auto const invalid_target = tr_pathbuf{ session_->configDir(), "/invalid-target"sv };
+    auto const bad_fd = tr_sys_file_open(invalid_target, TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE | TR_SYS_FILE_TRUNCATE, 0600);
+    ASSERT_NE(TR_BAD_SYS_FILE, bad_fd);
+    ASSERT_TRUE(tr_sys_file_close(bad_fd, nullptr));
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(0, tr_torrentStat(tor)->leftUntilDone);
+
+    tr_torrentStartNow(tor);
+    ASSERT_TRUE(waitFor([tor]() { return tor->is_running(); }, MaxWaitMsec));
+
+    auto state = -1;
+    tr_torrentSetLocation(tor, invalid_target, true, &state);
+
+    ASSERT_TRUE(waitFor([&state]() { return state == TR_LOC_ERROR; }, MaxWaitMsec));
+    ASSERT_TRUE(waitForRelocationState(tor, TR_RELOC_ERROR, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([tor]() { return tor->is_running(); }, MaxWaitMsec));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(MoveTest, failedRelocationKeepsPausedTorrentStopped)
+{
+    auto const invalid_target = tr_pathbuf{ session_->configDir(), "/invalid-target"sv };
+    auto const bad_fd = tr_sys_file_open(invalid_target, TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE | TR_SYS_FILE_TRUNCATE, 0600);
+    ASSERT_NE(TR_BAD_SYS_FILE, bad_fd);
+    ASSERT_TRUE(tr_sys_file_close(bad_fd, nullptr));
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(0, tr_torrentStat(tor)->leftUntilDone);
+    ASSERT_FALSE(tor->is_running());
+
+    auto state = -1;
+    tr_torrentSetLocation(tor, invalid_target, true, &state);
+
+    ASSERT_TRUE(waitFor([&state]() { return state == TR_LOC_ERROR; }, MaxWaitMsec));
+    ASSERT_TRUE(waitForRelocationState(tor, TR_RELOC_ERROR, MaxWaitMsec));
+    EXPECT_FALSE(tor->is_running());
 
     tr_torrentRemove(tor, false, nullptr, nullptr);
 }

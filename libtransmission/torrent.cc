@@ -1977,6 +1977,7 @@ void tr_torrent::RelocateMediator::on_relocate_state_changed(
         [session = session_,
          torrent_id = torrent_id_,
          setme_state = setme_state_,
+         resume_after_relocation = snapshot_.resume_after_relocation,
          state,
          bytes_copied,
          bytes_total,
@@ -1996,6 +1997,11 @@ void tr_torrent::RelocateMediator::on_relocate_state_changed(
 
             tor->set_relocation_state(state, bytes_copied, bytes_total, rate_bps, error);
             session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
+
+            if (state == TR_RELOC_ERROR && resume_after_relocation && !tor->is_running())
+            {
+                tor->start(false, {});
+            }
         });
 }
 

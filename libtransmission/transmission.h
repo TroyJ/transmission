@@ -247,6 +247,14 @@ void tr_sessionReloadBlocklists(tr_session* session);
 void tr_sessionClose(tr_session* session, size_t timeout_secs = 15);
 
 /**
+ * @brief Ask relocation jobs to checkpoint and stop so app shutdown can proceed cleanly.
+ *
+ * This blocks until any active relocation copy has stopped at a chunk boundary and
+ * queued relocation work has quiesced.
+ */
+void tr_sessionCheckpointRelocations(tr_session* session);
+
+/**
  * @brief Return the session's configuration directory.
  *
  * This is where transmission stores its torrent files, .resume files,

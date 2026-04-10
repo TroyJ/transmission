@@ -8,6 +8,7 @@
 @import Sparkle;
 
 #include <atomic> /* atomic, atomic_fetch_add_explicit, memory_order_relaxed */
+#include <signal.h>
 
 #include <libtransmission/transmission.h>
 
@@ -359,12 +360,14 @@ static void removeKeRangerRansomware()
 @property(nonatomic) QLPreviewPanel* fPreviewPanel;
 @property(nonatomic) BOOL fQuitting;
 @property(nonatomic) BOOL fQuitRequested;
+@property(nonatomic) BOOL fTerminationWaitingForRelocation;
 @property(nonatomic, readonly) BOOL fPauseOnLaunch;
 
 @property(nonatomic) Badger* fBadger;
 
 @property(nonatomic) NSMutableArray<NSString*>* fAutoImportedNames;
 @property(nonatomic) NSTimer* fAutoImportTimer;
+@property(nonatomic) dispatch_source_t fSigtermSource;
 
 @property(nonatomic) NSURLSession* fSession;
 
@@ -388,6 +391,8 @@ static void removeKeRangerRansomware()
 - (InternetStateIndicatorSnapshot*)internetStateSnapshotForState:(InternetStateIndicatorState)state
                                                hasActiveTorrents:(BOOL)hasActiveTorrents
                                                              now:(NSTimeInterval)now;
+- (BOOL)hasActiveRelocation;
+- (void)beginTerminationAfterRelocationCheckpoint;
 
 - (void)removeTorrentsImpl:(NSArray<Torrent*>*)torrents deleteData:(BOOL)deleteData;
 
@@ -667,6 +672,22 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
         [SUUpdater sharedUpdater].delegate = self;
         _fQuitRequested = NO;
+        _fTerminationWaitingForRelocation = NO;
+
+        signal(SIGTERM, SIG_IGN);
+        _fSigtermSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());
+        __weak Controller* weakSelf = self;
+        dispatch_source_set_event_handler(_fSigtermSource, ^{
+            Controller* strongSelf = weakSelf;
+            if (strongSelf == nil || strongSelf.fQuitting)
+            {
+                return;
+            }
+
+            strongSelf.fQuitRequested = YES;
+            [NSApp terminate:nil];
+        });
+        dispatch_resume(_fSigtermSource);
 
         _fPauseOnLaunch = (GetCurrentKeyModifiers() & (optionKey | rightOptionKey)) != 0;
     }
@@ -1029,10 +1050,63 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     return NO;
 }
 
+- (BOOL)hasActiveRelocation
+{
+    for (Torrent* torrent in self.fTorrents)
+    {
+        tr_torrent_relocation_state const state = torrent.relocationState;
+        if (state != TR_RELOC_NONE && state != TR_RELOC_ERROR && state != TR_RELOC_CANCELLED)
+        {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+- (void)beginTerminationAfterRelocationCheckpoint
+{
+    if (self.fTerminationWaitingForRelocation)
+    {
+        return;
+    }
+
+    if (![self hasActiveRelocation])
+    {
+        [NSApp replyToApplicationShouldTerminate:YES];
+        return;
+    }
+
+    self.fTerminationWaitingForRelocation = YES;
+    self.fQuitRequested = YES;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        tr_sessionCheckpointRelocations(self.fLib);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.fTerminationWaitingForRelocation = NO;
+            [NSApp replyToApplicationShouldTerminate:YES];
+        });
+    });
+}
+
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender
 {
+    if (self.fTerminationWaitingForRelocation)
+    {
+        return NSTerminateLater;
+    }
+
+    BOOL const hasActiveRelocation = [self hasActiveRelocation];
+
     if (self.fQuitRequested || ![self.fDefaults boolForKey:@"CheckQuit"])
     {
+        if (hasActiveRelocation)
+        {
+            [self beginTerminationAfterRelocationCheckpoint];
+            return NSTerminateLater;
+        }
+
         return NSTerminateNow;
     }
 
@@ -1053,6 +1127,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     if (!preventedByTransfer)
     {
+        if (hasActiveRelocation)
+        {
+            [self beginTerminationAfterRelocationCheckpoint];
+            return NSTerminateLater;
+        }
+
         return NSTerminateNow;
     }
 
@@ -1078,7 +1158,20 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         {
             [self.fDefaults setBool:NO forKey:@"CheckQuit"];
         }
-        [NSApp replyToApplicationShouldTerminate:returnCode == NSAlertFirstButtonReturn];
+
+        if (returnCode != NSAlertFirstButtonReturn)
+        {
+            [NSApp replyToApplicationShouldTerminate:NO];
+            return;
+        }
+
+        if (hasActiveRelocation)
+        {
+            [self beginTerminationAfterRelocationCheckpoint];
+            return;
+        }
+
+        [NSApp replyToApplicationShouldTerminate:YES];
     }];
 
     return NSTerminateLater;
@@ -1087,6 +1180,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 - (void)applicationWillTerminate:(NSNotification*)notification
 {
     self.fQuitting = YES;
+
+    if (self.fSigtermSource != nil)
+    {
+        dispatch_source_cancel(self.fSigtermSource);
+        self.fSigtermSource = nil;
+    }
 
     [PowerManager.shared stop];
 
@@ -3335,7 +3434,8 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 - (void)applyFilter
 {
     NSString* filterType = [self.fDefaults stringForKey:@"Filter"];
-    BOOL filterActive = NO, filterDownload = NO, filterSeed = NO, filterPause = NO, filterError = NO, filterStatus = YES;
+    BOOL filterActive = NO, filterDownload = NO, filterSeed = NO, filterPause = NO, filterMoving = NO, filterError = NO,
+         filterStatus = YES;
     if ([filterType isEqualToString:FilterTypeActive])
     {
         filterActive = YES;
@@ -3351,6 +3451,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     else if ([filterType isEqualToString:FilterTypePause])
     {
         filterPause = YES;
+    }
+    else if ([filterType isEqualToString:FilterTypeMoving])
+    {
+        filterMoving = YES;
     }
     else if ([filterType isEqualToString:FilterTypeError])
     {
@@ -3371,57 +3475,58 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }
     BOOL const filterTracker = searchStrings && [[self.fDefaults stringForKey:@"FilterSearchType"] isEqualToString:FilterSearchTypeTracker];
 
-    std::atomic<int32_t> active{ 0 }, downloading{ 0 }, seeding{ 0 }, paused{ 0 }, error{ 0 };
+    std::atomic<int32_t> active{ 0 }, downloading{ 0 }, seeding{ 0 }, paused{ 0 }, moving{ 0 }, error{ 0 };
     // Pointers to be captured by Obj-C Block as const*
     auto* activeRef = &active;
     auto* downloadingRef = &downloading;
     auto* seedingRef = &seeding;
     auto* pausedRef = &paused;
+    auto* movingRef = &moving;
     auto* errorRef = &error;
     //filter & get counts of each type
     NSIndexSet* indexesOfNonFilteredTorrents = [self.fTorrents
         indexesOfObjectsWithOptions:NSEnumerationConcurrent passingTest:^BOOL(Torrent* torrent, NSUInteger /*torrentIdx*/, BOOL* /*stopTorrentsEnumeration*/) {
-            //check status
-            if (torrent.active && !torrent.checkingWaiting)
-            {
-                BOOL const isActive = torrent.transmitting;
-                if (isActive)
-                {
-                    std::atomic_fetch_add_explicit(activeRef, 1, std::memory_order_relaxed);
-                }
+            BOOL const isMoving = torrent.relocationState != TR_RELOC_NONE;
+            BOOL const isRelocationError = torrent.relocationState == TR_RELOC_ERROR;
+            BOOL const hasError = torrent.error || isRelocationError;
+            BOOL const isRunning = torrent.active && !torrent.checkingWaiting;
+            BOOL const isActive = isRunning && torrent.transmitting;
+            BOOL const isSeed = isRunning && torrent.seeding;
+            BOOL const isDownload = isRunning && !torrent.seeding;
+            BOOL const isPaused = !isRunning && !hasError;
 
-                if (torrent.seeding)
-                {
-                    std::atomic_fetch_add_explicit(seedingRef, 1, std::memory_order_relaxed);
-                    if (filterStatus && !((filterActive && isActive) || filterSeed))
-                    {
-                        return NO;
-                    }
-                }
-                else
-                {
-                    std::atomic_fetch_add_explicit(downloadingRef, 1, std::memory_order_relaxed);
-                    if (filterStatus && !((filterActive && isActive) || filterDownload))
-                    {
-                        return NO;
-                    }
-                }
+            if (isMoving)
+            {
+                std::atomic_fetch_add_explicit(movingRef, 1, std::memory_order_relaxed);
             }
-            else if (torrent.error)
+
+            if (isActive)
+            {
+                std::atomic_fetch_add_explicit(activeRef, 1, std::memory_order_relaxed);
+            }
+
+            if (isSeed)
+            {
+                std::atomic_fetch_add_explicit(seedingRef, 1, std::memory_order_relaxed);
+            }
+            else if (isDownload)
+            {
+                std::atomic_fetch_add_explicit(downloadingRef, 1, std::memory_order_relaxed);
+            }
+
+            if (hasError)
             {
                 std::atomic_fetch_add_explicit(errorRef, 1, std::memory_order_relaxed);
-                if (filterStatus && !filterError)
-                {
-                    return NO;
-                }
             }
-            else
+            else if (isPaused)
             {
                 std::atomic_fetch_add_explicit(pausedRef, 1, std::memory_order_relaxed);
-                if (filterStatus && !filterPause)
-                {
-                    return NO;
-                }
+            }
+
+            if (filterStatus && !((filterActive && isActive) || (filterDownload && isDownload) || (filterSeed && isSeed) ||
+                                  (filterPause && isPaused) || (filterMoving && isMoving) || (filterError && hasError)))
+            {
+                return NO;
             }
 
             //checkGroup
@@ -3491,6 +3596,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         [self.fFilterBar setCountAll:self.fTorrents.count active:active.load() downloading:downloading.load()
                              seeding:seeding.load()
                               paused:paused.load()
+                              moving:moving.load()
                                error:error.load()];
     }
 

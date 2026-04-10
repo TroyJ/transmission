@@ -10,6 +10,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -73,6 +74,7 @@ public:
     [[nodiscard]] bool add(std::unique_ptr<Mediator> mediator, tr_priority_t priority);
     void remove(tr_sha1_digest_t const& info_hash);
     bool cancel(tr_sha1_digest_t const& info_hash);
+    void prepare_shutdown();
 
 private:
     struct Node
@@ -107,5 +109,7 @@ private:
     std::optional<std::thread::id> relocate_thread_id_;
     std::atomic<bool> stop_current_ = false;
     std::atomic<bool> cancel_current_ = false;
+    bool shutdown_requested_ = false;
     std::condition_variable stop_current_cv_;
+    std::condition_variable state_cv_;
 };

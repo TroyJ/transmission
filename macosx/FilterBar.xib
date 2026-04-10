@@ -12,6 +12,7 @@
                 <outlet property="fDownloadFilterButton" destination="8" id="29"/>
                 <outlet property="fErrorFilterButton" destination="nvH-xy-86S" id="Rsj-yc-FIu"/>
                 <outlet property="fGroupsButton" destination="4" id="49"/>
+                <outlet property="fMovingFilterButton" destination="u1d-7W-vKS" id="y2c-Bm-R7h"/>
                 <outlet property="fNoFilterButton" destination="9" id="27"/>
                 <outlet property="fPauseFilterButton" destination="6" id="28"/>
                 <outlet property="fSearchField" destination="10" id="31"/>
@@ -59,7 +60,7 @@
                     </constraints>
                 </box>
                 <stackView distribution="fillProportionally" orientation="horizontal" alignment="centerY" spacing="1" horizontalStackHuggingPriority="249.99998474121094" verticalStackHuggingPriority="249.99998474121094" horizontalClippingResistancePriority="750" detachesHiddenViews="YES" translatesAutoresizingMaskIntoConstraints="NO" id="mzg-HE-ptV">
-                    <rect key="frame" x="42" y="4" width="341" height="16"/>
+                    <rect key="frame" x="42" y="4" width="402" height="16"/>
                     <subviews>
                         <button verticalHuggingPriority="750" horizontalCompressionResistancePriority="250" translatesAutoresizingMaskIntoConstraints="NO" id="9" customClass="FilterButton">
                             <rect key="frame" x="0.0" y="0.0" width="31" height="16"/>
@@ -111,8 +112,18 @@
                                 <action selector="setFilter:" target="-2" id="44"/>
                             </connections>
                         </button>
+                        <button verticalHuggingPriority="750" horizontalCompressionResistancePriority="250" translatesAutoresizingMaskIntoConstraints="NO" id="u1d-7W-vKS" customClass="FilterButton">
+                            <rect key="frame" x="296" y="0.0" width="58" height="16"/>
+                            <buttonCell key="cell" type="recessed" title="Moving" bezelStyle="recessed" alignment="center" controlSize="mini" lineBreakMode="truncatingTail" borderStyle="border" imageScaling="proportionallyDown" inset="2" id="rK4-B1-Had">
+                                <behavior key="behavior" pushIn="YES" lightByBackground="YES" lightByGray="YES" changeBackground="YES" changeGray="YES"/>
+                                <font key="font" metaFont="smallSystemBold"/>
+                            </buttonCell>
+                            <connections>
+                                <action selector="setFilter:" target="-2" id="Ggs-K3-Qm0"/>
+                            </connections>
+                        </button>
                         <button verticalHuggingPriority="750" horizontalCompressionResistancePriority="250" translatesAutoresizingMaskIntoConstraints="NO" id="nvH-xy-86S" customClass="FilterButton">
-                            <rect key="frame" x="296" y="0.0" width="45" height="16"/>
+                            <rect key="frame" x="355" y="0.0" width="45" height="16"/>
                             <buttonCell key="cell" type="recessed" title="Error" bezelStyle="recessed" alignment="center" controlSize="mini" lineBreakMode="truncatingTail" borderStyle="border" imageScaling="proportionallyDown" inset="2" id="AtX-O4-Mqp">
                                 <behavior key="behavior" pushIn="YES" lightByBackground="YES" lightByGray="YES" changeBackground="YES" changeGray="YES"/>
                                 <font key="font" metaFont="smallSystemBold"/>
@@ -129,8 +140,10 @@
                         <integer value="1000"/>
                         <integer value="1000"/>
                         <integer value="1000"/>
+                        <integer value="1000"/>
                     </visibilityPriorities>
                     <customSpacing>
+                        <real value="3.4028234663852886e+38"/>
                         <real value="3.4028234663852886e+38"/>
                         <real value="3.4028234663852886e+38"/>
                         <real value="3.4028234663852886e+38"/>

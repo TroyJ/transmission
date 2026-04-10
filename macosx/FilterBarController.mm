@@ -12,6 +12,7 @@ FilterType const FilterTypeActive = @"Active";
 FilterType const FilterTypeDownload = @"Download";
 FilterType const FilterTypeSeed = @"Seed";
 FilterType const FilterTypePause = @"Pause";
+FilterType const FilterTypeMoving = @"Moving";
 FilterType const FilterTypeError = @"Error";
 
 FilterSearchType const FilterSearchTypeName = @"Name";
@@ -31,6 +32,7 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
 @property(nonatomic) IBOutlet FilterButton* fDownloadFilterButton;
 @property(nonatomic) IBOutlet FilterButton* fSeedFilterButton;
 @property(nonatomic) IBOutlet FilterButton* fPauseFilterButton;
+@property(nonatomic) IBOutlet FilterButton* fMovingFilterButton;
 @property(nonatomic) IBOutlet FilterButton* fErrorFilterButton;
 
 @property(nonatomic) IBOutlet NSSearchField* fSearchField;
@@ -57,6 +59,7 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
     self.fDownloadFilterButton.title = NSLocalizedString(@"Downloading", "Filter Bar -> filter button");
     self.fSeedFilterButton.title = NSLocalizedString(@"Seeding", "Filter Bar -> filter button");
     self.fPauseFilterButton.title = NSLocalizedString(@"Paused", "Filter Bar -> filter button");
+    self.fMovingFilterButton.title = NSLocalizedString(@"Moving", "Filter Bar -> filter button");
     self.fErrorFilterButton.title = NSLocalizedString(@"Error", "Filter Bar -> filter button");
 
     self.fNoFilterButton.cell.backgroundStyle = NSBackgroundStyleRaised;
@@ -64,6 +67,7 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
     self.fDownloadFilterButton.cell.backgroundStyle = NSBackgroundStyleRaised;
     self.fSeedFilterButton.cell.backgroundStyle = NSBackgroundStyleRaised;
     self.fPauseFilterButton.cell.backgroundStyle = NSBackgroundStyleRaised;
+    self.fMovingFilterButton.cell.backgroundStyle = NSBackgroundStyleRaised;
     self.fErrorFilterButton.cell.backgroundStyle = NSBackgroundStyleRaised;
 
     [self.fSearchField.searchMenuTemplate itemWithTag:FilterTypeTagName].title = NSLocalizedString(@"Name", "Filter Bar -> filter menu");
@@ -90,6 +94,10 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
     else if ([filterType isEqualToString:FilterTypeDownload])
     {
         currentFilterButton = self.fDownloadFilterButton;
+    }
+    else if ([filterType isEqualToString:FilterTypeMoving])
+    {
+        currentFilterButton = self.fMovingFilterButton;
     }
     else if ([filterType isEqualToString:FilterTypeError])
     {
@@ -162,6 +170,10 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
     {
         prevFilterButton = self.fDownloadFilterButton;
     }
+    else if ([oldFilterType isEqualToString:FilterTypeMoving])
+    {
+        prevFilterButton = self.fMovingFilterButton;
+    }
     else if ([oldFilterType isEqualToString:FilterTypeError])
     {
         prevFilterButton = self.fErrorFilterButton;
@@ -192,6 +204,10 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
         else if (sender == self.fSeedFilterButton)
         {
             filterType = FilterTypeSeed;
+        }
+        else if (sender == self.fMovingFilterButton)
+        {
+            filterType = FilterTypeMoving;
         }
         else if (sender == self.fErrorFilterButton)
         {
@@ -235,11 +251,15 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
     }
     else if ([filterType isEqualToString:FilterTypePause])
     {
-        button = right ? self.fErrorFilterButton : self.fSeedFilterButton;
+        button = right ? self.fMovingFilterButton : self.fSeedFilterButton;
+    }
+    else if ([filterType isEqualToString:FilterTypeMoving])
+    {
+        button = right ? self.fErrorFilterButton : self.fPauseFilterButton;
     }
     else if ([filterType isEqualToString:FilterTypeError])
     {
-        button = right ? self.fNoFilterButton : self.fPauseFilterButton;
+        button = right ? self.fNoFilterButton : self.fMovingFilterButton;
     }
     else
     {
@@ -341,6 +361,7 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
         downloading:(NSUInteger)downloading
             seeding:(NSUInteger)seeding
              paused:(NSUInteger)paused
+             moving:(NSUInteger)moving
               error:(NSUInteger)error
 {
     self.fNoFilterButton.count = all;
@@ -348,6 +369,7 @@ typedef NS_ENUM(NSInteger, FilterTypeTag) {
     self.fDownloadFilterButton.count = downloading;
     self.fSeedFilterButton.count = seeding;
     self.fPauseFilterButton.count = paused;
+    self.fMovingFilterButton.count = moving;
     self.fErrorFilterButton.count = error;
 }
 
