@@ -22,10 +22,149 @@
 NSString* const kTorrentDidChangeGroupNotification = @"TorrentDidChangeGroup";
 
 static int const kETAIdleDisplaySec = 2 * 60;
+static NSInteger const kMainWindowMaxPieces = 18 * 18;
 
 static dispatch_queue_t timeMachineExcludeQueue;
 
+static NSString* stringFromTorrentCString(char const* value)
+{
+    if (value == nullptr)
+    {
+        return nil;
+    }
+
+    NSString* string = [NSString stringWithUTF8String:value];
+    if (string == nil)
+    {
+        string = [NSString stringWithCString:value encoding:NSISOLatin1StringEncoding];
+    }
+
+    return string;
+}
+
+@interface TorrentMainWindowSnapshot ()
+
+@property(nonatomic, copy) NSString* hashString;
+@property(nonatomic) tr_stat stat;
+@property(nonatomic, copy) NSString* name;
+@property(nonatomic) BOOL magnet;
+@property(nonatomic) BOOL folder;
+@property(nonatomic) uint64_t size;
+@property(nonatomic) NSInteger pieceSize;
+@property(nonatomic) NSInteger pieceCount;
+@property(nonatomic) BOOL privateTorrent;
+@property(nonatomic) tr_priority_t priority;
+@property(nonatomic, copy) NSArray<NSString*>* allTrackersFlat;
+@property(nonatomic) NSString* trackerSortKey;
+@property(nonatomic) BOOL canManualAnnounce;
+@property(nonatomic) BOOL canRetryRelocation;
+@property(nonatomic) BOOL canResumeRelocation;
+@property(nonatomic) BOOL canCancelRelocation;
+@property(nonatomic, copy) NSData* piecePercentData;
+@property(nonatomic) BOOL includesPiecePercentData;
+@property(nonatomic, copy) NSString* errorString;
+@property(nonatomic, copy) NSString* relocationErrorString;
+
+- (instancetype)initWithHashString:(NSString*)hashString
+                              stat:(tr_stat)stat
+                        errorString:(NSString*)errorString
+             relocationErrorString:(NSString*)relocationErrorString
+                              name:(NSString*)name
+                            magnet:(BOOL)magnet
+                            folder:(BOOL)folder
+                              size:(uint64_t)size
+                         pieceSize:(NSInteger)pieceSize
+                        pieceCount:(NSInteger)pieceCount
+                    privateTorrent:(BOOL)privateTorrent
+                          priority:(tr_priority_t)priority
+                   allTrackersFlat:(NSArray<NSString*>*)allTrackersFlat
+                    trackerSortKey:(NSString*)trackerSortKey
+                 canManualAnnounce:(BOOL)canManualAnnounce
+                canRetryRelocation:(BOOL)canRetryRelocation
+               canResumeRelocation:(BOOL)canResumeRelocation
+               canCancelRelocation:(BOOL)canCancelRelocation
+                   piecePercentData:(NSData*)piecePercentData
+             includesPiecePercentData:(BOOL)includesPiecePercentData NS_DESIGNATED_INITIALIZER;
+
+@end
+
+@implementation TorrentMainWindowSnapshot
+
+- (instancetype)initWithHashString:(NSString*)hashString
+                              stat:(tr_stat)stat
+                        errorString:(NSString*)errorString
+             relocationErrorString:(NSString*)relocationErrorString
+                              name:(NSString*)name
+                            magnet:(BOOL)magnet
+                            folder:(BOOL)folder
+                              size:(uint64_t)size
+                         pieceSize:(NSInteger)pieceSize
+                        pieceCount:(NSInteger)pieceCount
+                    privateTorrent:(BOOL)privateTorrent
+                          priority:(tr_priority_t)priority
+                   allTrackersFlat:(NSArray<NSString*>*)allTrackersFlat
+                    trackerSortKey:(NSString*)trackerSortKey
+                 canManualAnnounce:(BOOL)canManualAnnounce
+                canRetryRelocation:(BOOL)canRetryRelocation
+               canResumeRelocation:(BOOL)canResumeRelocation
+               canCancelRelocation:(BOOL)canCancelRelocation
+                   piecePercentData:(NSData*)piecePercentData
+             includesPiecePercentData:(BOOL)includesPiecePercentData
+{
+    if ((self = [super init]))
+    {
+        _hashString = [hashString copy];
+        _errorString = [errorString copy];
+        _relocationErrorString = [relocationErrorString copy];
+        _name = [name copy];
+        _magnet = magnet;
+        _folder = folder;
+        _size = size;
+        _pieceSize = pieceSize;
+        _pieceCount = pieceCount;
+        _privateTorrent = privateTorrent;
+        _priority = priority;
+        _allTrackersFlat = [allTrackersFlat copy];
+        _trackerSortKey = [trackerSortKey copy];
+        _canManualAnnounce = canManualAnnounce;
+        _canRetryRelocation = canRetryRelocation;
+        _canResumeRelocation = canResumeRelocation;
+        _canCancelRelocation = canCancelRelocation;
+        _piecePercentData = [piecePercentData copy];
+        _includesPiecePercentData = includesPiecePercentData;
+
+        _stat = stat;
+        _stat.errorString = _errorString.UTF8String;
+        _stat.relocationErrorString = _relocationErrorString.UTF8String;
+    }
+
+    return self;
+}
+
+@end
+
 @interface Torrent ()
+{
+    tr_stat _fStatStorage;
+    BOOL _fHasStat;
+    BOOL _fHasMainWindowSnapshot;
+    NSString* _fCachedErrorString;
+    NSString* _fCachedRelocationErrorString;
+    NSString* _fCachedName;
+    BOOL _fCachedMagnet;
+    BOOL _fCachedFolder;
+    uint64_t _fCachedSize;
+    NSInteger _fCachedPieceSize;
+    NSInteger _fCachedPieceCount;
+    BOOL _fCachedPrivateTorrent;
+    tr_priority_t _fCachedPriority;
+    NSArray<NSString*>* _fCachedAllTrackersFlat;
+    NSString* _fCachedTrackerSortKey;
+    BOOL _fCachedCanManualAnnounce;
+    BOOL _fCachedCanRetryRelocation;
+    BOOL _fCachedCanResumeRelocation;
+    BOOL _fCachedCanCancelRelocation;
+}
 
 @property(nonatomic, readonly) tr_torrent* fHandle;
 @property(nonatomic) tr_stat const* fStat;
@@ -47,12 +186,15 @@ static dispatch_queue_t timeMachineExcludeQueue;
 
 @property(nonatomic) BOOL fResumeOnWake;
 @property(nonatomic, copy, readwrite) NSString* hashString;
+@property(nonatomic, copy, readwrite) NSData* mainWindowPiecePercentData;
 
 - (void)renameFinished:(BOOL)success
                  nodes:(NSArray<FileListNode*>*)nodes
      completionHandler:(void (^)(BOOL))completionHandler
                oldPath:(NSString*)oldPath
                newName:(NSString*)newName;
+
+- (void)refreshMainWindowCachedStateIncludingPieces:(BOOL)includePieces postActivityNotification:(BOOL)postActivityNotification;
 
 @property(nonatomic, readonly) BOOL shouldShowEta;
 @property(nonatomic, readonly) NSString* etaString;
@@ -245,21 +387,149 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     self.fPreviousFinishedIndexesDate = indexes != nil ? [[NSDate alloc] init] : nil;
 }
 
-- (void)update
+- (tr_stat const*)fStat
 {
-    //get previous stalled value before update
-    BOOL const wasTransmitting = self.fStat != NULL && self.transmitting;
+    return _fHasStat ? &_fStatStorage : nullptr;
+}
 
-    self.fStat = tr_torrentStat(self.fHandle);
+- (void)setFStat:(tr_stat const*)stat
+{
+    if (stat == nullptr)
+    {
+        _fHasStat = NO;
+        _fStatStorage = {};
+        _fCachedErrorString = nil;
+        _fCachedRelocationErrorString = nil;
+        return;
+    }
+
+    _fHasStat = YES;
+    _fStatStorage = *stat;
+    _fCachedErrorString = stringFromTorrentCString(stat->errorString);
+    _fCachedRelocationErrorString = stringFromTorrentCString(stat->relocationErrorString);
+    _fStatStorage.errorString = _fCachedErrorString.UTF8String;
+    _fStatStorage.relocationErrorString = _fCachedRelocationErrorString.UTF8String;
+}
+
+- (void)refreshMainWindowCachedStateIncludingPieces:(BOOL)includePieces postActivityNotification:(BOOL)postActivityNotification
+{
+    // get previous stalled value before update
+    BOOL const wasTransmitting = _fHasStat && self.transmitting;
+    TorrentMainWindowSnapshot* snapshot = [self createMainWindowSnapshotIncludingPieces:includePieces];
+    [self applyMainWindowSnapshot:snapshot];
 
     //make sure the "active" filter is updated when transmitting changes
-    if (wasTransmitting != self.transmitting)
+    if (postActivityNotification && wasTransmitting != self.transmitting)
     {
         //posting asynchronously with coalescing to prevent stack overflow on lots of torrents changing state at the same time
         [NSNotificationQueue.defaultQueue enqueueNotification:[NSNotification notificationWithName:@"UpdateTorrentsState" object:nil]
                                                  postingStyle:NSPostASAP
                                                  coalesceMask:NSNotificationCoalescingOnName
                                                      forModes:nil];
+    }
+}
+
+- (void)update
+{
+    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:YES];
+}
+
+- (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces
+{
+    tr_stat stat = *tr_torrentStat(self.fHandle);
+    auto const view = tr_torrentView(self.fHandle);
+    NSString* hashString = @(view.hash_string);
+    NSString* errorString = stringFromTorrentCString(stat.errorString);
+    NSString* relocationErrorString = stringFromTorrentCString(stat.relocationErrorString);
+    NSString* name = @(tr_torrentName(self.fHandle));
+    BOOL const magnet = !tr_torrentHasMetadata(self.fHandle);
+    BOOL const folder = view.is_folder;
+    uint64_t const size = view.total_size;
+    NSInteger const pieceSize = view.piece_size;
+    NSInteger const pieceCount = view.n_pieces;
+    BOOL const privateTorrent = view.is_private;
+    tr_priority_t const priority = tr_torrentGetPriority(self.fHandle);
+
+    NSMutableArray<NSString*>* allTrackers = [NSMutableArray arrayWithCapacity:tr_torrentTrackerCount(self.fHandle)];
+    NSString* bestTrackerSortKey = nil;
+    for (size_t i = 0, n = tr_torrentTrackerCount(self.fHandle); i < n; ++i)
+    {
+        auto const tracker = tr_torrentTracker(self.fHandle, i);
+        NSString* announce = @(tracker.announce);
+        [allTrackers addObject:announce];
+
+        NSString* hostAndPort = @(tracker.host_and_port);
+        if (bestTrackerSortKey == nil || [hostAndPort localizedCaseInsensitiveCompare:bestTrackerSortKey] == NSOrderedAscending)
+        {
+            bestTrackerSortKey = hostAndPort;
+        }
+    }
+
+    NSData* piecePercentData = nil;
+    if (includePieces && !magnet && pieceCount > 0)
+    {
+        NSInteger const visiblePieceCount = MIN(pieceCount, kMainWindowMaxPieces);
+        NSMutableData* mutablePiecePercentData = [NSMutableData dataWithLength:visiblePieceCount * sizeof(float)];
+        tr_torrentAmountFinished(self.fHandle, static_cast<float*>(mutablePiecePercentData.mutableBytes), static_cast<int>(visiblePieceCount));
+        piecePercentData = mutablePiecePercentData;
+    }
+
+    return [[TorrentMainWindowSnapshot alloc] initWithHashString:hashString
+                                                            stat:stat
+                                                      errorString:errorString
+                                           relocationErrorString:relocationErrorString
+                                                            name:name
+                                                          magnet:magnet
+                                                          folder:folder
+                                                            size:size
+                                                       pieceSize:pieceSize
+                                                      pieceCount:pieceCount
+                                                  privateTorrent:privateTorrent
+                                                        priority:priority
+                                                 allTrackersFlat:allTrackers
+                                                  trackerSortKey:bestTrackerSortKey
+                                               canManualAnnounce:tr_torrentCanManualUpdate(self.fHandle)
+                                              canRetryRelocation:tr_torrentCanRetryRelocation(self.fHandle)
+                                             canResumeRelocation:tr_torrentCanResumeRelocation(self.fHandle)
+                                             canCancelRelocation:tr_torrentCanCancelRelocation(self.fHandle)
+                                                 piecePercentData:piecePercentData
+                                           includesPiecePercentData:includePieces];
+}
+
+- (void)applyMainWindowSnapshot:(TorrentMainWindowSnapshot*)snapshot
+{
+    NSString* previousName = _fCachedName;
+    BOOL const previousMagnet = _fCachedMagnet;
+    BOOL const previousFolder = _fCachedFolder;
+
+    tr_stat stat = snapshot.stat;
+    self.fStat = &stat;
+
+    _fHasMainWindowSnapshot = YES;
+    _fCachedName = snapshot.name;
+    _fCachedMagnet = snapshot.magnet;
+    _fCachedFolder = snapshot.folder;
+    _fCachedSize = snapshot.size;
+    _fCachedPieceSize = snapshot.pieceSize;
+    _fCachedPieceCount = snapshot.pieceCount;
+    _fCachedPrivateTorrent = snapshot.privateTorrent;
+    _fCachedPriority = snapshot.priority;
+    _fCachedAllTrackersFlat = snapshot.allTrackersFlat;
+    _fCachedTrackerSortKey = snapshot.trackerSortKey;
+    _fCachedCanManualAnnounce = snapshot.canManualAnnounce;
+    _fCachedCanRetryRelocation = snapshot.canRetryRelocation;
+    _fCachedCanResumeRelocation = snapshot.canResumeRelocation;
+    _fCachedCanCancelRelocation = snapshot.canCancelRelocation;
+
+    if (snapshot.includesPiecePercentData)
+    {
+        self.mainWindowPiecePercentData = snapshot.piecePercentData;
+    }
+
+    if (previousName == nil || ![previousName isEqualToString:_fCachedName] || previousMagnet != _fCachedMagnet ||
+        previousFolder != _fCachedFolder)
+    {
+        self.fIcon = nil;
     }
 }
 
@@ -355,7 +625,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (BOOL)canManualAnnounce
 {
-    return tr_torrentCanManualUpdate(self.fHandle);
+    return _fHasMainWindowSnapshot ? _fCachedCanManualAnnounce : tr_torrentCanManualUpdate(self.fHandle);
 }
 
 - (void)resetCache
@@ -366,7 +636,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (BOOL)isMagnet
 {
-    return !tr_torrentHasMetadata(self.fHandle);
+    return _fHasMainWindowSnapshot ? _fCachedMagnet : !tr_torrentHasMetadata(self.fHandle);
 }
 
 - (NSString*)magnetLink
@@ -476,12 +746,13 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (tr_priority_t)priority
 {
-    return tr_torrentGetPriority(self.fHandle);
+    return _fHasMainWindowSnapshot ? _fCachedPriority : tr_torrentGetPriority(self.fHandle);
 }
 
 - (void)setPriority:(tr_priority_t)priority
 {
-    return tr_torrentSetPriority(self.fHandle, priority);
+    _fCachedPriority = priority;
+    tr_torrentSetPriority(self.fHandle, priority);
 }
 
 + (BOOL)trashFile:(NSString*)path error:(NSError**)error
@@ -621,17 +892,17 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (NSString*)name
 {
-    return @(tr_torrentName(self.fHandle));
+    return _fHasMainWindowSnapshot ? _fCachedName : @(tr_torrentName(self.fHandle));
 }
 
 - (BOOL)isFolder
 {
-    return tr_torrentView(self.fHandle).is_folder;
+    return _fHasMainWindowSnapshot ? _fCachedFolder : tr_torrentView(self.fHandle).is_folder;
 }
 
 - (uint64_t)size
 {
-    return tr_torrentView(self.fHandle).total_size;
+    return _fHasMainWindowSnapshot ? _fCachedSize : tr_torrentView(self.fHandle).total_size;
 }
 
 - (uint64_t)sizeLeft
@@ -665,6 +936,11 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (NSArray<NSString*>*)allTrackersFlat
 {
+    if (_fHasMainWindowSnapshot)
+    {
+        return _fCachedAllTrackersFlat;
+    }
+
     auto const n = tr_torrentTrackerCount(self.fHandle);
     NSMutableArray* allTrackers = [NSMutableArray arrayWithCapacity:n];
 
@@ -740,12 +1016,12 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (NSInteger)pieceSize
 {
-    return tr_torrentView(self.fHandle).piece_size;
+    return _fHasMainWindowSnapshot ? _fCachedPieceSize : tr_torrentView(self.fHandle).piece_size;
 }
 
 - (NSInteger)pieceCount
 {
-    return tr_torrentView(self.fHandle).n_pieces;
+    return _fHasMainWindowSnapshot ? _fCachedPieceCount : tr_torrentView(self.fHandle).n_pieces;
 }
 
 - (NSString*)hashString
@@ -755,7 +1031,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (BOOL)privateTorrent
 {
-    return tr_torrentView(self.fHandle).is_private;
+    return _fHasMainWindowSnapshot ? _fCachedPrivateTorrent : tr_torrentView(self.fHandle).is_private;
 }
 
 - (NSString*)torrentLocation
@@ -965,17 +1241,17 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (BOOL)canRetryRelocation
 {
-    return tr_torrentCanRetryRelocation(self.fHandle);
+    return _fHasMainWindowSnapshot ? _fCachedCanRetryRelocation : tr_torrentCanRetryRelocation(self.fHandle);
 }
 
 - (BOOL)canResumeRelocation
 {
-    return tr_torrentCanResumeRelocation(self.fHandle);
+    return _fHasMainWindowSnapshot ? _fCachedCanResumeRelocation : tr_torrentCanResumeRelocation(self.fHandle);
 }
 
 - (BOOL)canCancelRelocation
 {
-    return tr_torrentCanCancelRelocation(self.fHandle);
+    return _fHasMainWindowSnapshot ? _fCachedCanCancelRelocation : tr_torrentCanCancelRelocation(self.fHandle);
 }
 
 - (tr_torrent_relocation_state)relocationState
@@ -1857,6 +2133,11 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (NSString*)trackerSortKey
 {
+    if (_fHasMainWindowSnapshot)
+    {
+        return _fCachedTrackerSortKey;
+    }
+
     NSString* best = nil;
 
     for (size_t i = 0, n = tr_torrentTrackerCount(self.fHandle); i < n; ++i)
@@ -2106,7 +2387,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (void)completenessChange:(tr_completeness)status wasRunning:(BOOL)wasRunning
 {
-    self.fStat = tr_torrentStat(self.fHandle); //don't call update yet to avoid auto-stop
+    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO]; // don't call update yet to avoid auto-stop
 
     switch (status)
     {
@@ -2140,21 +2421,21 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (void)ratioLimitHit
 {
-    self.fStat = tr_torrentStat(self.fHandle);
+    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO];
 
     [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentFinishedSeeding" object:self];
 }
 
 - (void)idleLimitHit
 {
-    self.fStat = tr_torrentStat(self.fHandle);
+    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO];
 
     [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentFinishedSeeding" object:self];
 }
 
 - (void)metadataRetrieved
 {
-    self.fStat = tr_torrentStat(self.fHandle);
+    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO];
 
     [self createFileList];
 

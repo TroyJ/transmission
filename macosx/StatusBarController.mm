@@ -120,7 +120,11 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
                                              object:nil];
 }
 
-- (void)updateWithDownload:(CGFloat)dlRate upload:(CGFloat)ulRate internetState:(InternetStateIndicatorSnapshot*)internetState
+- (void)updateWithDownload:(CGFloat)dlRate
+                    upload:(CGFloat)ulRate
+               sessionStats:(tr_session_stats)sessionStats
+           cumulativeStats:(tr_session_stats)cumulativeStats
+             internetState:(InternetStateIndicatorSnapshot*)internetState
 {
     //set rates
     if (!isSpeedEqual(self.fPreviousDownloadRate, dlRate))
@@ -140,7 +144,7 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
     BOOL total;
     if ((total = [statusLabel isEqualToString:StatusRatioTypeTotal]) || [statusLabel isEqualToString:StatusRatioTypeSession])
     {
-        auto const stats = total ? tr_sessionGetCumulativeStats(self.fLib) : tr_sessionGetStats(self.fLib);
+        auto const stats = total ? cumulativeStats : sessionStats;
 
         statusString = [NSLocalizedString(@"Ratio", "status bar -> status label")
             stringByAppendingFormat:@": %@", [NSString stringForRatio:stats.ratio]];
@@ -149,7 +153,7 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
     {
         total = [statusLabel isEqualToString:StatusTransferTypeTotal];
 
-        auto const stats = total ? tr_sessionGetCumulativeStats(self.fLib) : tr_sessionGetStats(self.fLib);
+        auto const stats = total ? cumulativeStats : sessionStats;
 
         statusString = [NSString stringWithFormat:@"%@: %@  %@: %@",
                                                   NSLocalizedString(@"DL", "status bar -> status label"),

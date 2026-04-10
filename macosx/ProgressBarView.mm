@@ -9,7 +9,6 @@
 #import "NSApplicationAdditions.h"
 
 static CGFloat const kPiecesTotalPercent = 0.6;
-static NSInteger const kMaxPieces = 18 * 18;
 
 @interface ProgressBarView ()
 
@@ -158,9 +157,25 @@ static NSInteger const kMaxPieces = 18 * 18;
         return;
     }
 
-    int const pieceCount = static_cast<int>(MIN(torrent.pieceCount, kMaxPieces));
-    float* piecesPercent = static_cast<float*>(malloc(pieceCount * sizeof(float)));
-    [torrent getAmountFinished:piecesPercent size:pieceCount];
+    NSData* piecePercentData = torrent.mainWindowPiecePercentData;
+    int const pieceCount = static_cast<int>(piecePercentData.length / sizeof(float));
+    if (pieceCount <= 0)
+    {
+        torrent.previousFinishedPieces = nil;
+
+        if (NSApp.darkMode)
+        {
+            [NSColor.controlColor set];
+        }
+        else
+        {
+            [[NSColor colorWithCalibratedWhite:1.0 alpha:[self.fDefaults boolForKey:@"SmallView"] ? 0.25 : 1.0] set];
+        }
+        NSRectFillUsingOperation(barRect, NSCompositingOperationSourceOver);
+        return;
+    }
+
+    float const* piecesPercent = static_cast<float const*>(piecePercentData.bytes);
 
     NSBitmapImageRep* bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nil pixelsWide:pieceCount pixelsHigh:1
                                                                     bitsPerSample:8
@@ -204,8 +219,6 @@ static NSInteger const kMaxPieces = 18 * 18;
         data[2] = pieceColor.blueComponent * 255;
         data[3] = pieceColor.alphaComponent * 255;
     }
-
-    free(piecesPercent);
 
     torrent.previousFinishedPieces = finishedIndexes.count > 0 ? finishedIndexes : nil; //don't bother saving if none are complete
 

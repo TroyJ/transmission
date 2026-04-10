@@ -9,6 +9,31 @@
 
 @class FileListNode;
 
+@interface TorrentMainWindowSnapshot : NSObject
+
+@property(nonatomic, readonly, copy) NSString* hashString;
+@property(nonatomic, readonly) tr_stat stat;
+@property(nonatomic, readonly, copy) NSString* name;
+@property(nonatomic, getter=isMagnet, readonly) BOOL magnet;
+@property(nonatomic, getter=isFolder, readonly) BOOL folder;
+@property(nonatomic, readonly) uint64_t size;
+@property(nonatomic, readonly) NSInteger pieceSize;
+@property(nonatomic, readonly) NSInteger pieceCount;
+@property(nonatomic, readonly) BOOL privateTorrent;
+@property(nonatomic, readonly) tr_priority_t priority;
+@property(nonatomic, readonly, copy) NSArray<NSString*>* allTrackersFlat;
+@property(nonatomic, readonly) NSString* trackerSortKey;
+@property(nonatomic, readonly) BOOL canManualAnnounce;
+@property(nonatomic, readonly) BOOL canRetryRelocation;
+@property(nonatomic, readonly) BOOL canResumeRelocation;
+@property(nonatomic, readonly) BOOL canCancelRelocation;
+@property(nonatomic, readonly) NSData* piecePercentData;
+@property(nonatomic, readonly) BOOL includesPiecePercentData;
+
+- (instancetype)init NS_UNAVAILABLE;
+
+@end
+
 typedef NS_ENUM(NSUInteger, TorrentDeterminationType) { TorrentDeterminationAutomatic = 0, TorrentDeterminationUserSpecified };
 
 extern NSString* const kTorrentDidChangeGroupNotification;
@@ -34,8 +59,11 @@ extern NSString* const kTorrentDidChangeGroupNotification;
 - (void)getAvailability:(int8_t*)tab size:(int)size;
 - (void)getAmountFinished:(float*)tab size:(int)size;
 @property(nonatomic) NSIndexSet* previousFinishedPieces;
+@property(nonatomic, readonly) NSData* mainWindowPiecePercentData;
 
 - (void)update;
+- (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces;
+- (void)applyMainWindowSnapshot:(TorrentMainWindowSnapshot*)snapshot;
 
 - (void)startTransferIgnoringQueue:(BOOL)ignoreQueue;
 - (void)startTransferNoQueue;

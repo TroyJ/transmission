@@ -142,6 +142,26 @@ typedef struct
     NSUInteger knownPeersLtep;
 } InternetStateEvidence;
 
+@interface ControllerMainWindowSampleResult : NSObject
+
+@property(nonatomic) NSUInteger generation;
+@property(nonatomic, copy) NSArray<TorrentMainWindowSnapshot*>* torrentSnapshots;
+@property(nonatomic) CGFloat downloadRate;
+@property(nonatomic) CGFloat uploadRate;
+@property(nonatomic) BOOL anyCompleted;
+@property(nonatomic) BOOL anySleepPreventActive;
+@property(nonatomic) InternetStateEvidence internetStateEvidence;
+@property(nonatomic) uint16_t peerPort;
+@property(nonatomic) BOOL portForwardingEnabled;
+@property(nonatomic) tr_port_forwarding_state portForwardingState;
+@property(nonatomic) tr_session_stats sessionStats;
+@property(nonatomic) tr_session_stats cumulativeStats;
+
+@end
+
+@implementation ControllerMainWindowSampleResult
+@end
+
 static bool isFreshTimestamp(NSTimeInterval timestamp, NSTimeInterval now, NSTimeInterval maxAge)
 {
     return timestamp > 0.0 && (now - timestamp) <= maxAge;
@@ -335,6 +355,22 @@ static void removeKeRangerRansomware()
 @property(nonatomic) DragOverlayWindow* fOverlayWindow;
 
 @property(nonatomic) NSTimer* fTimer;
+@property(nonatomic) dispatch_queue_t fMainWindowSampleQueue;
+@property(nonatomic) BOOL fMainWindowSampleInFlight;
+@property(nonatomic) BOOL fMainWindowSampleDirty;
+@property(nonatomic) NSUInteger fMainWindowSampleRequestedGeneration;
+@property(nonatomic) NSUInteger fMainWindowSampleAppliedGeneration;
+@property(nonatomic, copy) NSSet<NSString*>* fMainWindowPendingPieceTorrentHashes;
+@property(nonatomic) CGFloat fMainWindowCachedDownloadRate;
+@property(nonatomic) CGFloat fMainWindowCachedUploadRate;
+@property(nonatomic) BOOL fMainWindowCachedAnyCompleted;
+@property(nonatomic) BOOL fMainWindowCachedAnySleepPreventActive;
+@property(nonatomic) InternetStateEvidence fMainWindowCachedInternetStateEvidence;
+@property(nonatomic) uint16_t fMainWindowCachedPeerPort;
+@property(nonatomic) BOOL fMainWindowCachedPortForwardingEnabled;
+@property(nonatomic) tr_port_forwarding_state fMainWindowCachedPortForwardingState;
+@property(nonatomic) tr_session_stats fMainWindowCachedSessionStats;
+@property(nonatomic) tr_session_stats fMainWindowCachedCumulativeStats;
 
 @property(nonatomic) StatusBarController* fStatusBar;
 @property(nonatomic) PortChecker* fInternetStatePortChecker;
@@ -393,6 +429,11 @@ static void removeKeRangerRansomware()
                                                              now:(NSTimeInterval)now;
 - (BOOL)hasActiveRelocation;
 - (void)beginTerminationAfterRelocationCheckpoint;
+- (void)requestMainWindowSample;
+- (void)refreshMainWindowFromCachedState;
+- (NSSet<NSString*>*)visibleTorrentHashesForPieceSampling;
+- (void)startMainWindowSampleWithGeneration:(NSUInteger)generation;
+- (void)applyMainWindowSampleResult:(ControllerMainWindowSampleResult*)sample;
 
 - (void)removeTorrentsImpl:(NSArray<Torrent*>*)torrents deleteData:(BOOL)deleteData;
 
@@ -645,6 +686,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         _fTorrents = [[NSMutableArray alloc] init];
         _fDisplayedTorrents = [[NSMutableArray alloc] init];
         _fTorrentHashes = [[NSMutableDictionary alloc] init];
+        _fMainWindowSampleQueue = dispatch_queue_create("org.m0k.transmission.main-window-sampler", DISPATCH_QUEUE_SERIAL);
+        _fMainWindowPendingPieceTorrentHashes = [NSSet set];
+        _fMainWindowCachedSessionStats = {};
+        _fMainWindowCachedCumulativeStats = {};
 
         NSURLSessionConfiguration* configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
         configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
@@ -782,6 +827,8 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     //this must be called after showStatusBar:
     [self.fStatusBar updateWithDownload:0.0
                                  upload:0.0
+                            sessionStats:(tr_session_stats){}
+                        cumulativeStats:(tr_session_stats){}
                           internetState:[self internetStateSnapshotForState:InternetStateIndicatorStateYellow
                                                           hasActiveTorrents:NO
                                                                         now:[NSDate timeIntervalSinceReferenceDate]]];
@@ -1494,6 +1541,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
             [torrent update];
             [self.fTorrents addObject:torrent];
+            self.fTorrentHashes[torrent.hashString] = torrent;
 
             if (!self.fAddingTransfers)
             {
@@ -1516,6 +1564,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
         [torrent update];
         [self.fTorrents addObject:torrent];
+        self.fTorrentHashes[torrent.hashString] = torrent;
 
         if (!self.fAddingTransfers)
         {
@@ -1589,6 +1638,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
         [torrent update];
         [self.fTorrents addObject:torrent];
+        self.fTorrentHashes[torrent.hashString] = torrent;
 
         if (!self.fAddingTransfers)
         {
@@ -1610,6 +1660,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
         [torrent update];
         [self.fTorrents addObject:torrent];
+        self.fTorrentHashes[torrent.hashString] = torrent;
 
         if (!self.fAddingTransfers)
         {
@@ -2147,6 +2198,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }
 
     [self.fTorrents removeObjectsInArray:torrents];
+    for (Torrent* torrent in torrents)
+    {
+        [self.fTorrentHashes removeObjectForKey:torrent.hashString];
+    }
 
     //set up helpers to remove from the table
     __block BOOL beganUpdate = NO;
@@ -2735,10 +2790,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }
 
     NSMutableArray<NSString*>* toolTipLines = [NSMutableArray arrayWithObject:baseToolTip];
-    if (tr_sessionIsPortForwardingEnabled(self.fLib))
+    if (self.fMainWindowCachedPortForwardingEnabled)
     {
         NSString* localPortHint = nil;
-        switch (tr_sessionGetPortForwarding(self.fLib))
+        switch (self.fMainWindowCachedPortForwardingState)
         {
         case TR_PORT_MAPPED:
             localPortHint = NSLocalizedString(@"Local UPnP/NAT-PMP mapped", "Status bar internet state tooltip supplemental hint");
@@ -2825,51 +2880,172 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     [self updateUI];
 }
 
-- (void)updateUI
+- (NSSet<NSString*>*)visibleTorrentHashesForPieceSampling
 {
-    CGFloat dlRate = 0.0, ulRate = 0.0;
-    BOOL anyCompleted = NO;
-    BOOL anySleepPreventActive = NO;
-    InternetStateEvidence internetStateEvidence = {};
-
+    if (![self.fDefaults boolForKey:@"PiecesBar"])
     {
-        // avoid having to wait for the same lock multiple times in the same operation
-        auto const lock = tr_sessionLock(self.sessionHandle);
-        for (Torrent* torrent in self.fTorrents)
+        return [NSSet set];
+    }
+
+    NSMutableSet<NSString*>* hashes = [NSMutableSet set];
+    NSRange const visibleRows = [self.fTableView rowsInRect:self.fTableView.visibleRect];
+    if (visibleRows.location == NSNotFound)
+    {
+        return hashes;
+    }
+
+    NSUInteger const maxRow = NSMaxRange(visibleRows);
+    for (NSUInteger row = visibleRows.location; row < maxRow; ++row)
+    {
+        id item = [self.fTableView itemAtRow:row];
+        if ([item isKindOfClass:[Torrent class]])
         {
-            [torrent update];
-
-            //pull the upload and download speeds - most consistent by using current stats
-            dlRate += torrent.downloadRate;
-            ulRate += torrent.uploadRate;
-
-            anyCompleted |= torrent.finishedSeeding;
-            anySleepPreventActive |= torrent.active && !torrent.stalled && !torrent.error;
-
-            if (!torrent.active)
-            {
-                continue;
-            }
-
-            internetStateEvidence.hasActiveTorrents = YES;
-            internetStateEvidence.hasIncomingPeer |= torrent.totalPeersIncoming > 0;
-            internetStateEvidence.hasConnectedPeers |= torrent.totalPeersConnected > 0;
-            internetStateEvidence.hasPeerTraffic |= torrent.peersSendingToUs > 0 || torrent.peersGettingFromUs > 0;
-            internetStateEvidence.hasTransferRate |= torrent.downloadRate > 0.0 || torrent.uploadRate > 0.0;
-            internetStateEvidence.knownPeersTracker += torrent.totalKnownPeersTracker;
-            internetStateEvidence.knownPeersPex += torrent.totalKnownPeersPex;
-            internetStateEvidence.knownPeersDht += torrent.totalKnownPeersDHT;
-            internetStateEvidence.knownPeersLocal += torrent.totalKnownPeersLocal;
-            internetStateEvidence.knownPeersLtep += torrent.totalKnownPeersLTEP;
+            [hashes addObject:((Torrent*)item).hashString];
         }
     }
 
+    return hashes;
+}
+
+- (void)requestMainWindowSample
+{
+    self.fMainWindowPendingPieceTorrentHashes = [self visibleTorrentHashesForPieceSampling];
+    NSUInteger const generation = ++self.fMainWindowSampleRequestedGeneration;
+
+    if (self.fMainWindowSampleInFlight)
+    {
+        self.fMainWindowSampleDirty = YES;
+        return;
+    }
+
+    [self startMainWindowSampleWithGeneration:generation];
+}
+
+- (void)startMainWindowSampleWithGeneration:(NSUInteger)generation
+{
+    self.fMainWindowSampleInFlight = YES;
+
+    NSArray<Torrent*>* torrents = [self.fTorrents copy];
+    NSSet<NSString*>* pieceTorrentHashes = [self.fMainWindowPendingPieceTorrentHashes copy] ?: [NSSet set];
+    tr_session* session = self.fLib;
+
+    dispatch_async(self.fMainWindowSampleQueue, ^{
+        ControllerMainWindowSampleResult* sample = [ControllerMainWindowSampleResult new];
+        sample.generation = generation;
+
+        NSMutableArray<TorrentMainWindowSnapshot*>* torrentSnapshots = [NSMutableArray arrayWithCapacity:torrents.count];
+        CGFloat downloadRate = 0.0;
+        CGFloat uploadRate = 0.0;
+        BOOL anyCompleted = NO;
+        BOOL anySleepPreventActive = NO;
+        InternetStateEvidence internetStateEvidence = {};
+
+        {
+            auto const lock = tr_sessionLock(session);
+            for (Torrent* torrent in torrents)
+            {
+                BOOL const includePieces = [pieceTorrentHashes containsObject:torrent.hashString];
+                TorrentMainWindowSnapshot* snapshot = [torrent createMainWindowSnapshotIncludingPieces:includePieces];
+                [torrentSnapshots addObject:snapshot];
+
+                tr_stat const stat = snapshot.stat;
+                BOOL const isActive = stat.activity != TR_STATUS_STOPPED && stat.activity != TR_STATUS_DOWNLOAD_WAIT &&
+                    stat.activity != TR_STATUS_SEED_WAIT;
+
+                downloadRate += stat.pieceDownloadSpeed_KBps;
+                uploadRate += stat.pieceUploadSpeed_KBps;
+                anyCompleted |= stat.finished;
+                anySleepPreventActive |= isActive && !stat.isStalled && stat.error != TR_STAT_LOCAL_ERROR;
+
+                if (!isActive)
+                {
+                    continue;
+                }
+
+                internetStateEvidence.hasActiveTorrents = YES;
+                internetStateEvidence.hasIncomingPeer |= stat.peersFrom[TR_PEER_FROM_INCOMING] > 0;
+                internetStateEvidence.hasConnectedPeers |= stat.peersConnected > 0;
+                internetStateEvidence.hasPeerTraffic |= stat.peersSendingToUs > 0 || stat.peersGettingFromUs > 0;
+                internetStateEvidence.hasTransferRate |= stat.pieceDownloadSpeed_KBps > 0.0 || stat.pieceUploadSpeed_KBps > 0.0;
+                internetStateEvidence.knownPeersTracker += stat.knownPeersFrom[TR_PEER_FROM_TRACKER];
+                internetStateEvidence.knownPeersPex += stat.knownPeersFrom[TR_PEER_FROM_PEX];
+                internetStateEvidence.knownPeersDht += stat.knownPeersFrom[TR_PEER_FROM_DHT];
+                internetStateEvidence.knownPeersLocal += stat.knownPeersFrom[TR_PEER_FROM_LPD];
+                internetStateEvidence.knownPeersLtep += stat.knownPeersFrom[TR_PEER_FROM_LTEP];
+            }
+
+            sample.peerPort = tr_sessionGetPeerPort(session);
+            sample.portForwardingEnabled = tr_sessionIsPortForwardingEnabled(session);
+            sample.portForwardingState = tr_sessionGetPortForwarding(session);
+            sample.sessionStats = tr_sessionGetStats(session);
+            sample.cumulativeStats = tr_sessionGetCumulativeStats(session);
+        }
+
+        sample.torrentSnapshots = torrentSnapshots;
+        sample.downloadRate = downloadRate;
+        sample.uploadRate = uploadRate;
+        sample.anyCompleted = anyCompleted;
+        sample.anySleepPreventActive = anySleepPreventActive;
+        sample.internetStateEvidence = internetStateEvidence;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self applyMainWindowSampleResult:sample];
+        });
+    });
+}
+
+- (void)applyMainWindowSampleResult:(ControllerMainWindowSampleResult*)sample
+{
+    if (sample.generation >= self.fMainWindowSampleRequestedGeneration && sample.generation > self.fMainWindowSampleAppliedGeneration)
+    {
+        for (TorrentMainWindowSnapshot* snapshot in sample.torrentSnapshots)
+        {
+            Torrent* torrent = self.fTorrentHashes[snapshot.hashString];
+            if (torrent != nil)
+            {
+                [torrent applyMainWindowSnapshot:snapshot];
+            }
+        }
+
+        self.fMainWindowCachedDownloadRate = sample.downloadRate;
+        self.fMainWindowCachedUploadRate = sample.uploadRate;
+        self.fMainWindowCachedAnyCompleted = sample.anyCompleted;
+        self.fMainWindowCachedAnySleepPreventActive = sample.anySleepPreventActive;
+        self.fMainWindowCachedInternetStateEvidence = sample.internetStateEvidence;
+        self.fMainWindowCachedPeerPort = sample.peerPort;
+        self.fMainWindowCachedPortForwardingEnabled = sample.portForwardingEnabled;
+        self.fMainWindowCachedPortForwardingState = sample.portForwardingState;
+        self.fMainWindowCachedSessionStats = sample.sessionStats;
+        self.fMainWindowCachedCumulativeStats = sample.cumulativeStats;
+        self.fMainWindowSampleAppliedGeneration = sample.generation;
+
+        [self refreshMainWindowFromCachedState];
+        [self applyFilter];
+        [self.fWindow.toolbar validateVisibleItems];
+    }
+
+    self.fMainWindowSampleInFlight = NO;
+
+    if (self.fMainWindowSampleDirty)
+    {
+        self.fMainWindowSampleDirty = NO;
+        [self startMainWindowSampleWithGeneration:self.fMainWindowSampleRequestedGeneration];
+    }
+}
+
+- (void)refreshMainWindowFromCachedState
+{
     NSTimeInterval const now = [NSDate timeIntervalSinceReferenceDate];
+    CGFloat const dlRate = self.fMainWindowCachedDownloadRate;
+    CGFloat const ulRate = self.fMainWindowCachedUploadRate;
+    BOOL const anyCompleted = self.fMainWindowCachedAnyCompleted;
+    BOOL const anySleepPreventActive = self.fMainWindowCachedAnySleepPreventActive;
+    InternetStateEvidence const internetStateEvidence = self.fMainWindowCachedInternetStateEvidence;
     BOOL const indicatorVisible = [self isInternetStateIndicatorVisible];
     BOOL const becameVisible = indicatorVisible && !self.fInternetStateWasVisibleLastTick;
     BOOL const becameActive = internetStateEvidence.hasActiveTorrents && !self.fInternetStateHadActiveTorrentsLastTick;
 
-    uint16_t const peerPort = tr_sessionGetPeerPort(self.fLib);
+    uint16_t const peerPort = self.fMainWindowCachedPeerPort;
     BOOL const portChanged = self.fInternetStatePeerPort != 0 && self.fInternetStatePeerPort != peerPort;
     if (self.fInternetStatePeerPort != peerPort)
     {
@@ -2908,7 +3084,11 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         {
             [self sortTorrentsAndIncludeQueueOrder:NO];
 
-            [self.fStatusBar updateWithDownload:dlRate upload:ulRate internetState:internetStateSnapshot];
+            [self.fStatusBar updateWithDownload:dlRate
+                                         upload:ulRate
+                                    sessionStats:self.fMainWindowCachedSessionStats
+                                cumulativeStats:self.fMainWindowCachedCumulativeStats
+                                  internetState:internetStateSnapshot];
 
             self.fClearCompletedButton.hidden = !anyCompleted;
         }
@@ -2924,6 +3104,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     //badge dock
     [self.fBadger updateBadgeWithDownload:dlRate upload:ulRate];
+}
+
+- (void)updateUI
+{
+    [self requestMainWindowSample];
+    [self refreshMainWindowFromCachedState];
 }
 
 #warning can this be removed or refined?
@@ -4544,6 +4730,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 {
     [self.fDefaults setBool:![self.fDefaults boolForKey:@"PiecesBar"] forKey:@"PiecesBar"];
     [self.fTableView togglePiecesBar];
+    [self requestMainWindowSample];
 }
 
 - (void)toggleAvailabilityBar:(id)sender
@@ -6054,8 +6241,8 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         [torrent changeDownloadFolderBeforeUsing:location determinationType:TorrentDeterminationAutomatic];
     }
 
-    [torrent update];
     [self.fTorrents addObject:torrent];
+    self.fTorrentHashes[torrent.hashString] = torrent;
 
     if (!self.fAddingTransfers)
     {
@@ -6073,16 +6260,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
 - (void)rpcStartedStoppedTorrent:(Torrent*)torrent
 {
-    [torrent update];
-
-    [self updateUI];
-    [self applyFilter];
-    [self updateTorrentHistory];
+    [self fullUpdateUI];
 }
 
 - (void)rpcChangedTorrent:(Torrent*)torrent
 {
-    [torrent update];
+    [self requestMainWindowSample];
 
     if ([self.fTableView.selectedTorrents containsObject:torrent])
     {
@@ -6093,7 +6276,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
 - (void)rpcMovedTorrent:(Torrent*)torrent
 {
-    [torrent update];
+    [self requestMainWindowSample];
     [torrent updateTimeMachineExclude];
 
     if ([self.fTableView.selectedTorrents containsObject:torrent])
@@ -6104,16 +6287,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
 - (void)rpcUpdateQueue
 {
-    for (Torrent* torrent in self.fTorrents)
-    {
-        [torrent update];
-    }
-
-    NSSortDescriptor* descriptor = [NSSortDescriptor sortDescriptorWithKey:@"queuePosition" ascending:YES];
-    NSArray* descriptors = @[ descriptor ];
-    [self.fTorrents sortUsingDescriptors:descriptors];
-
-    [self sortTorrentsAndIncludeQueueOrder:YES];
+    [self requestMainWindowSample];
 }
 
 @end

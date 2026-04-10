@@ -33,7 +33,11 @@ typedef NS_ENUM(NSUInteger, InternetStateIndicatorState) {
 
 - (instancetype)initWithLib:(tr_session*)lib;
 
-- (void)updateWithDownload:(CGFloat)dlRate upload:(CGFloat)ulRate internetState:(InternetStateIndicatorSnapshot*)internetState;
+- (void)updateWithDownload:(CGFloat)dlRate
+                    upload:(CGFloat)ulRate
+               sessionStats:(tr_session_stats)sessionStats
+           cumulativeStats:(tr_session_stats)cumulativeStats
+             internetState:(InternetStateIndicatorSnapshot*)internetState;
 
 - (void)updateSpeedFieldsToolTips;
 
