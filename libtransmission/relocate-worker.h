@@ -1,0 +1,108 @@
+// This file Copyright © Mnemosyne LLC.
+// It may be used under GPLv2 (SPDX: GPL-2.0-only), GPLv3 (SPDX: GPL-3.0-only),
+// or any future license endorsed by Mnemosyne LLC.
+// License text can be found in the licenses/ folder.
+
+#pragma once
+
+#ifndef __TRANSMISSION__
+#error only libtransmission should #include this header.
+#endif
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+
+#include "libtransmission/torrent-metainfo.h"
+#include "libtransmission/transmission.h"
+
+enum tr_torrent_relocation_state : uint8_t;
+
+class tr_relocate_worker
+{
+public:
+    struct Snapshot
+    {
+        tr_torrent_id_t torrent_id = {};
+        tr_sha1_digest_t info_hash = {};
+        std::string info_hash_string;
+        std::string name;
+        tr_torrent_metainfo metainfo;
+        std::string source_root;
+        std::string target_root;
+        std::string previous_download_dir;
+        std::string previous_incomplete_dir;
+        std::string journal_file;
+    };
+
+    class Mediator
+    {
+    public:
+        virtual ~Mediator() = default;
+
+        [[nodiscard]] virtual Snapshot const& snapshot() const = 0;
+
+        virtual void on_relocate_state_changed(
+            tr_torrent_relocation_state state,
+            uint64_t bytes_copied,
+            uint64_t bytes_total,
+            uint64_t rate_bps,
+            std::string_view error) = 0;
+
+        [[nodiscard]] virtual bool on_verified_location_ready() = 0;
+        virtual void on_source_deleted() = 0;
+    };
+
+    tr_relocate_worker() = default;
+    ~tr_relocate_worker();
+
+    tr_relocate_worker(tr_relocate_worker const&) = delete;
+    tr_relocate_worker(tr_relocate_worker&&) = delete;
+    tr_relocate_worker& operator=(tr_relocate_worker const&) = delete;
+    tr_relocate_worker& operator=(tr_relocate_worker&&) = delete;
+
+    [[nodiscard]] bool add(std::unique_ptr<Mediator> mediator, tr_priority_t priority);
+    void remove(tr_sha1_digest_t const& info_hash);
+
+private:
+    struct Node
+    {
+        Node(std::unique_ptr<Mediator> mediator, tr_priority_t priority) noexcept
+            : mediator_{ std::move(mediator) }
+            , priority_{ priority }
+        {
+        }
+
+        [[nodiscard]] int compare(Node const& that) const noexcept;
+
+        [[nodiscard]] auto operator<(Node const& that) const noexcept
+        {
+            return compare(that) < 0;
+        }
+
+        [[nodiscard]] bool matches(tr_sha1_digest_t const& info_hash) const noexcept
+        {
+            return mediator_->snapshot().info_hash == info_hash;
+        }
+
+        std::unique_ptr<Mediator> mediator_;
+        tr_priority_t priority_;
+    };
+
+    void relocate_thread_func();
+
+    std::mutex relocate_mutex_;
+    std::set<Node> todo_;
+    std::optional<Node> current_node_;
+    std::optional<std::thread::id> relocate_thread_id_;
+    std::atomic<bool> stop_current_ = false;
+    std::condition_variable stop_current_cv_;
+};

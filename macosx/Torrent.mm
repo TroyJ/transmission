@@ -518,19 +518,11 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         return;
     }
 
-    int volatile status;
+    int volatile status = TR_LOC_DONE;
     tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, &status);
+    [self update];
 
-    while (status == TR_LOC_MOVING) //block while moving (for now)
-    {
-        [NSThread sleepForTimeInterval:0.05];
-    }
-
-    if (status == TR_LOC_DONE)
-    {
-        [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateStats" object:nil];
-    }
-    else
+    if (status == TR_LOC_ERROR)
     {
         NSAlert* alert = [[NSAlert alloc] init];
         alert.messageText = NSLocalizedString(@"There was an error moving the data file.", "Move error alert -> title");
@@ -1122,6 +1114,67 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 - (NSString*)statusString
 {
     NSString* string;
+    if (self.fStat->relocationState == TR_RELOC_ERROR)
+    {
+        string = NSLocalizedString(@"Move failed", "Torrent -> status string");
+        NSString* relocationError = self.fStat->relocationErrorString != NULL ?
+            [NSString stringWithUTF8String:self.fStat->relocationErrorString] :
+            nil;
+        if (relocationError.length > 0)
+        {
+            string = [string stringByAppendingFormat:@": %@", relocationError];
+        }
+        return string;
+    }
+
+    if (self.fStat->relocationState != TR_RELOC_NONE)
+    {
+        NSString* phaseString = nil;
+        switch (self.fStat->relocationState)
+        {
+        case TR_RELOC_QUEUED:
+            phaseString = NSLocalizedString(@"Move queued", "Torrent -> status string");
+            break;
+        case TR_RELOC_COPYING:
+            phaseString = NSLocalizedString(@"Moving data", "Torrent -> status string");
+            break;
+        case TR_RELOC_VERIFYING:
+            phaseString = NSLocalizedString(@"Verifying moved data", "Torrent -> status string");
+            break;
+        case TR_RELOC_RENAMING:
+            phaseString = NSLocalizedString(@"Finishing move", "Torrent -> status string");
+            break;
+        case TR_RELOC_DELETING_SOURCE:
+            phaseString = NSLocalizedString(@"Cleaning old data", "Torrent -> status string");
+            break;
+        default:
+            break;
+        }
+
+        if (phaseString != nil)
+        {
+            if (self.fStat->relocationBytesTotal > 0 &&
+                (self.fStat->relocationState == TR_RELOC_COPYING || self.fStat->relocationState == TR_RELOC_VERIFYING))
+            {
+                CGFloat progress = (CGFloat)self.fStat->relocationBytesCopied / self.fStat->relocationBytesTotal;
+                string = [NSString stringWithFormat:@"%@ (%@)",
+                                                    phaseString,
+                                                    [NSString percentString:progress longDecimals:YES]];
+            }
+            else
+            {
+                string = phaseString;
+            }
+
+            if (self.fStat->relocationState == TR_RELOC_COPYING && self.fStat->relocationRate_Bps > 0)
+            {
+                string = [string stringByAppendingFormat:@" — %@",
+                                                     [NSString stringForSpeed:(CGFloat)self.fStat->relocationRate_Bps / 1024.0]];
+            }
+
+            return string;
+        }
+    }
 
     if (self.anyErrorOrWarning)
     {

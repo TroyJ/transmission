@@ -289,6 +289,11 @@ The 'source' column here corresponds to the data structure there.
 | `primary_mime_type`| string| tr_torrent
 | `queue_position`| number| tr_stat
 | `rate_download` (B/s)| number| tr_stat
+| `relocation_bytes_copied` | number | tr_stat
+| `relocation_bytes_total` | number | tr_stat
+| `relocation_error` | string | tr_stat
+| `relocation_rate_bps` | number | tr_stat
+| `relocation_state` | number (see below) | tr_stat
 | `rate_upload` (B/s)| number| tr_stat
 | `recheck_progress`| double| tr_stat
 | `seconds_downloading`| number| tr_stat
@@ -316,6 +321,8 @@ The 'source' column here corresponds to the data structure there.
 | `webseeds_sending_to_us`| number| tr_stat
 
 `availability`: An array of `piece_count` numbers representing the number of connected peers that have each piece, or -1 if we already have the piece ourselves.
+
+`relocation_state`: background relocation state. `0` means idle, `1` queued, `2` copying, `3` verifying, `4` renaming into place, `5` deleting the old source, and `6` error.
 
 `bytes_completed`: An array of `tr_info.filecount` numbers. Each is the completed bytes for the corresponding file.
 
@@ -1104,3 +1111,9 @@ Transmission 4.1.1 (`rpc_version_semver` 6.0.1, `rpc_version`: 19)
 | `session_get` | `speed_limit_up` reverted to return an integer
 | `group_get` | `speed_limit_down` reverted to return an integer
 | `group_get` | `speed_limit_up` reverted to return an integer
+
+Current fork additions
+
+| Method | Description
+|:---|:---
+| `torrent_get` | new args `relocation_bytes_copied`, `relocation_bytes_total`, `relocation_error`, `relocation_rate_bps`, and `relocation_state`

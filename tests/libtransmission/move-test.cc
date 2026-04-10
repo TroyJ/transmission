@@ -30,6 +30,22 @@ namespace libtransmission::test
 
 auto constexpr MaxWaitMsec = 5000;
 
+[[nodiscard]] bool waitForRelocationToFinish(tr_torrent* const tor, size_t const max_wait_msec)
+{
+    auto const done = [tor]()
+    {
+        auto const state = tr_torrentStat(tor)->relocationState;
+        return state == TR_RELOC_NONE || state == TR_RELOC_ERROR;
+    };
+
+    if (!waitFor(done, max_wait_msec))
+    {
+        return false;
+    }
+
+    return tr_torrentStat(tor)->relocationState != TR_RELOC_ERROR;
+}
+
 class IncompleteDirTest
     : public SessionTest
     , public ::testing::WithParamInterface<std::pair<std::string, std::string>>
@@ -127,6 +143,7 @@ TEST_P(IncompleteDirTest, incompleteDir)
     };
     EXPECT_TRUE(waitFor(test, MaxWaitMsec));
     EXPECT_EQ(TR_SEED, completeness);
+    EXPECT_TRUE(waitForRelocationToFinish(tor, MaxWaitMsec));
 
     auto const n = tr_torrentFileCount(tor);
     for (tr_file_index_t i = 0; i < n; ++i)
@@ -175,6 +192,7 @@ TEST_F(MoveTest, setLocation)
     };
     EXPECT_TRUE(waitFor(test, MaxWaitMsec));
     EXPECT_EQ(TR_LOC_DONE, state);
+    EXPECT_TRUE(waitForRelocationToFinish(tor, MaxWaitMsec));
 
     // confirm the torrent is still complete after being moved
     blockingTorrentVerify(tor);

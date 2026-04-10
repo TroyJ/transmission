@@ -716,6 +716,7 @@ void tr_torrentRemoveInSessionThread(tr_torrent* tor, bool delete_flag, tr_fileF
         // ensure the files are all closed and idle before moving
         tor->session->close_torrent_files(tor->id());
         tor->session->verify_remove(tor);
+        tor->session->relocate_remove(tor);
 
         if (delete_func == nullptr)
         {
@@ -740,6 +741,7 @@ void tr_torrentRemoveInSessionThread(tr_torrent* tor, bool delete_flag, tr_fileF
         }
     }
 
+    tor->session->relocate_remove(tor);
     tr_torrentFreeInSessionThread(tor);
 }
 
@@ -780,6 +782,7 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
         tr_logAddInfoTor(tor, _("Removing torrent"));
     }
 
+    tor->session->relocate_remove(tor);
     tor->set_dirty(!tor->is_deleting_);
     tor->stop_now();
 
@@ -1025,6 +1028,11 @@ void tr_torrent::init(tr_ctor const& ctor)
     {
         date_done_ = now_sec;
     }
+
+    if (tr_sys_path_exists(relocation_journal_file()))
+    {
+        (void)session->relocate_add(std::make_unique<RelocateMediator>(this, download_dir().sv()), get_priority());
+    }
 }
 
 void tr_torrent::set_metainfo(tr_torrent_metainfo tm)
@@ -1153,8 +1161,62 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
         *setme_state = TR_LOC_MOVING;
     }
 
-    session->run_in_session_thread([this, loc = std::string(location), move_from_old_path, setme_state]()
-                                   { set_location_in_session_thread(loc, move_from_old_path, setme_state); });
+    if (move_from_old_path)
+    {
+        if (session->am_in_session_thread())
+        {
+            queue_relocation_in_session_thread(location, setme_state);
+        }
+        else
+        {
+            session->run_in_session_thread([this, loc = std::string(location), setme_state]()
+                                           { queue_relocation_in_session_thread(loc, setme_state); });
+        }
+        return;
+    }
+
+    session->run_in_session_thread(
+        [this, loc = std::string(location), move_from_old_path, setme_state]()
+        { set_location_in_session_thread(loc, move_from_old_path, setme_state); });
+}
+
+void tr_torrent::queue_relocation_in_session_thread(std::string_view const path, int volatile* const setme_state)
+{
+    TR_ASSERT(session->am_in_session_thread());
+
+    if (!has_metainfo() || std::empty(path))
+    {
+        if (setme_state != nullptr)
+        {
+            *setme_state = TR_LOC_ERROR;
+        }
+        return;
+    }
+
+    if (path == current_dir())
+    {
+        if (setme_state != nullptr)
+        {
+            *setme_state = TR_LOC_DONE;
+        }
+        return;
+    }
+
+    if (!session->relocate_add(std::make_unique<RelocateMediator>(this, path, setme_state), get_priority()))
+    {
+        if (setme_state != nullptr)
+        {
+            *setme_state = TR_LOC_ERROR;
+        }
+
+        set_relocation_state(
+            TR_RELOC_ERROR,
+            relocation_bytes_copied_,
+            relocation_bytes_total_,
+            0U,
+            _("Relocation already in progress for this torrent."));
+        return;
+    }
 }
 
 void tr_torrentSetLocation(tr_torrent* tor, char const* location, bool move_from_old_path, int volatile* setme_state)
@@ -1293,6 +1355,11 @@ tr_stat tr_torrent::stats() const
     stats.pieceUploadSpeed_KBps = piece_upload_speed.count(Speed::Units::KByps);
     auto const piece_download_speed = bandwidth().get_piece_speed(now_msec, TR_DOWN);
     stats.pieceDownloadSpeed_KBps = piece_download_speed.count(Speed::Units::KByps);
+    stats.relocationBytesCopied = relocation_bytes_copied_;
+    stats.relocationBytesTotal = relocation_bytes_total_;
+    stats.relocationRate_Bps = relocation_rate_bps_;
+    stats.relocationState = relocation_state_;
+    stats.relocationErrorString = relocation_error_.c_str();
 
     stats.percentComplete = this->completion_.percent_complete();
     stats.metadataPercentComplete = get_metadata_percent();
@@ -1701,6 +1768,148 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
                 }
             });
     }
+}
+
+// ---
+
+tr_torrent::RelocateMediator::RelocateMediator(
+    tr_torrent* const tor,
+    std::string_view const target_root,
+    int volatile* const setme_state)
+    : session_{ tor->session }
+    , torrent_id_{ tor->id() }
+    , setme_state_{ setme_state }
+{
+    snapshot_.torrent_id = tor->id();
+    snapshot_.info_hash = tor->info_hash();
+    snapshot_.info_hash_string = std::string{ tor->info_hash_string() };
+    snapshot_.name = std::string{ tor->name() };
+    snapshot_.metainfo = tor->metainfo();
+    snapshot_.source_root = std::string{ tor->current_dir() };
+    snapshot_.target_root = std::string{ target_root };
+    snapshot_.previous_download_dir = std::string{ tor->download_dir() };
+    snapshot_.previous_incomplete_dir = std::string{ tor->incomplete_dir() };
+    snapshot_.journal_file = tor->relocation_journal_file();
+}
+
+tr_relocate_worker::Snapshot const& tr_torrent::RelocateMediator::snapshot() const
+{
+    return snapshot_;
+}
+
+void tr_torrent::RelocateMediator::on_relocate_state_changed(
+    tr_torrent_relocation_state const state,
+    uint64_t const bytes_copied,
+    uint64_t const bytes_total,
+    uint64_t const rate_bps,
+    std::string_view const error)
+{
+    session_->run_in_session_thread(
+        [session = session_,
+         torrent_id = torrent_id_,
+         setme_state = setme_state_,
+         state,
+         bytes_copied,
+         bytes_total,
+         rate_bps,
+         error = std::string{ error }]()
+        {
+            auto* const tor = session->torrents().get(torrent_id);
+            if (tor == nullptr || tor->is_deleting_)
+            {
+                return;
+            }
+
+            if (state == TR_RELOC_ERROR && setme_state != nullptr)
+            {
+                *setme_state = TR_LOC_ERROR;
+            }
+
+            tor->set_relocation_state(state, bytes_copied, bytes_total, rate_bps, error);
+            session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
+        });
+}
+
+bool tr_torrent::RelocateMediator::on_verified_location_ready()
+{
+    auto ready_promise = std::promise<bool>{};
+    auto ready_future = ready_promise.get_future();
+
+    session_->run_in_session_thread(
+        [session = session_, torrent_id = torrent_id_, snapshot = snapshot_, &ready_promise]()
+        {
+            auto* const tor = session->torrents().get(torrent_id);
+            if (tor == nullptr || tor->is_deleting_)
+            {
+                ready_promise.set_value(false);
+                return;
+            }
+
+            session->close_torrent_files(tor->id());
+            tor->set_download_dir(snapshot.target_root);
+            tor->incomplete_dir_ = snapshot.source_root != snapshot.target_root ? tr_interned_string{ snapshot.source_root } :
+                                                                                tr_interned_string{};
+            tor->refresh_current_dir();
+            tor->set_relocation_state(TR_RELOC_DELETING_SOURCE, tor->relocation_bytes_total_, tor->relocation_bytes_total_, 0U, {});
+            tor->save_resume_file();
+            session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
+            ready_promise.set_value(true);
+        });
+
+    ready_future.wait();
+    return ready_future.get();
+}
+
+void tr_torrent::RelocateMediator::on_source_deleted()
+{
+    session_->run_in_session_thread(
+        [session = session_, torrent_id = torrent_id_, setme_state = setme_state_]()
+        {
+            auto* const tor = session->torrents().get(torrent_id);
+            if (tor == nullptr || tor->is_deleting_)
+            {
+                return;
+            }
+
+            tor->incomplete_dir_.clear();
+            tor->current_dir_ = tor->download_dir();
+            tor->clear_relocation_state();
+            tor->mark_edited();
+            tor->set_dirty();
+            tor->save_resume_file();
+            if (setme_state != nullptr)
+            {
+                *setme_state = TR_LOC_DONE;
+            }
+            session->rpcNotify(TR_RPC_TORRENT_MOVED, tor);
+            session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
+        });
+}
+
+std::string tr_torrent::relocation_journal_file() const
+{
+    return fmt::format("{}/relocations/{}.relocation.json", session->configDir(), info_hash_string());
+}
+
+void tr_torrent::set_relocation_state(
+    tr_torrent_relocation_state const state,
+    uint64_t const bytes_copied,
+    uint64_t const bytes_total,
+    uint64_t const rate_bps,
+    std::string_view const error)
+{
+    relocation_state_ = state;
+    relocation_bytes_copied_ = bytes_copied;
+    relocation_bytes_total_ = bytes_total;
+    relocation_rate_bps_ = rate_bps;
+    relocation_error_ = std::string{ error };
+    mark_changed();
+}
+
+void tr_torrent::clear_relocation_state()
+{
+    set_relocation_state(TR_RELOC_NONE, 0U, 0U, 0U, {});
+    relocation_error_.clear();
 }
 
 // ---

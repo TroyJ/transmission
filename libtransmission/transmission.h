@@ -912,6 +912,17 @@ enum : uint8_t
     TR_LOC_ERROR
 };
 
+enum tr_torrent_relocation_state : uint8_t
+{
+    TR_RELOC_NONE,
+    TR_RELOC_QUEUED,
+    TR_RELOC_COPYING,
+    TR_RELOC_VERIFYING,
+    TR_RELOC_RENAMING,
+    TR_RELOC_DELETING_SOURCE,
+    TR_RELOC_ERROR
+};
+
 /**
  * @brief Tell transmission where to find this torrent's local data.
  *
@@ -1535,6 +1546,15 @@ struct tr_stat
         This ONLY counts piece data. */
     float pieceDownloadSpeed_KBps;
 
+    /** Bytes copied so far by a background relocation job. */
+    uint64_t relocationBytesCopied;
+
+    /** Total bytes to copy for a background relocation job. */
+    uint64_t relocationBytesTotal;
+
+    /** Current relocation copy rate in bytes per second. */
+    uint64_t relocationRate_Bps;
+
     /** Total uploaded bytes / sizeWhenDone.
         NB: In Transmission 3.00 and earlier, this was total upload / download,
         which caused edge cases when total download was less than sizeWhenDone. */
@@ -1568,9 +1588,15 @@ struct tr_stat
     /** What is this torrent doing right now? */
     tr_torrent_activity activity;
 
+    /** What is this torrent's relocation job doing right now? */
+    tr_torrent_relocation_state relocationState;
+
     /** Defines what kind of text is in errorString.
         @see errorString */
     tr_stat_errtype error;
+
+    /** A relocation-specific error string, if the latest relocation failed. */
+    char const* relocationErrorString;
 
     /** Number of peers that we're connected to */
     uint16_t peersConnected;

@@ -105,6 +105,8 @@ target_sources(${TR_NAME}
         port-forwarding.h
         quark.cc
         quark.h
+        relocate-worker.cc
+        relocate-worker.h
         resume.cc
         resume.h
         rpc-server.cc

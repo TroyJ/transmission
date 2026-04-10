@@ -742,6 +742,11 @@ namespace make_torrent_field_helpers
     case TR_KEY_queue_position:
     case TR_KEY_rate_download:
     case TR_KEY_rate_upload:
+    case TR_KEY_relocation_bytes_copied:
+    case TR_KEY_relocation_bytes_total:
+    case TR_KEY_relocation_error:
+    case TR_KEY_relocation_rate_bps:
+    case TR_KEY_relocation_state:
     case TR_KEY_recheck_progress:
     case TR_KEY_seconds_downloading:
     case TR_KEY_seconds_seeding:
@@ -892,6 +897,16 @@ namespace make_torrent_field_helpers
         return Speed{ st.pieceDownloadSpeed_KBps, Speed::Units::KByps }.base_quantity();
     case TR_KEY_rate_upload:
         return Speed{ st.pieceUploadSpeed_KBps, Speed::Units::KByps }.base_quantity();
+    case TR_KEY_relocation_bytes_copied:
+        return st.relocationBytesCopied;
+    case TR_KEY_relocation_bytes_total:
+        return st.relocationBytesTotal;
+    case TR_KEY_relocation_error:
+        return st.relocationErrorString;
+    case TR_KEY_relocation_rate_bps:
+        return st.relocationRate_Bps;
+    case TR_KEY_relocation_state:
+        return st.relocationState;
     case TR_KEY_recheck_progress:
         return st.recheckProgress;
     case TR_KEY_seconds_downloading:

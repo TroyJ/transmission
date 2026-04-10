@@ -171,6 +171,31 @@ struct tr_torrent
         std::optional<time_t> time_started_;
     };
 
+    class RelocateMediator : public tr_relocate_worker::Mediator
+    {
+    public:
+        RelocateMediator(tr_torrent* tor, std::string_view target_root, int volatile* setme_state = nullptr);
+        ~RelocateMediator() override = default;
+
+        [[nodiscard]] tr_relocate_worker::Snapshot const& snapshot() const override;
+
+        void on_relocate_state_changed(
+            tr_torrent_relocation_state state,
+            uint64_t bytes_copied,
+            uint64_t bytes_total,
+            uint64_t rate_bps,
+            std::string_view error) override;
+
+        [[nodiscard]] bool on_verified_location_ready() override;
+        void on_source_deleted() override;
+
+    private:
+        tr_relocate_worker::Snapshot snapshot_;
+        tr_session* session_ = nullptr;
+        tr_torrent_id_t torrent_id_ = {};
+        int volatile* setme_state_ = nullptr;
+    };
+
     // ---
 
     explicit tr_torrent(tr_torrent_metainfo&& tm)
@@ -200,6 +225,14 @@ struct tr_torrent
     }
 
     void save_resume_file();
+    [[nodiscard]] std::string relocation_journal_file() const;
+    void set_relocation_state(
+        tr_torrent_relocation_state state,
+        uint64_t bytes_copied,
+        uint64_t bytes_total,
+        uint64_t rate_bps,
+        std::string_view error);
+    void clear_relocation_state();
 
     [[nodiscard]] constexpr auto started_recently(time_t const now, time_t recent_secs = 120) const noexcept
     {
@@ -684,6 +717,11 @@ struct tr_torrent
     ///
 
     [[nodiscard]] tr_stat stats() const;
+
+    [[nodiscard]] constexpr auto relocation_state() const noexcept
+    {
+        return relocation_state_;
+    }
 
     [[nodiscard]] constexpr auto queue_direction() const noexcept
     {
@@ -1361,6 +1399,7 @@ private:
     void update_file_path(tr_file_index_t file, std::optional<bool> has_file) const;
 
     void set_location_in_session_thread(std::string_view path, bool move_from_old_path, int volatile* setme_state);
+    void queue_relocation_in_session_thread(std::string_view path, int volatile* setme_state);
 
     void rename_path_in_session_thread(
         std::string_view oldpath,
@@ -1379,6 +1418,7 @@ private:
     Error error_;
 
     VerifyDoneCallback verify_done_callback_;
+    std::string relocation_error_;
 
     // true iff the piece was verified more recently than any of the piece's
     // files' mtimes (file_mtimes_). If checked_pieces_.test(piece) is false,
@@ -1444,6 +1484,9 @@ private:
 
     float verify_progress_ = -1.0F;
     float seed_ratio_ = 0.0F;
+    uint64_t relocation_bytes_copied_ = 0;
+    uint64_t relocation_bytes_total_ = 0;
+    uint64_t relocation_rate_bps_ = 0;
 
     tr_announce_key_t announce_key_ = tr_rand_obj<tr_announce_key_t>();
 
@@ -1452,6 +1495,7 @@ private:
     tr_ratiolimit seed_ratio_mode_ = TR_RATIOLIMIT_GLOBAL;
 
     tr_idlelimit idle_limit_mode_ = TR_IDLELIMIT_GLOBAL;
+    tr_torrent_relocation_state relocation_state_ = TR_RELOC_NONE;
 
     VerifyState verify_state_ = VerifyState::None;
 

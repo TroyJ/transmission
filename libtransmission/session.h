@@ -52,6 +52,7 @@
 #include "libtransmission/peer-io.h" // tr_preferred_transport
 #include "libtransmission/port-forwarding.h"
 #include "libtransmission/quark.h"
+#include "libtransmission/relocate-worker.h"
 #include "libtransmission/rpc-server.h"
 #include "libtransmission/session-alt-speeds.h"
 #include "libtransmission/session-id.h"
@@ -1147,6 +1148,8 @@ public:
 
     void verify_add(tr_torrent* tor);
     void verify_remove(tr_torrent const* tor);
+    [[nodiscard]] bool relocate_add(std::unique_ptr<tr_relocate_worker::Mediator> mediator, tr_priority_t priority);
+    void relocate_remove(tr_torrent const* tor);
 
     void fetch(tr_web::FetchOptions&& options) const
     {
@@ -1473,6 +1476,7 @@ private:
     std::unique_ptr<libtransmission::Timer> save_timer_;
 
     std::unique_ptr<tr_verify_worker> verifier_ = std::make_unique<tr_verify_worker>();
+    std::unique_ptr<tr_relocate_worker> relocator_ = std::make_unique<tr_relocate_worker>();
 
 public:
     std::unique_ptr<libtransmission::Timer> utp_timer;
