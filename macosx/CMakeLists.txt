@@ -109,6 +109,8 @@ target_sources(${TR_NAME}-mac
         InfoFileViewController.mm
         InfoGeneralViewController.h
         InfoGeneralViewController.mm
+        InternetStateIndicatorView.h
+        InternetStateIndicatorView.mm
         InfoOptionsViewController.h
         InfoOptionsViewController.mm
         InfoPeersViewController.h

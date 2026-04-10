@@ -42,6 +42,7 @@
 #import "ShareTorrentFileHelper.h"
 #import "Toolbar.h"
 #import "BlocklistDownloader.h"
+#import "PortChecker.h"
 #import "StatusBarController.h"
 #import "FilterBarController.h"
 #import "FileRenameSheetController.h"
@@ -117,6 +118,33 @@ static CGFloat const kFilterBarHeight = 24.0;
 static CGFloat const kBottomBarHeight = 24.0;
 
 static NSTimeInterval const kUpdateUISeconds = 1.0;
+static NSTimeInterval const kInternetStateGreenFreshSeconds = 5.0 * 60.0;
+static NSTimeInterval const kInternetStateIncomingProofFreshSeconds = 10.0 * 60.0;
+static NSTimeInterval const kInternetStateOutgoingEvidenceFreshSeconds = 60.0;
+static NSTimeInterval const kInternetStateRedGraceSeconds = 60.0;
+static NSTimeInterval const kInternetStateYellowProbeInterval = 30.0;
+static NSTimeInterval const kInternetStateGreenProbeInterval = 5.0 * 60.0;
+static NSTimeInterval const kInternetStatePortErrorBackoffInitialSeconds = 2.0 * 60.0;
+static NSTimeInterval const kInternetStatePortErrorBackoffRepeatedSeconds = 5.0 * 60.0;
+
+typedef struct
+{
+    BOOL hasActiveTorrents;
+    BOOL hasIncomingPeer;
+    BOOL hasConnectedPeers;
+    BOOL hasPeerTraffic;
+    BOOL hasTransferRate;
+    NSUInteger knownPeersTracker;
+    NSUInteger knownPeersPex;
+    NSUInteger knownPeersDht;
+    NSUInteger knownPeersLocal;
+    NSUInteger knownPeersLtep;
+} InternetStateEvidence;
+
+static bool isFreshTimestamp(NSTimeInterval timestamp, NSTimeInterval now, NSTimeInterval maxAge)
+{
+    return timestamp > 0.0 && (now - timestamp) <= maxAge;
+}
 
 static NSString* const kTransferPlist = @"Transfers.plist";
 
@@ -308,6 +336,23 @@ static void removeKeRangerRansomware()
 @property(nonatomic) NSTimer* fTimer;
 
 @property(nonatomic) StatusBarController* fStatusBar;
+@property(nonatomic) PortChecker* fInternetStatePortChecker;
+@property(nonatomic) PortStatus fInternetStateLastPortCheckResult;
+@property(nonatomic) NSTimeInterval fInternetStateLastPortCheckAt;
+@property(nonatomic) NSTimeInterval fInternetStateLastIncomingPeerAt;
+@property(nonatomic) NSTimeInterval fInternetStateLastOutgoingEvidenceAt;
+@property(nonatomic) NSTimeInterval fInternetStateLastActiveTorrentAt;
+@property(nonatomic) NSTimeInterval fInternetStateNextPortCheckAt;
+@property(nonatomic) NSUInteger fInternetStatePreviousKnownPeersTracker;
+@property(nonatomic) NSUInteger fInternetStatePreviousKnownPeersPex;
+@property(nonatomic) NSUInteger fInternetStatePreviousKnownPeersDht;
+@property(nonatomic) NSUInteger fInternetStatePreviousKnownPeersLocal;
+@property(nonatomic) NSUInteger fInternetStatePreviousKnownPeersLtep;
+@property(nonatomic) NSUInteger fInternetStateConsecutivePortCheckErrors;
+@property(nonatomic) BOOL fInternetStatePortCheckInFlight;
+@property(nonatomic) BOOL fInternetStateHadActiveTorrentsLastTick;
+@property(nonatomic) BOOL fInternetStateWasVisibleLastTick;
+@property(nonatomic) uint16_t fInternetStatePeerPort;
 
 @property(nonatomic) FilterBarController* fFilterBar;
 
@@ -331,6 +376,18 @@ static void removeKeRangerRansomware()
 @property(nonatomic) BOOL fGlobalPopoverShown;
 @property(nonatomic) NSView* fPositioningView;
 @property(nonatomic) BOOL fSoundPlaying;
+
+- (BOOL)isInternetStateIndicatorVisible;
+- (void)invalidateInternetStateInboundProof;
+- (void)updateInternetStateEvidence:(InternetStateEvidence)evidence now:(NSTimeInterval)now becameActive:(BOOL)becameActive;
+- (InternetStateIndicatorState)internetStateForHasActiveTorrents:(BOOL)hasActiveTorrents now:(NSTimeInterval)now;
+- (void)maybeStartInternetStatePortCheckForced:(BOOL)force
+                                  currentState:(InternetStateIndicatorState)currentState
+                              hasActiveTorrents:(BOOL)hasActiveTorrents
+                                            now:(NSTimeInterval)now;
+- (InternetStateIndicatorSnapshot*)internetStateSnapshotForState:(InternetStateIndicatorState)state
+                                               hasActiveTorrents:(BOOL)hasActiveTorrents
+                                                             now:(NSTimeInterval)now;
 
 - (void)removeTorrentsImpl:(NSArray<Torrent*>*)torrents deleteData:(BOOL)deleteData;
 
@@ -702,7 +759,11 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     //you would think this would be called later in this method from updateUI, but it's not reached in awakeFromNib
     //this must be called after showStatusBar:
-    [self.fStatusBar updateWithDownload:0.0 upload:0.0];
+    [self.fStatusBar updateWithDownload:0.0
+                                 upload:0.0
+                          internetState:[self internetStateSnapshotForState:InternetStateIndicatorStateYellow
+                                                          hasActiveTorrents:NO
+                                                                        now:[NSDate timeIntervalSinceReferenceDate]]];
 
     auto* const session = self.fLib;
 
@@ -2397,11 +2458,280 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     [StatsWindowController.statsWindow showWindow:nil];
 }
 
+- (BOOL)isInternetStateIndicatorVisible
+{
+    return self.fStatusBar != nil && !self.fStatusBar.isHidden && self.fWindow.visible && !NSApp.hidden;
+}
+
+- (void)invalidateInternetStateInboundProof
+{
+    [self.fInternetStatePortChecker cancelProbe];
+    self.fInternetStatePortChecker = nil;
+    self.fInternetStatePortCheckInFlight = NO;
+    self.fInternetStateLastPortCheckResult = PortStatusChecking;
+    self.fInternetStateLastPortCheckAt = 0.0;
+    self.fInternetStateLastIncomingPeerAt = 0.0;
+    self.fInternetStateNextPortCheckAt = 0.0;
+    self.fInternetStateConsecutivePortCheckErrors = 0;
+}
+
+- (void)updateInternetStateEvidence:(InternetStateEvidence)evidence now:(NSTimeInterval)now becameActive:(BOOL)becameActive
+{
+    if (becameActive)
+    {
+        self.fInternetStateLastActiveTorrentAt = now;
+    }
+
+    if (evidence.hasIncomingPeer)
+    {
+        self.fInternetStateLastIncomingPeerAt = now;
+    }
+
+    BOOL const knownPeersIncreased = evidence.knownPeersTracker > self.fInternetStatePreviousKnownPeersTracker ||
+        evidence.knownPeersPex > self.fInternetStatePreviousKnownPeersPex ||
+        evidence.knownPeersDht > self.fInternetStatePreviousKnownPeersDht ||
+        evidence.knownPeersLocal > self.fInternetStatePreviousKnownPeersLocal ||
+        evidence.knownPeersLtep > self.fInternetStatePreviousKnownPeersLtep;
+
+    if (evidence.hasConnectedPeers || evidence.hasPeerTraffic || evidence.hasTransferRate ||
+        (evidence.hasActiveTorrents && knownPeersIncreased))
+    {
+        self.fInternetStateLastOutgoingEvidenceAt = now;
+    }
+
+    self.fInternetStatePreviousKnownPeersTracker = evidence.knownPeersTracker;
+    self.fInternetStatePreviousKnownPeersPex = evidence.knownPeersPex;
+    self.fInternetStatePreviousKnownPeersDht = evidence.knownPeersDht;
+    self.fInternetStatePreviousKnownPeersLocal = evidence.knownPeersLocal;
+    self.fInternetStatePreviousKnownPeersLtep = evidence.knownPeersLtep;
+}
+
+- (InternetStateIndicatorState)internetStateForHasActiveTorrents:(BOOL)hasActiveTorrents now:(NSTimeInterval)now
+{
+    if (self.fInternetStateLastPortCheckResult == PortStatusOpen &&
+        isFreshTimestamp(self.fInternetStateLastPortCheckAt, now, kInternetStateGreenFreshSeconds))
+    {
+        return InternetStateIndicatorStateGreen;
+    }
+
+    if (isFreshTimestamp(self.fInternetStateLastIncomingPeerAt, now, kInternetStateIncomingProofFreshSeconds))
+    {
+        return InternetStateIndicatorStateGreen;
+    }
+
+    if (isFreshTimestamp(self.fInternetStateLastOutgoingEvidenceAt, now, kInternetStateOutgoingEvidenceFreshSeconds))
+    {
+        return InternetStateIndicatorStateYellow;
+    }
+
+    if (hasActiveTorrents && self.fInternetStateLastActiveTorrentAt > 0.0 &&
+        (now - self.fInternetStateLastActiveTorrentAt) >= kInternetStateRedGraceSeconds)
+    {
+        return InternetStateIndicatorStateRed;
+    }
+
+    return InternetStateIndicatorStateYellow;
+}
+
+- (void)maybeStartInternetStatePortCheckForced:(BOOL)force
+                                  currentState:(InternetStateIndicatorState)currentState
+                              hasActiveTorrents:(BOOL)hasActiveTorrents
+                                            now:(NSTimeInterval)now
+{
+    if (![self isInternetStateIndicatorVisible] || self.fInternetStatePeerPort == 0)
+    {
+        return;
+    }
+
+    if (force)
+    {
+        self.fInternetStateNextPortCheckAt = now;
+    }
+
+    if (self.fInternetStatePortCheckInFlight)
+    {
+        return;
+    }
+
+    BOOL shouldStartProbe = force;
+    if (!shouldStartProbe && hasActiveTorrents)
+    {
+        if (currentState == InternetStateIndicatorStateYellow || currentState == InternetStateIndicatorStateGreen)
+        {
+            shouldStartProbe = self.fInternetStateNextPortCheckAt <= now;
+        }
+    }
+
+    if (!shouldStartProbe)
+    {
+        return;
+    }
+
+    [self.fInternetStatePortChecker cancelProbe];
+    self.fInternetStatePortCheckInFlight = YES;
+    self.fInternetStatePortChecker = [[PortChecker alloc] initForPort:self.fInternetStatePeerPort
+                                                                delay:NO
+                                                         withDelegate:(NSObject<PortCheckerDelegate>*)self];
+}
+
+- (InternetStateIndicatorSnapshot*)internetStateSnapshotForState:(InternetStateIndicatorState)state
+                                               hasActiveTorrents:(BOOL)hasActiveTorrents
+                                                             now:(NSTimeInterval)now
+{
+    NSString* baseToolTip = nil;
+    NSString* accessibilityLabel = nil;
+
+    BOOL const hasFreshExternalOpen = self.fInternetStateLastPortCheckResult == PortStatusOpen &&
+        isFreshTimestamp(self.fInternetStateLastPortCheckAt, now, kInternetStateGreenFreshSeconds);
+    BOOL const hasRecentClosedPortCheck = self.fInternetStateLastPortCheckResult == PortStatusClosed &&
+        isFreshTimestamp(self.fInternetStateLastPortCheckAt, now, kInternetStateGreenFreshSeconds);
+    BOOL const hasRecentPortCheckError = self.fInternetStateLastPortCheckResult == PortStatusError &&
+        isFreshTimestamp(self.fInternetStateLastPortCheckAt, now, kInternetStateGreenFreshSeconds);
+
+    switch (state)
+    {
+    case InternetStateIndicatorStateGreen:
+        baseToolTip = hasFreshExternalOpen ?
+            NSLocalizedString(@"Incoming port proven reachable: external port check open", "Status bar internet state tooltip") :
+            NSLocalizedString(@"Incoming port proven reachable: recent incoming peer observed", "Status bar internet state tooltip");
+        accessibilityLabel = NSLocalizedString(
+            @"Internet state: incoming port proven reachable",
+            "Status bar internet state accessibility label");
+        break;
+
+    case InternetStateIndicatorStateYellow:
+        if (!hasActiveTorrents)
+        {
+            baseToolTip = NSLocalizedString(@"No active torrents; incoming reachability not yet proven", "Status bar internet state tooltip");
+        }
+        else if (hasRecentClosedPortCheck)
+        {
+            baseToolTip = NSLocalizedString(@"Outgoing connectivity active; external port check closed", "Status bar internet state tooltip");
+        }
+        else if (hasRecentPortCheckError)
+        {
+            baseToolTip = NSLocalizedString(
+                @"Outgoing connectivity active; external port-check service unavailable",
+                "Status bar internet state tooltip");
+        }
+        else
+        {
+            baseToolTip = NSLocalizedString(
+                @"Outgoing connectivity active; incoming reachability not yet proven",
+                "Status bar internet state tooltip");
+        }
+        accessibilityLabel = NSLocalizedString(
+            @"Internet state: outgoing connectivity active, incoming reachability not proven",
+            "Status bar internet state accessibility label");
+        break;
+
+    case InternetStateIndicatorStateRed:
+        baseToolTip = NSLocalizedString(
+            @"Active torrents have no peers, peer discovery, or transfer activity",
+            "Status bar internet state tooltip");
+        accessibilityLabel = NSLocalizedString(
+            @"Internet state: no outbound swarm activity detected",
+            "Status bar internet state accessibility label");
+        break;
+    }
+
+    NSMutableArray<NSString*>* toolTipLines = [NSMutableArray arrayWithObject:baseToolTip];
+    if (tr_sessionIsPortForwardingEnabled(self.fLib))
+    {
+        NSString* localPortHint = nil;
+        switch (tr_sessionGetPortForwarding(self.fLib))
+        {
+        case TR_PORT_MAPPED:
+            localPortHint = NSLocalizedString(@"Local UPnP/NAT-PMP mapped", "Status bar internet state tooltip supplemental hint");
+            break;
+
+        case TR_PORT_MAPPING:
+            localPortHint = NSLocalizedString(
+                @"Local UPnP/NAT-PMP mapping in progress",
+                "Status bar internet state tooltip supplemental hint");
+            break;
+
+        case TR_PORT_UNMAPPED:
+            localPortHint = NSLocalizedString(
+                @"Local UPnP/NAT-PMP unmapped",
+                "Status bar internet state tooltip supplemental hint");
+            break;
+
+        case TR_PORT_UNMAPPING:
+            localPortHint = NSLocalizedString(
+                @"Local UPnP/NAT-PMP unmapping in progress",
+                "Status bar internet state tooltip supplemental hint");
+            break;
+
+        case TR_PORT_ERROR:
+            localPortHint = NSLocalizedString(
+                @"Local UPnP/NAT-PMP state unavailable",
+                "Status bar internet state tooltip supplemental hint");
+            break;
+        }
+
+        if (localPortHint != nil)
+        {
+            [toolTipLines addObject:localPortHint];
+        }
+    }
+
+    if (self.fInternetStatePortCheckInFlight)
+    {
+        [toolTipLines addObject:NSLocalizedString(@"Rechecking external port status...", "Status bar internet state tooltip")];
+    }
+
+    return [InternetStateIndicatorSnapshot snapshotWithState:state
+                                                     toolTip:[toolTipLines componentsJoinedByString:@"\n"]
+                                          accessibilityLabel:accessibilityLabel];
+}
+
+- (void)portCheckerDidFinishProbing:(PortChecker*)portChecker
+{
+    if (portChecker != self.fInternetStatePortChecker)
+    {
+        return;
+    }
+
+    NSTimeInterval const now = [NSDate timeIntervalSinceReferenceDate];
+    self.fInternetStatePortCheckInFlight = NO;
+    self.fInternetStateLastPortCheckAt = now;
+    self.fInternetStateLastPortCheckResult = portChecker.status;
+
+    switch (portChecker.status)
+    {
+    case PortStatusOpen:
+        self.fInternetStateConsecutivePortCheckErrors = 0;
+        self.fInternetStateNextPortCheckAt = now + kInternetStateGreenProbeInterval;
+        break;
+
+    case PortStatusClosed:
+        self.fInternetStateConsecutivePortCheckErrors = 0;
+        self.fInternetStateNextPortCheckAt = now + kInternetStateYellowProbeInterval;
+        break;
+
+    case PortStatusError:
+        ++self.fInternetStateConsecutivePortCheckErrors;
+        self.fInternetStateNextPortCheckAt = now +
+            (self.fInternetStateConsecutivePortCheckErrors > 1 ? kInternetStatePortErrorBackoffRepeatedSeconds :
+                                                                 kInternetStatePortErrorBackoffInitialSeconds);
+        break;
+
+    case PortStatusChecking:
+        self.fInternetStateNextPortCheckAt = now + kInternetStateYellowProbeInterval;
+        break;
+    }
+
+    self.fInternetStatePortChecker = nil;
+    [self updateUI];
+}
+
 - (void)updateUI
 {
     CGFloat dlRate = 0.0, ulRate = 0.0;
     BOOL anyCompleted = NO;
-    BOOL anyActive = NO;
+    BOOL anySleepPreventActive = NO;
+    InternetStateEvidence internetStateEvidence = {};
 
     {
         // avoid having to wait for the same lock multiple times in the same operation
@@ -2415,11 +2745,63 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             ulRate += torrent.uploadRate;
 
             anyCompleted |= torrent.finishedSeeding;
-            anyActive |= torrent.active && !torrent.stalled && !torrent.error;
+            anySleepPreventActive |= torrent.active && !torrent.stalled && !torrent.error;
+
+            if (!torrent.active)
+            {
+                continue;
+            }
+
+            internetStateEvidence.hasActiveTorrents = YES;
+            internetStateEvidence.hasIncomingPeer |= torrent.totalPeersIncoming > 0;
+            internetStateEvidence.hasConnectedPeers |= torrent.totalPeersConnected > 0;
+            internetStateEvidence.hasPeerTraffic |= torrent.peersSendingToUs > 0 || torrent.peersGettingFromUs > 0;
+            internetStateEvidence.hasTransferRate |= torrent.downloadRate > 0.0 || torrent.uploadRate > 0.0;
+            internetStateEvidence.knownPeersTracker += torrent.totalKnownPeersTracker;
+            internetStateEvidence.knownPeersPex += torrent.totalKnownPeersPex;
+            internetStateEvidence.knownPeersDht += torrent.totalKnownPeersDHT;
+            internetStateEvidence.knownPeersLocal += torrent.totalKnownPeersLocal;
+            internetStateEvidence.knownPeersLtep += torrent.totalKnownPeersLTEP;
         }
     }
 
-    PowerManager.shared.shouldPreventSleep = anyActive && [self.fDefaults boolForKey:@"SleepPrevent"];
+    NSTimeInterval const now = [NSDate timeIntervalSinceReferenceDate];
+    BOOL const indicatorVisible = [self isInternetStateIndicatorVisible];
+    BOOL const becameVisible = indicatorVisible && !self.fInternetStateWasVisibleLastTick;
+    BOOL const becameActive = internetStateEvidence.hasActiveTorrents && !self.fInternetStateHadActiveTorrentsLastTick;
+
+    uint16_t const peerPort = tr_sessionGetPeerPort(self.fLib);
+    BOOL const portChanged = self.fInternetStatePeerPort != 0 && self.fInternetStatePeerPort != peerPort;
+    if (self.fInternetStatePeerPort != peerPort)
+    {
+        self.fInternetStatePeerPort = peerPort;
+    }
+
+    if (portChanged)
+    {
+        [self invalidateInternetStateInboundProof];
+    }
+
+    [self updateInternetStateEvidence:internetStateEvidence now:now becameActive:becameActive];
+
+    InternetStateIndicatorState const internetState = [self internetStateForHasActiveTorrents:internetStateEvidence.hasActiveTorrents
+                                                                                           now:now];
+    BOOL const shouldForcePortCheck = (indicatorVisible && self.fInternetStateLastPortCheckAt == 0.0) || becameVisible ||
+        becameActive || portChanged;
+
+    [self maybeStartInternetStatePortCheckForced:shouldForcePortCheck
+                                    currentState:internetState
+                                hasActiveTorrents:internetStateEvidence.hasActiveTorrents
+                                              now:now];
+
+    InternetStateIndicatorSnapshot* internetStateSnapshot = [self internetStateSnapshotForState:internetState
+                                                                               hasActiveTorrents:internetStateEvidence.hasActiveTorrents
+                                                                                             now:now];
+
+    self.fInternetStateHadActiveTorrentsLastTick = internetStateEvidence.hasActiveTorrents;
+    self.fInternetStateWasVisibleLastTick = indicatorVisible;
+
+    PowerManager.shared.shouldPreventSleep = anySleepPreventActive && [self.fDefaults boolForKey:@"SleepPrevent"];
 
     if (!NSApp.hidden)
     {
@@ -2427,7 +2809,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         {
             [self sortTorrentsAndIncludeQueueOrder:NO];
 
-            [self.fStatusBar updateWithDownload:dlRate upload:ulRate];
+            [self.fStatusBar updateWithDownload:dlRate upload:ulRate internetState:internetStateSnapshot];
 
             self.fClearCompletedButton.hidden = !anyCompleted;
         }

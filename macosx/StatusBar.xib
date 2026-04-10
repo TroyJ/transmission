@@ -8,6 +8,7 @@
     <objects>
         <customObject id="-2" userLabel="File's Owner" customClass="StatusBarController">
             <connections>
+                <outlet property="fInternetStateView" destination="Bzb-bQ-RJw" id="lBR-oc-hp6"/>
                 <outlet property="fStatusButton" destination="3" id="18"/>
                 <outlet property="fTotalDLField" destination="7" id="19"/>
                 <outlet property="fTotalDLImageView" destination="4" id="21"/>
@@ -78,6 +79,9 @@
                         <color key="backgroundColor" name="controlColor" catalog="System" colorSpace="catalog"/>
                     </textFieldCell>
                 </textField>
+                <customView translatesAutoresizingMaskIntoConstraints="NO" id="Bzb-bQ-RJw" customClass="InternetStateIndicatorView">
+                    <rect key="frame" x="480" y="7" width="10" height="10"/>
+                </customView>
                 <box verticalHuggingPriority="750" boxType="separator" translatesAutoresizingMaskIntoConstraints="NO" id="na0-dX-KKO">
                     <rect key="frame" x="0.0" y="21" width="500" height="5"/>
                 </box>
@@ -89,14 +93,18 @@
                 <constraint firstItem="4" firstAttribute="leading" relation="greaterThanOrEqual" secondItem="3" secondAttribute="trailing" constant="5" id="6tW-KD-to5"/>
                 <constraint firstItem="6" firstAttribute="centerY" secondItem="2" secondAttribute="centerY" id="PhY-Kl-8UO"/>
                 <constraint firstItem="7" firstAttribute="centerY" secondItem="2" secondAttribute="centerY" id="RUV-jV-Cu3"/>
-                <constraint firstAttribute="trailing" secondItem="6" secondAttribute="trailing" constant="20" id="TYC-7o-i81"/>
+                <constraint firstAttribute="trailing" secondItem="Bzb-bQ-RJw" secondAttribute="trailing" constant="10" id="TYC-7o-i81"/>
                 <constraint firstItem="na0-dX-KKO" firstAttribute="leading" secondItem="2" secondAttribute="leading" id="VcY-K8-v6h"/>
+                <constraint firstItem="Bzb-bQ-RJw" firstAttribute="height" secondItem="Bzb-bQ-RJw" secondAttribute="width" id="Y3k-Kq-1ti"/>
                 <constraint firstItem="3" firstAttribute="leading" secondItem="2" secondAttribute="leading" constant="5" id="aSH-P9-sbq"/>
                 <constraint firstAttribute="trailing" secondItem="na0-dX-KKO" secondAttribute="trailing" id="qcN-md-bN6"/>
                 <constraint firstItem="5" firstAttribute="centerY" secondItem="2" secondAttribute="centerY" id="s5N-sn-GIz"/>
+                <constraint firstItem="Bzb-bQ-RJw" firstAttribute="leading" secondItem="6" secondAttribute="trailing" constant="10" id="t1n-k8-aR4"/>
+                <constraint firstItem="Bzb-bQ-RJw" firstAttribute="width" constant="10" id="wQL-iH-aLP"/>
                 <constraint firstItem="7" firstAttribute="leading" secondItem="4" secondAttribute="trailing" constant="5" id="ucx-2O-Qeb"/>
                 <constraint firstItem="5" firstAttribute="leading" secondItem="7" secondAttribute="trailing" constant="20" id="w5L-Hb-0Ly"/>
                 <constraint firstItem="3" firstAttribute="centerY" secondItem="2" secondAttribute="centerY" id="xna-mB-gNK"/>
+                <constraint firstItem="Bzb-bQ-RJw" firstAttribute="centerY" secondItem="2" secondAttribute="centerY" id="zP6-dW-o2f"/>
             </constraints>
             <point key="canvasLocation" x="211" y="136"/>
         </customView>

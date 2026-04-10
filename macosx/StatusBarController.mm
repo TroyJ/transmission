@@ -3,6 +3,7 @@
 // License text can be found in the licenses/ folder.
 
 #import "StatusBarController.h"
+#import "InternetStateIndicatorView.h"
 #import "NSStringAdditions.h"
 #import "Utils.h"
 
@@ -23,6 +24,31 @@ typedef NS_ENUM(NSUInteger, StatusTag) {
     StatusTagSessionTransfer = 3
 };
 
+@implementation InternetStateIndicatorSnapshot
+
+- (instancetype)initWithState:(InternetStateIndicatorState)state
+                      toolTip:(NSString*)toolTip
+           accessibilityLabel:(NSString*)accessibilityLabel
+{
+    if ((self = [super init]))
+    {
+        _state = state;
+        _toolTip = [toolTip copy];
+        _accessibilityLabel = [accessibilityLabel copy];
+    }
+
+    return self;
+}
+
++ (instancetype)snapshotWithState:(InternetStateIndicatorState)state
+                          toolTip:(NSString*)toolTip
+               accessibilityLabel:(NSString*)accessibilityLabel
+{
+    return [[self alloc] initWithState:state toolTip:toolTip accessibilityLabel:accessibilityLabel];
+}
+
+@end
+
 @interface StatusBarController ()
 
 @property(nonatomic) IBOutlet NSButton* fStatusButton;
@@ -30,6 +56,7 @@ typedef NS_ENUM(NSUInteger, StatusTag) {
 @property(nonatomic) IBOutlet NSTextField* fTotalULField;
 @property(nonatomic) IBOutlet NSImageView* fTotalDLImageView;
 @property(nonatomic) IBOutlet NSImageView* fTotalULImageView;
+@property(nonatomic) IBOutlet InternetStateIndicatorView* fInternetStateView;
 
 @property(nonatomic, readonly) tr_session* fLib;
 
@@ -39,6 +66,23 @@ typedef NS_ENUM(NSUInteger, StatusTag) {
 @end
 
 @implementation StatusBarController
+
+static NSColor* colorForInternetState(InternetStateIndicatorState state)
+{
+    switch (state)
+    {
+    case InternetStateIndicatorStateGreen:
+        return NSColor.systemGreenColor;
+
+    case InternetStateIndicatorStateYellow:
+        return NSColor.systemYellowColor;
+
+    case InternetStateIndicatorStateRed:
+        return NSColor.systemRedColor;
+    }
+
+    return NSColor.systemYellowColor;
+}
 
 - (instancetype)initWithLib:(tr_session*)lib
 {
@@ -69,13 +113,14 @@ typedef NS_ENUM(NSUInteger, StatusTag) {
     self.fTotalULImageView.cell.backgroundStyle = NSBackgroundStyleRaised;
 
     [self updateSpeedFieldsToolTips];
+    self.fInternetStateView.indicatorColor = colorForInternetState(InternetStateIndicatorStateYellow);
 
     //update when speed limits are changed
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(updateSpeedFieldsToolTips) name:@"SpeedLimitUpdate"
                                              object:nil];
 }
 
-- (void)updateWithDownload:(CGFloat)dlRate upload:(CGFloat)ulRate
+- (void)updateWithDownload:(CGFloat)dlRate upload:(CGFloat)ulRate internetState:(InternetStateIndicatorSnapshot*)internetState
 {
     //set rates
     if (!isSpeedEqual(self.fPreviousDownloadRate, dlRate))
@@ -117,6 +162,10 @@ typedef NS_ENUM(NSUInteger, StatusTag) {
     {
         self.fStatusButton.title = statusString;
     }
+
+    self.fInternetStateView.indicatorColor = colorForInternetState(internetState.state);
+    self.fInternetStateView.toolTip = internetState.toolTip;
+    self.fInternetStateView.indicatorAccessibilityLabel = internetState.accessibilityLabel;
 }
 
 - (void)setStatusLabel:(id)sender
