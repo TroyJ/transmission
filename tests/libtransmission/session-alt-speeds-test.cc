@@ -67,7 +67,8 @@ protected:
         tmdate.tm_year = 2023 - 1900;
         tmdate.tm_wday = 0; // Sunday
         tmdate.tm_yday = 0;
-        tmdate.tm_isdst = 0;
+        // Let mktime() determine DST so this stays correct in summer-time zones.
+        tmdate.tm_isdst = -1;
         return mktime(&tmdate);
     }
 };
