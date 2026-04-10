@@ -641,6 +641,7 @@ TEST_F(RpcTest, sessionGet)
     ASSERT_NE(response_map, nullptr);
     auto* args_map = response_map->find_if<tr_variant::Map>(TR_KEY_result);
     ASSERT_NE(args_map, nullptr);
+    EXPECT_EQ(TrRpcVersionSemver, args_map->value_if<std::string_view>(TR_KEY_rpc_version_semver).value_or("missing"sv));
 
     // what we expected
     static auto constexpr ExpectedKeysUnsorted = std::array{
@@ -799,6 +800,7 @@ TEST_F(RpcTest, torrentGetRelocationFields)
     fields.emplace_back(tr_quark_get_string_view(TR_KEY_relocation_bytes_total));
     fields.emplace_back(tr_quark_get_string_view(TR_KEY_relocation_rate_bps));
     fields.emplace_back(tr_quark_get_string_view(TR_KEY_relocation_error));
+    fields.emplace_back(tr_quark_get_string_view(TR_KEY_relocation_phase));
     params.try_emplace(TR_KEY_fields, std::move(fields));
     request_map.try_emplace(TR_KEY_params, std::move(params));
 
@@ -825,6 +827,7 @@ TEST_F(RpcTest, torrentGetRelocationFields)
     EXPECT_EQ(0, first_torrent->value_if<int64_t>(TR_KEY_relocation_bytes_total).value_or(-1));
     EXPECT_EQ(0, first_torrent->value_if<int64_t>(TR_KEY_relocation_rate_bps).value_or(-1));
     EXPECT_EQ(""sv, first_torrent->value_if<std::string_view>(TR_KEY_relocation_error).value_or("missing"sv));
+    EXPECT_EQ("none"sv, first_torrent->value_if<std::string_view>(TR_KEY_relocation_phase).value_or("missing"sv));
 
     tr_torrentRemove(tor, false, nullptr, nullptr);
 }

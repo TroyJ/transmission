@@ -1081,6 +1081,21 @@ CA
                         <action selector="resumeSelectedTorrentsNoWait:" target="206" id="1809"/>
                     </connections>
                 </menuItem>
+                <menuItem title="Retry Relocation" secondaryImage="arrow.clockwise" catalog="system" id="TjR-1a-yA1">
+                    <connections>
+                        <action selector="retryRelocationSelected:" target="206" id="TjR-1b-yA1"/>
+                    </connections>
+                </menuItem>
+                <menuItem title="Cancel Relocation" secondaryImage="xmark.circle" catalog="system" id="TjR-1c-yA1">
+                    <connections>
+                        <action selector="cancelRelocationSelected:" target="206" id="TjR-1d-yA1"/>
+                    </connections>
+                </menuItem>
+                <menuItem title="Resume Relocation" secondaryImage="arrow.clockwise" catalog="system" id="TjR-1e-yA1">
+                    <connections>
+                        <action selector="resumeRelocationSelected:" target="206" id="TjR-1f-yA1"/>
+                    </connections>
+                </menuItem>
                 <menuItem isSeparatorItem="YES" id="613">
                     <modifierMask key="keyEquivalentModifierMask" command="YES"/>
                 </menuItem>

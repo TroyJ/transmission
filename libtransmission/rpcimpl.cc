@@ -681,6 +681,31 @@ namespace make_torrent_field_helpers
 
     return tr_variant::unmanaged_string(""sv);
 }
+
+[[nodiscard]] auto relocation_phase_string(tr_torrent_relocation_state const state)
+{
+    switch (state)
+    {
+    case TR_RELOC_NONE:
+        return "none"sv;
+    case TR_RELOC_QUEUED:
+        return "queued"sv;
+    case TR_RELOC_COPYING:
+        return "copying"sv;
+    case TR_RELOC_VERIFYING:
+        return "verifying"sv;
+    case TR_RELOC_RENAMING:
+        return "renaming"sv;
+    case TR_RELOC_DELETING_SOURCE:
+        return "deleting_source"sv;
+    case TR_RELOC_ERROR:
+        return "failed"sv;
+    case TR_RELOC_CANCELLED:
+        return "cancelled"sv;
+    }
+
+    return "failed"sv;
+}
 } // namespace make_torrent_field_helpers
 
 [[nodiscard]] auto constexpr isSupportedTorrentGetField(tr_quark key)
@@ -745,6 +770,7 @@ namespace make_torrent_field_helpers
     case TR_KEY_relocation_bytes_copied:
     case TR_KEY_relocation_bytes_total:
     case TR_KEY_relocation_error:
+    case TR_KEY_relocation_phase:
     case TR_KEY_relocation_rate_bps:
     case TR_KEY_relocation_state:
     case TR_KEY_recheck_progress:
@@ -903,6 +929,8 @@ namespace make_torrent_field_helpers
         return st.relocationBytesTotal;
     case TR_KEY_relocation_error:
         return st.relocationErrorString;
+    case TR_KEY_relocation_phase:
+        return tr_variant::unmanaged_string(relocation_phase_string(st.relocationState));
     case TR_KEY_relocation_rate_bps:
         return st.relocationRate_Bps;
     case TR_KEY_relocation_state:
@@ -1640,12 +1668,11 @@ void onBlocklistFetched(tr_web::FetchResponse const& web_response)
 
 void blocklistUpdate(tr_session* session, tr_variant::Map const& /*args_in*/, struct tr_rpc_idle_data* idle_data)
 {
-    session->fetch(
-        {
-            session->blocklistUrl(),
-            [](tr_web::FetchResponse const& r) { onBlocklistFetched(r); },
-            idle_data,
-        });
+    session->fetch({
+        session->blocklistUrl(),
+        [](tr_web::FetchResponse const& r) { onBlocklistFetched(r); },
+        idle_data,
+    });
 }
 
 // ---
@@ -1701,12 +1728,11 @@ void onMetadataFetched(tr_web::FetchResponse const& web_response)
     auto const& [status, body, primary_ip, did_connect, did_timeout, user_data] = web_response;
     auto* data = static_cast<struct add_torrent_idle_data*>(user_data);
 
-    tr_logAddTrace(
-        fmt::format(
-            "torrentAdd: HTTP response code was {} ({}); response length was {} bytes",
-            status,
-            tr_webGetResponseStr(status),
-            std::size(body)));
+    tr_logAddTrace(fmt::format(
+        "torrentAdd: HTTP response code was {} ({}); response length was {} bytes",
+        status,
+        tr_webGetResponseStr(status),
+        std::size(body)));
 
     if (status == 200 || status == 221) /* http or ftp success.. */
     {

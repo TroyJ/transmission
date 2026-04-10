@@ -418,10 +418,9 @@ tr_session::BoundSocket::BoundSocket(
         return;
     }
 
-    tr_logAddInfo(
-        fmt::format(
-            fmt::runtime(_("Listening to incoming peer connections on {hostport}")),
-            fmt::arg("hostport", tr_socket_address::display_name(addr, port))));
+    tr_logAddInfo(fmt::format(
+        fmt::runtime(_("Listening to incoming peer connections on {hostport}")),
+        fmt::arg("hostport", tr_socket_address::display_name(addr, port))));
     event_add(ev_.get(), nullptr);
 }
 
@@ -1567,10 +1566,9 @@ void session_load_torrents(tr_session* session, tr_ctor* ctor, std::promise<size
 
     if (n_torrents != 0U)
     {
-        tr_logAddInfo(
-            fmt::format(
-                fmt::runtime(tr_ngettext("Loaded {count} torrent", "Loaded {count} torrents", n_torrents)),
-                fmt::arg("count", n_torrents)));
+        tr_logAddInfo(fmt::format(
+            fmt::runtime(tr_ngettext("Loaded {count} torrent", "Loaded {count} torrents", n_torrents)),
+            fmt::arg("count", n_torrents)));
     }
 
     loaded_promise->set_value(n_torrents);
@@ -2144,6 +2142,11 @@ void tr_session::relocate_remove(tr_torrent const* const tor)
     {
         relocator_->remove(tor->info_hash());
     }
+}
+
+bool tr_session::relocate_cancel(tr_torrent const* const tor)
+{
+    return relocator_ ? relocator_->cancel(tor->info_hash()) : false;
 }
 
 // ---

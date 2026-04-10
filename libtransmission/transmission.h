@@ -920,7 +920,8 @@ enum tr_torrent_relocation_state : uint8_t
     TR_RELOC_VERIFYING,
     TR_RELOC_RENAMING,
     TR_RELOC_DELETING_SOURCE,
-    TR_RELOC_ERROR
+    TR_RELOC_ERROR,
+    TR_RELOC_CANCELLED
 };
 
 /**
@@ -931,6 +932,14 @@ enum tr_torrent_relocation_state : uint8_t
  * to the torrent's downloadDir.
  */
 void tr_torrentSetLocation(tr_torrent* torrent, char const* location, bool move_from_old_path, int volatile* setme_state);
+
+bool tr_torrentCanRetryRelocation(tr_torrent const* torrent);
+bool tr_torrentCanResumeRelocation(tr_torrent const* torrent);
+bool tr_torrentCanCancelRelocation(tr_torrent const* torrent);
+
+void tr_torrentRetryRelocation(tr_torrent* torrent);
+void tr_torrentResumeRelocation(tr_torrent* torrent);
+void tr_torrentCancelRelocation(tr_torrent* torrent);
 
 uint64_t tr_torrentGetBytesLeftToAllocate(tr_torrent const* torrent);
 

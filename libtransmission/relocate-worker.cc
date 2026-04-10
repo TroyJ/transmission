@@ -41,9 +41,9 @@ auto constexpr CopyChunkSize = size_t{ 1024U * 1024U };
 auto constexpr ProgressSaveInterval = 64U * 1024U * 1024U;
 auto constexpr ProgressUpdateInterval = 5s;
 
-[[nodiscard]] constexpr auto is_active_state(tr_torrent_relocation_state const state) noexcept
+[[nodiscard]] constexpr auto is_cancelable_state(tr_torrent_relocation_state const state) noexcept
 {
-    return state != TR_RELOC_NONE && state != TR_RELOC_ERROR;
+    return state == TR_RELOC_QUEUED || state == TR_RELOC_COPYING || state == TR_RELOC_VERIFYING;
 }
 
 [[nodiscard]] auto phase_to_string(tr_torrent_relocation_state const state)
@@ -63,10 +63,12 @@ auto constexpr ProgressUpdateInterval = 5s;
     case TR_RELOC_DELETING_SOURCE:
         return "deleting_source"sv;
     case TR_RELOC_ERROR:
-        return "error"sv;
+        return "failed"sv;
+    case TR_RELOC_CANCELLED:
+        return "cancelled"sv;
     }
 
-    return "error"sv;
+    return "failed"sv;
 }
 
 [[nodiscard]] std::optional<tr_torrent_relocation_state> phase_from_string(std::string_view const phase) noexcept
@@ -95,9 +97,13 @@ auto constexpr ProgressUpdateInterval = 5s;
     {
         return TR_RELOC_DELETING_SOURCE;
     }
-    if (phase == "error"sv)
+    if (phase == "failed"sv || phase == "error"sv)
     {
         return TR_RELOC_ERROR;
+    }
+    if (phase == "cancelled"sv)
+    {
+        return TR_RELOC_CANCELLED;
     }
 
     return {};
@@ -106,12 +112,8 @@ auto constexpr ProgressUpdateInterval = 5s;
 [[nodiscard]] auto temp_path(tr_relocate_worker::Snapshot const& snapshot, tr_file_index_t const file_index)
 {
     return tr_pathbuf{
-        snapshot.target_root,
-        '/',
-        snapshot.metainfo.file_subpath(file_index),
-        ".trreloc."sv,
-        snapshot.info_hash_string,
-        ".tmp"sv,
+        snapshot.target_root,      '/',      snapshot.metainfo.file_subpath(file_index), ".trreloc."sv,
+        snapshot.info_hash_string, ".tmp"sv,
     };
 }
 
@@ -149,6 +151,7 @@ struct Journal
     std::string previous_download_dir;
     std::string previous_incomplete_dir;
     std::string error;
+    bool resume_after_relocation = false;
 };
 
 [[nodiscard]] auto relocation_dir(std::string_view const journal_file)
@@ -213,6 +216,10 @@ struct Journal
     {
         journal.error = std::string{ *value };
     }
+    if (auto const value = map->value_if<bool>(tr_quark_new("resume_after_relocation"sv)); value)
+    {
+        journal.resume_after_relocation = *value;
+    }
 
     return journal;
 }
@@ -236,6 +243,7 @@ struct Journal
     out.try_emplace(tr_quark_new("previous_incomplete_dir"sv), journal.previous_incomplete_dir);
     out.try_emplace(tr_quark_new("updated_at"sv), static_cast<int64_t>(tr_time()));
     out.try_emplace(tr_quark_new("error"sv), journal.error);
+    out.try_emplace(tr_quark_new("resume_after_relocation"sv), journal.resume_after_relocation);
 
     return tr_variant_serde::json().to_file(std::move(out), snapshot.journal_file);
 }
@@ -253,6 +261,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     journal.target_root = snapshot.target_root;
     journal.previous_download_dir = snapshot.previous_download_dir;
     journal.previous_incomplete_dir = snapshot.previous_incomplete_dir;
+    journal.resume_after_relocation = snapshot.resume_after_relocation;
 
     if (auto const loaded = load_journal(snapshot); loaded)
     {
@@ -282,7 +291,10 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     return journal;
 }
 
-[[nodiscard]] auto source_path(tr_relocate_worker::Snapshot const& snapshot, Journal const& journal, tr_file_index_t const file_index)
+[[nodiscard]] auto source_path(
+    tr_relocate_worker::Snapshot const& snapshot,
+    Journal const& journal,
+    tr_file_index_t const file_index)
 {
     auto const base = tr_pathbuf{ journal.source_root, '/', snapshot.metainfo.file_subpath(file_index) };
     if (tr_sys_path_exists(base))
@@ -350,25 +362,6 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     return true;
 }
 
-[[nodiscard]] bool all_temp_files_ready(tr_relocate_worker::Snapshot const& snapshot)
-{
-    for (tr_file_index_t file_index = 0, n_files = snapshot.metainfo.file_count(); file_index < n_files; ++file_index)
-    {
-        auto const file_size = snapshot.metainfo.file_size(file_index);
-        if (file_size == 0U)
-        {
-            continue;
-        }
-
-        if (auto const size = file_size_if_exists(temp_path(snapshot, file_index)); !size || *size != file_size)
-        {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 [[nodiscard]] bool copy_file(
     tr_relocate_worker::Snapshot const& snapshot,
     Journal& journal,
@@ -399,11 +392,12 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         return true;
     }
 
-    if (auto const existing = file_size_if_exists(dst); existing && *existing <= file_size)
+    if (auto const existing_size = file_size_if_exists(dst); existing_size && *existing_size <= file_size)
     {
-        offset = *existing;
+        offset = *existing_size;
     }
-    else if (auto const existing = file_size_if_exists(dst); existing && *existing > file_size)
+    else if (auto const oversized_existing_size = file_size_if_exists(dst);
+             oversized_existing_size && *oversized_existing_size > file_size)
     {
         tr_sys_path_remove(dst, nullptr);
     }
@@ -454,12 +448,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         {
             if (error != nullptr && !*error)
             {
-                error->set(
-                    EIO,
-                    fmt::format(
-                        "Couldn't read '{}' at {} bytes",
-                        src,
-                        offset));
+                error->set(EIO, fmt::format("Couldn't read '{}' at {} bytes", src, offset));
             }
             tr_sys_file_close(out, nullptr);
             tr_sys_file_close(in, nullptr);
@@ -481,12 +470,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             {
                 if (error != nullptr && !*error)
                 {
-                    error->set(
-                        EIO,
-                        fmt::format(
-                            "Couldn't write '{}' at {} bytes",
-                            dst,
-                            offset + wrote_total));
+                    error->set(EIO, fmt::format("Couldn't write '{}' at {} bytes", dst, offset + wrote_total));
                 }
                 tr_sys_file_close(out, nullptr);
                 tr_sys_file_close(in, nullptr);
@@ -504,7 +488,8 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         bytes_since_last_rate += bytes_read;
 
         auto const now = std::chrono::steady_clock::now();
-        auto const save_needed = bytes_since_last_save >= ProgressSaveInterval || now - last_progress_at >= ProgressUpdateInterval;
+        auto const save_needed = bytes_since_last_save >= ProgressSaveInterval ||
+            now - last_progress_at >= ProgressUpdateInterval;
         if (save_needed)
         {
             auto rate_bps = uint64_t{};
@@ -863,12 +848,26 @@ bool tr_relocate_worker::add(std::unique_ptr<Mediator> mediator, tr_priority_t c
     auto const& snapshot = mediator->snapshot();
 
     if ((current_node_ && current_node_->matches(snapshot.info_hash)) ||
-        std::any_of(std::begin(todo_), std::end(todo_), [&snapshot](auto const& node) { return node.matches(snapshot.info_hash); }))
+        std::any_of(
+            std::begin(todo_),
+            std::end(todo_),
+            [&snapshot](auto const& node) { return node.matches(snapshot.info_hash); }))
     {
         return false;
     }
 
-    mediator->on_relocate_state_changed(TR_RELOC_QUEUED, 0U, snapshot.metainfo.total_size(), 0U, {});
+    auto journal = initial_journal(snapshot);
+    journal.phase = TR_RELOC_QUEUED;
+    journal.bytes_total = snapshot.metainfo.total_size();
+    journal.bytes_copied = std::min(journal.bytes_copied, journal.bytes_total);
+    journal.error.clear();
+    journal.resume_after_relocation = snapshot.resume_after_relocation;
+    if (!save_journal(snapshot, journal, nullptr))
+    {
+        return false;
+    }
+
+    mediator->on_relocate_state_changed(TR_RELOC_QUEUED, journal.bytes_copied, journal.bytes_total, 0U, {});
     todo_.emplace(std::move(mediator), priority);
 
     if (!relocate_thread_id_)
@@ -900,11 +899,48 @@ void tr_relocate_worker::remove(tr_sha1_digest_t const& info_hash)
     }
 }
 
+bool tr_relocate_worker::cancel(tr_sha1_digest_t const& info_hash)
+{
+    auto lock = std::unique_lock{ relocate_mutex_ };
+
+    if (current_node_ && current_node_->matches(info_hash))
+    {
+        auto const journal = load_journal(current_node_->mediator_->snapshot());
+        if (!journal || !is_cancelable_state(journal->phase))
+        {
+            return false;
+        }
+
+        cancel_current_ = true;
+        stop_current_ = true;
+        stop_current_cv_.wait(lock, [this]() { return !stop_current_; });
+        return true;
+    }
+
+    if (auto const iter = std::find_if(
+            std::begin(todo_),
+            std::end(todo_),
+            [&info_hash](auto const& node) { return node.matches(info_hash); });
+        iter != std::end(todo_))
+    {
+        auto journal = initial_journal(iter->mediator_->snapshot());
+        journal.phase = TR_RELOC_CANCELLED;
+        journal.error.clear();
+        (void)save_journal(iter->mediator_->snapshot(), journal, nullptr);
+        iter->mediator_->on_relocate_state_changed(TR_RELOC_CANCELLED, journal.bytes_copied, journal.bytes_total, 0U, {});
+        todo_.erase(iter);
+        return true;
+    }
+
+    return false;
+}
+
 tr_relocate_worker::~tr_relocate_worker()
 {
     {
         auto const lock = std::scoped_lock{ relocate_mutex_ };
         stop_current_ = true;
+        cancel_current_ = false;
         todo_.clear();
     }
 
@@ -933,14 +969,12 @@ void tr_relocate_worker::relocate_thread_func()
         auto const snapshot = mediator.snapshot();
         auto journal = initial_journal(snapshot);
         auto error = tr_error{};
-        auto aborted = false;
-
-        auto const finish_current = [this, &aborted]()
+        auto const finish_current = [this]()
         {
             auto lock = std::unique_lock{ relocate_mutex_ };
-            aborted = stop_current_;
             current_node_.reset();
             stop_current_ = false;
+            cancel_current_ = false;
             lock.unlock();
             stop_current_cv_.notify_all();
         };
@@ -960,12 +994,8 @@ void tr_relocate_worker::relocate_thread_func()
                     journal.phase = TR_RELOC_ERROR;
                     journal.error = error ? error.message() : "Relocation delete failed"s;
                     (void)save_journal(snapshot, journal, nullptr);
-                    mediator.on_relocate_state_changed(
-                        TR_RELOC_ERROR,
-                        journal.bytes_total,
-                        journal.bytes_total,
-                        0U,
-                        journal.error);
+                    mediator
+                        .on_relocate_state_changed(TR_RELOC_ERROR, journal.bytes_total, journal.bytes_total, 0U, journal.error);
                 }
 
                 finish_current();
@@ -1002,6 +1032,13 @@ void tr_relocate_worker::relocate_thread_func()
             mediator.on_source_deleted();
             remove_journal(snapshot);
             mediator.on_relocate_state_changed(TR_RELOC_NONE, journal.bytes_total, journal.bytes_total, 0U, {});
+        }
+        else if (cancel_current_)
+        {
+            journal.phase = TR_RELOC_CANCELLED;
+            journal.error.clear();
+            (void)save_journal(snapshot, journal, nullptr);
+            mediator.on_relocate_state_changed(TR_RELOC_CANCELLED, journal.bytes_copied, journal.bytes_total, 0U, {});
         }
         else if (!stop_current_)
         {

@@ -11,11 +11,11 @@
 struct tr_session;
 struct tr_variant;
 
-#define RPC_VERSION_VARS(major, minor, patch) \
-    auto inline constexpr TrRpcVersionSemver = std::string_view{ #major "." #minor "." #patch }; \
+#define RPC_VERSION_VARS(major, minor, patch, suffix) \
+    auto inline constexpr TrRpcVersionSemver = std::string_view{ #major "." #minor "." #patch suffix }; \
     auto inline constexpr TrRpcVersionSemverMajor = major;
 
-RPC_VERSION_VARS(6, 0, 1)
+RPC_VERSION_VARS(6, 0, 1, "+troy.1")
 
 #undef RPC_VERSION_VARS
 

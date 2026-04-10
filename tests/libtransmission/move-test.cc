@@ -35,7 +35,7 @@ auto constexpr MaxWaitMsec = 5000;
     auto const done = [tor]()
     {
         auto const state = tr_torrentStat(tor)->relocationState;
-        return state == TR_RELOC_NONE || state == TR_RELOC_ERROR;
+        return state == TR_RELOC_NONE || state == TR_RELOC_ERROR || state == TR_RELOC_CANCELLED;
     };
 
     if (!waitFor(done, max_wait_msec))
@@ -43,7 +43,8 @@ auto constexpr MaxWaitMsec = 5000;
         return false;
     }
 
-    return tr_torrentStat(tor)->relocationState != TR_RELOC_ERROR;
+    auto const state = tr_torrentStat(tor)->relocationState;
+    return state != TR_RELOC_ERROR && state != TR_RELOC_CANCELLED;
 }
 
 class IncompleteDirTest
@@ -209,6 +210,29 @@ TEST_F(MoveTest, setLocation)
 
     // cleanup
     tr_torrentRemove(tor, true, nullptr, nullptr);
+}
+
+TEST_F(MoveTest, relocationControlPredicates)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    ASSERT_NE(nullptr, tor);
+
+    tor->set_relocation_state(TR_RELOC_ERROR, 0U, 0U, 0U, {});
+    EXPECT_TRUE(tr_torrentCanRetryRelocation(tor));
+    EXPECT_FALSE(tr_torrentCanResumeRelocation(tor));
+    EXPECT_FALSE(tr_torrentCanCancelRelocation(tor));
+
+    tor->set_relocation_state(TR_RELOC_COPYING, 1U, 2U, 0U, {});
+    EXPECT_FALSE(tr_torrentCanRetryRelocation(tor));
+    EXPECT_FALSE(tr_torrentCanResumeRelocation(tor));
+    EXPECT_TRUE(tr_torrentCanCancelRelocation(tor));
+
+    tor->set_relocation_state(TR_RELOC_CANCELLED, 1U, 2U, 0U, {});
+    EXPECT_FALSE(tr_torrentCanRetryRelocation(tor));
+    EXPECT_TRUE(tr_torrentCanResumeRelocation(tor));
+    EXPECT_FALSE(tr_torrentCanCancelRelocation(tor));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
 }
 
 } // namespace libtransmission::test

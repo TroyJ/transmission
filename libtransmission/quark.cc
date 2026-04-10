@@ -464,6 +464,7 @@ auto constexpr MyStatic = std::array<std::string_view, TR_N_KEYS>{
     "relocation_bytes_copied"sv, // rpc
     "relocation_bytes_total"sv, // rpc
     "relocation_error"sv, // rpc
+    "relocation_phase"sv, // rpc
     "relocation_rate_bps"sv, // rpc
     "relocation_state"sv, // rpc
     "remote-session-enabled"sv, // qt app

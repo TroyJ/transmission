@@ -828,7 +828,7 @@ version in an HTTP header `X-Transmission-Rpc-Version: {rpc_version_semver}`
 in the CSRF HTTP 409 response. This is so
 that clients supporting both JSON-RPC and the old bespoke API can determine
 which scheme to use without making any extra requests.
-Example: `X-Transmission-Rpc-Version: 6.0.0`
+Example: `X-Transmission-Rpc-Version: 6.0.1+troy.1`
 
 Breaking changes are denoted with a :bomb: emoji.
 
@@ -1112,8 +1112,8 @@ Transmission 4.1.1 (`rpc_version_semver` 6.0.1, `rpc_version`: 19)
 | `group_get` | `speed_limit_down` reverted to return an integer
 | `group_get` | `speed_limit_up` reverted to return an integer
 
-Current fork additions
+Current fork additions (`rpc_version_semver` 6.0.1+troy.1, `rpc_version`: 19)
 
 | Method | Description
 |:---|:---
-| `torrent_get` | new args `relocation_bytes_copied`, `relocation_bytes_total`, `relocation_error`, `relocation_rate_bps`, and `relocation_state`
+| `torrent_get` | new args `relocation_bytes_copied`, `relocation_bytes_total`, `relocation_error`, `relocation_phase`, `relocation_rate_bps`, and `relocation_state`

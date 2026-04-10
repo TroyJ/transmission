@@ -19,6 +19,13 @@ typedef NS_ENUM(NSUInteger, OptionPopupPriority) {
     OptionPopupPriorityLow = 2,
 };
 
+typedef NS_ENUM(NSUInteger, RelocationActionType) {
+    RelocationActionTypeNone = 0,
+    RelocationActionTypeRetry = 1,
+    RelocationActionTypeCancel = 2,
+    RelocationActionTypeResume = 3,
+};
+
 static NSInteger const kInvalidValue = -99;
 
 static CGFloat const kStackViewInset = 12.0;
@@ -58,6 +65,8 @@ static CGFloat const kStackViewSpacing = 8.0;
 @property(nonatomic, readonly) CGFloat fHorizLayoutHeight;
 @property(nonatomic, readonly) CGFloat fHorizLayoutWidth;
 @property(nonatomic, readonly) CGFloat fVertLayoutHeight;
+@property(nonatomic) NSButton* fRelocationActionButton;
+@property(nonatomic) RelocationActionType fRelocationActionType;
 
 @end
 
@@ -77,6 +86,18 @@ static CGFloat const kStackViewSpacing = 8.0;
 {
     [super awakeFromNib];
     [self checkWindowSize];
+
+    self.fRelocationActionButton = [NSButton buttonWithTitle:@"" target:self action:@selector(handleRelocationAction:)];
+    self.fRelocationActionButton.bezelStyle = NSBezelStyleRounded;
+    self.fRelocationActionButton.controlSize = NSControlSizeSmall;
+    self.fRelocationActionButton.hidden = YES;
+    self.fRelocationActionButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.fSeedingView addSubview:self.fRelocationActionButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.fRelocationActionButton.leadingAnchor constraintEqualToAnchor:self.fRemoveSeedingCompleteCheck.leadingAnchor],
+        [self.fRelocationActionButton.topAnchor constraintEqualToAnchor:self.fRemoveSeedingCompleteCheck.bottomAnchor constant:6.0],
+        [self.fRelocationActionButton.trailingAnchor constraintLessThanOrEqualToAnchor:self.fSeedingView.trailingAnchor constant:-12.0],
+    ]];
 
     [self setGlobalLabels];
 
@@ -194,6 +215,7 @@ static CGFloat const kStackViewSpacing = 8.0;
 {
     if (self.fTorrents.count == 0)
     {
+        [self updateRelocationActionControls];
         return;
     }
 
@@ -448,6 +470,8 @@ static CGFloat const kStackViewSpacing = 8.0;
     {
         self.fPeersConnectField.stringValue = @"";
     }
+
+    [self updateRelocationActionControls];
 }
 
 - (void)setUseSpeedLimit:(id)sender
@@ -732,6 +756,8 @@ static CGFloat const kStackViewSpacing = 8.0;
     {
         [self updateOptions];
     }
+
+    [self updateRelocationActionControls];
 }
 
 - (void)setGlobalLabels
@@ -757,12 +783,113 @@ static CGFloat const kStackViewSpacing = 8.0;
     self.fIdleLimitGlobalLabel.stringValue = globalIdle;
 }
 
+- (RelocationActionType)sharedRelocationActionType
+{
+    if (self.fTorrents.count == 0)
+    {
+        return RelocationActionTypeNone;
+    }
+
+    RelocationActionType actionType = RelocationActionTypeNone;
+    for (Torrent* torrent in self.fTorrents)
+    {
+        RelocationActionType torrentAction = RelocationActionTypeNone;
+        if (torrent.canRetryRelocation)
+        {
+            torrentAction = RelocationActionTypeRetry;
+        }
+        else if (torrent.canCancelRelocation)
+        {
+            torrentAction = RelocationActionTypeCancel;
+        }
+        else if (torrent.canResumeRelocation)
+        {
+            torrentAction = RelocationActionTypeResume;
+        }
+
+        if (torrentAction == RelocationActionTypeNone)
+        {
+            return RelocationActionTypeNone;
+        }
+
+        if (actionType == RelocationActionTypeNone)
+        {
+            actionType = torrentAction;
+        }
+        else if (actionType != torrentAction)
+        {
+            return RelocationActionTypeNone;
+        }
+    }
+
+    return actionType;
+}
+
+- (void)updateRelocationActionControls
+{
+    BOOL const wasHidden = self.fRelocationActionButton.hidden;
+    self.fRelocationActionType = [self sharedRelocationActionType];
+
+    NSString* title = nil;
+    switch (self.fRelocationActionType)
+    {
+    case RelocationActionTypeRetry:
+        title = NSLocalizedString(@"Retry Relocation", "Info options -> relocation action");
+        break;
+    case RelocationActionTypeCancel:
+        title = NSLocalizedString(@"Cancel Relocation", "Info options -> relocation action");
+        break;
+    case RelocationActionTypeResume:
+        title = NSLocalizedString(@"Resume Relocation", "Info options -> relocation action");
+        break;
+    case RelocationActionTypeNone:
+        break;
+    }
+
+    self.fRelocationActionButton.hidden = title == nil;
+    if (title != nil)
+    {
+        self.fRelocationActionButton.title = title;
+        self.fRelocationActionButton.enabled = YES;
+    }
+
+    if (wasHidden != self.fRelocationActionButton.hidden)
+    {
+        [self.view setNeedsLayout:YES];
+    }
+}
+
+- (IBAction)handleRelocationAction:(id)sender
+{
+    for (Torrent* torrent in self.fTorrents)
+    {
+        switch (self.fRelocationActionType)
+        {
+        case RelocationActionTypeRetry:
+            [torrent retryRelocation];
+            break;
+        case RelocationActionTypeCancel:
+            [torrent cancelRelocation];
+            break;
+        case RelocationActionTypeResume:
+            [torrent resumeRelocation];
+            break;
+        case RelocationActionTypeNone:
+            break;
+        }
+    }
+
+    [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateOptions" object:self];
+}
+
 - (void)updateOptionsNotification:(NSNotification*)notification
 {
     if (notification.object != self)
     {
         [self updateOptions];
     }
+
+    [self updateRelocationActionControls];
 }
 
 @end

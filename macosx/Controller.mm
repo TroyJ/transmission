@@ -2125,6 +2125,36 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     [self moveDataFiles:self.fTableView.selectedTorrents];
 }
 
+- (void)retryRelocationSelected:(id)sender
+{
+    for (Torrent* torrent in self.fTableView.selectedTorrents)
+    {
+        [torrent retryRelocation];
+    }
+
+    [self fullUpdateUI];
+}
+
+- (void)cancelRelocationSelected:(id)sender
+{
+    for (Torrent* torrent in self.fTableView.selectedTorrents)
+    {
+        [torrent cancelRelocation];
+    }
+
+    [self fullUpdateUI];
+}
+
+- (void)resumeRelocationSelected:(id)sender
+{
+    for (Torrent* torrent in self.fTableView.selectedTorrents)
+    {
+        [torrent resumeRelocation];
+    }
+
+    [self fullUpdateUI];
+}
+
 - (void)moveDataFiles:(NSArray<Torrent*>*)torrents
 {
     NSOpenPanel* panel = [NSOpenPanel openPanel];
@@ -4915,6 +4945,57 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             }
         }
         return NO;
+    }
+
+    if (action == @selector(retryRelocationSelected:))
+    {
+        if (!canUseTable || self.fTableView.numberOfSelectedRows == 0)
+        {
+            return NO;
+        }
+
+        for (Torrent* torrent in self.fTableView.selectedTorrents)
+        {
+            if (!torrent.canRetryRelocation)
+            {
+                return NO;
+            }
+        }
+        return YES;
+    }
+
+    if (action == @selector(cancelRelocationSelected:))
+    {
+        if (!canUseTable || self.fTableView.numberOfSelectedRows == 0)
+        {
+            return NO;
+        }
+
+        for (Torrent* torrent in self.fTableView.selectedTorrents)
+        {
+            if (!torrent.canCancelRelocation)
+            {
+                return NO;
+            }
+        }
+        return YES;
+    }
+
+    if (action == @selector(resumeRelocationSelected:))
+    {
+        if (!canUseTable || self.fTableView.numberOfSelectedRows == 0)
+        {
+            return NO;
+        }
+
+        for (Torrent* torrent in self.fTableView.selectedTorrents)
+        {
+            if (!torrent.canResumeRelocation)
+            {
+                return NO;
+            }
+        }
+        return YES;
     }
 
     //enable manual announce item

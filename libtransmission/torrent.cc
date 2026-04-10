@@ -33,6 +33,7 @@
 #include "libtransmission/magnet-metainfo.h"
 #include "libtransmission/peer-common.h"
 #include "libtransmission/peer-mgr.h"
+#include "libtransmission/quark.h"
 #include "libtransmission/resume.h"
 #include "libtransmission/session.h"
 #include "libtransmission/subprocess.h"
@@ -43,6 +44,7 @@
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-strbuf.h"
 #include "libtransmission/utils.h"
+#include "libtransmission/variant.h"
 #include "libtransmission/version.h"
 #include "libtransmission/web-utils.h"
 
@@ -71,6 +73,96 @@ using namespace libtransmission::Values;
     } while (0)
 
 // ---
+
+namespace
+{
+struct RelocationJournalState
+{
+    tr_torrent_relocation_state phase = TR_RELOC_NONE;
+    uint64_t bytes_total = 0U;
+    uint64_t bytes_copied = 0U;
+    std::string error;
+    std::string target_root;
+    bool resume_after_relocation = false;
+};
+
+[[nodiscard]] std::optional<RelocationJournalState> load_relocation_journal_state(std::string_view const filename)
+{
+    auto top = tr_variant_serde::json().parse_file(filename);
+    if (!top)
+    {
+        return {};
+    }
+
+    auto const* const map = top->get_if<tr_variant::Map>();
+    if (map == nullptr)
+    {
+        return {};
+    }
+
+    auto journal = RelocationJournalState{};
+    if (auto const phase = map->value_if<std::string_view>(tr_quark_new("phase"sv)); phase)
+    {
+        if (*phase == "queued"sv)
+        {
+            journal.phase = TR_RELOC_QUEUED;
+        }
+        else if (*phase == "copying"sv)
+        {
+            journal.phase = TR_RELOC_COPYING;
+        }
+        else if (*phase == "verifying"sv)
+        {
+            journal.phase = TR_RELOC_VERIFYING;
+        }
+        else if (*phase == "renaming"sv)
+        {
+            journal.phase = TR_RELOC_RENAMING;
+        }
+        else if (*phase == "deleting_source"sv)
+        {
+            journal.phase = TR_RELOC_DELETING_SOURCE;
+        }
+        else if (*phase == "failed"sv || *phase == "error"sv)
+        {
+            journal.phase = TR_RELOC_ERROR;
+        }
+        else if (*phase == "cancelled"sv)
+        {
+            journal.phase = TR_RELOC_CANCELLED;
+        }
+    }
+
+    if (auto const value = map->value_if<int64_t>(tr_quark_new("bytes_total"sv)); value)
+    {
+        journal.bytes_total = static_cast<uint64_t>(*value);
+    }
+    if (auto const value = map->value_if<int64_t>(tr_quark_new("bytes_copied"sv)); value)
+    {
+        journal.bytes_copied = static_cast<uint64_t>(*value);
+    }
+    if (auto const value = map->value_if<std::string_view>(tr_quark_new("error"sv)); value)
+    {
+        journal.error = std::string{ *value };
+    }
+    if (auto const value = map->value_if<std::string_view>(tr_quark_new("target_root"sv)); value)
+    {
+        journal.target_root = std::string{ *value };
+    }
+    if (auto const value = map->value_if<bool>(tr_quark_new("resume_after_relocation"sv)); value)
+    {
+        journal.resume_after_relocation = *value;
+    }
+
+    return journal;
+}
+
+[[nodiscard]] constexpr bool is_relocation_active(tr_torrent_relocation_state const state) noexcept
+{
+    return state != TR_RELOC_NONE && state != TR_RELOC_ERROR && state != TR_RELOC_CANCELLED;
+}
+
+} // namespace
 
 void tr_torrent::Error::set_tracker_warning(tr_interned_string announce_url, std::string_view errmsg)
 {
@@ -151,13 +243,12 @@ bool tr_torrentSetMetainfoFromFile(tr_torrent* tor, tr_torrent_metainfo const* m
     tor->use_metainfo_from_file(metainfo, filename, &error);
     if (error)
     {
-        tor->error().set_local_error(
-            fmt::format(
-                fmt::runtime(_("Couldn't use metainfo from '{path}' for '{magnet}': {error} ({error_code})")),
-                fmt::arg("path", filename),
-                fmt::arg("magnet", tor->magnet()),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
+        tor->error().set_local_error(fmt::format(
+            fmt::runtime(_("Couldn't use metainfo from '{path}' for '{magnet}': {error} ({error_code})")),
+            fmt::arg("path", filename),
+            fmt::arg("magnet", tor->magnet()),
+            fmt::arg("error", error.message()),
+            fmt::arg("error_code", error.code())));
         return false;
     }
 
@@ -998,12 +1089,11 @@ void tr_torrent::init(tr_ctor const& ctor)
 
         if (error)
         {
-            this->error().set_local_error(
-                fmt::format(
-                    fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-                    fmt::arg("path", file_path),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
+            this->error().set_local_error(fmt::format(
+                fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
+                fmt::arg("path", file_path),
+                fmt::arg("error", error.message()),
+                fmt::arg("error_code", error.code())));
         }
     }
 
@@ -1031,7 +1121,19 @@ void tr_torrent::init(tr_ctor const& ctor)
 
     if (tr_sys_path_exists(relocation_journal_file()))
     {
-        (void)session->relocate_add(std::make_unique<RelocateMediator>(this, download_dir().sv()), get_priority());
+        if (auto const journal = load_relocation_journal_state(relocation_journal_file()); journal)
+        {
+            set_relocation_state(journal->phase, journal->bytes_copied, journal->bytes_total, 0U, journal->error);
+
+            if (is_relocation_active(journal->phase))
+            {
+                auto const& target_root = !std::empty(journal->target_root) ? journal->target_root :
+                                                                              std::string{ download_dir() };
+                (void)session->relocate_add(
+                    std::make_unique<RelocateMediator>(this, target_root, nullptr, journal->resume_after_relocation),
+                    get_priority());
+            }
+        }
     }
 }
 
@@ -1102,13 +1204,12 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
         ok = files().move(current_dir(), path, name(), &error);
         if (error)
         {
-            this->error().set_local_error(
-                fmt::format(
-                    fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
-                    fmt::arg("old_path", current_dir()),
-                    fmt::arg("path", path),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
+            this->error().set_local_error(fmt::format(
+                fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
+                fmt::arg("old_path", current_dir()),
+                fmt::arg("path", path),
+                fmt::arg("error", error.message()),
+                fmt::arg("error_code", error.code())));
             tr_torrentStop(this);
         }
     }
@@ -1165,22 +1266,24 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
     {
         if (session->am_in_session_thread())
         {
-            queue_relocation_in_session_thread(location, setme_state);
+            queue_relocation_in_session_thread(location, setme_state, std::nullopt);
         }
         else
         {
             session->run_in_session_thread([this, loc = std::string(location), setme_state]()
-                                           { queue_relocation_in_session_thread(loc, setme_state); });
+                                           { queue_relocation_in_session_thread(loc, setme_state, std::nullopt); });
         }
         return;
     }
 
-    session->run_in_session_thread(
-        [this, loc = std::string(location), move_from_old_path, setme_state]()
-        { set_location_in_session_thread(loc, move_from_old_path, setme_state); });
+    session->run_in_session_thread([this, loc = std::string(location), move_from_old_path, setme_state]()
+                                   { set_location_in_session_thread(loc, move_from_old_path, setme_state); });
 }
 
-void tr_torrent::queue_relocation_in_session_thread(std::string_view const path, int volatile* const setme_state)
+void tr_torrent::queue_relocation_in_session_thread(
+    std::string_view const path,
+    int volatile* const setme_state,
+    std::optional<bool> const resume_after_relocation)
 {
     TR_ASSERT(session->am_in_session_thread());
 
@@ -1202,7 +1305,7 @@ void tr_torrent::queue_relocation_in_session_thread(std::string_view const path,
         return;
     }
 
-    if (!session->relocate_add(std::make_unique<RelocateMediator>(this, path, setme_state), get_priority()))
+    if (is_relocation_active(relocation_state()))
     {
         if (setme_state != nullptr)
         {
@@ -1217,6 +1320,34 @@ void tr_torrent::queue_relocation_in_session_thread(std::string_view const path,
             _("Relocation already in progress for this torrent."));
         return;
     }
+
+    auto const should_resume = resume_after_relocation.value_or(is_running());
+    if (is_running())
+    {
+        stop_now();
+    }
+    else if (is_queued(queue_direction()))
+    {
+        set_is_queued(false);
+    }
+
+    if (!session->relocate_add(std::make_unique<RelocateMediator>(this, path, setme_state, should_resume), get_priority()))
+    {
+        if (setme_state != nullptr)
+        {
+            *setme_state = TR_LOC_ERROR;
+        }
+
+        set_relocation_state(
+            TR_RELOC_ERROR,
+            relocation_bytes_copied_,
+            relocation_bytes_total_,
+            0U,
+            _("Couldn't queue relocation job."));
+        return;
+    }
+
+    session->rpcNotify(TR_RPC_TORRENT_CHANGED, this);
 }
 
 void tr_torrentSetLocation(tr_torrent* tor, char const* location, bool move_from_old_path, int volatile* setme_state)
@@ -1226,6 +1357,42 @@ void tr_torrentSetLocation(tr_torrent* tor, char const* location, bool move_from
     tr_return_if_fail(*location != '\0');
 
     tor->set_location(location, move_from_old_path, setme_state);
+}
+
+bool tr_torrentCanRetryRelocation(tr_torrent const* const tor)
+{
+    tr_return_val_if_fail(tr_isTorrent(tor), false);
+    return tor->can_retry_relocation();
+}
+
+bool tr_torrentCanResumeRelocation(tr_torrent const* const tor)
+{
+    tr_return_val_if_fail(tr_isTorrent(tor), false);
+    return tor->can_resume_relocation();
+}
+
+bool tr_torrentCanCancelRelocation(tr_torrent const* const tor)
+{
+    tr_return_val_if_fail(tr_isTorrent(tor), false);
+    return tor->can_cancel_relocation();
+}
+
+void tr_torrentRetryRelocation(tr_torrent* const tor)
+{
+    tr_return_if_fail(tr_isTorrent(tor));
+    tor->retry_relocation();
+}
+
+void tr_torrentResumeRelocation(tr_torrent* const tor)
+{
+    tr_return_if_fail(tr_isTorrent(tor));
+    tor->resume_relocation();
+}
+
+void tr_torrentCancelRelocation(tr_torrent* const tor)
+{
+    tr_return_if_fail(tr_isTorrent(tor));
+    tor->cancel_relocation();
 }
 
 std::optional<tr_torrent_files::FoundFile> tr_torrent::find_file(tr_file_index_t file_index) const
@@ -1775,7 +1942,8 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
 tr_torrent::RelocateMediator::RelocateMediator(
     tr_torrent* const tor,
     std::string_view const target_root,
-    int volatile* const setme_state)
+    int volatile* const setme_state,
+    std::optional<bool> const resume_after_relocation)
     : session_{ tor->session }
     , torrent_id_{ tor->id() }
     , setme_state_{ setme_state }
@@ -1790,6 +1958,7 @@ tr_torrent::RelocateMediator::RelocateMediator(
     snapshot_.previous_download_dir = std::string{ tor->download_dir() };
     snapshot_.previous_incomplete_dir = std::string{ tor->incomplete_dir() };
     snapshot_.journal_file = tor->relocation_journal_file();
+    snapshot_.resume_after_relocation = resume_after_relocation.value_or(tor->is_running());
 }
 
 tr_relocate_worker::Snapshot const& tr_torrent::RelocateMediator::snapshot() const
@@ -1848,9 +2017,14 @@ bool tr_torrent::RelocateMediator::on_verified_location_ready()
             session->close_torrent_files(tor->id());
             tor->set_download_dir(snapshot.target_root);
             tor->incomplete_dir_ = snapshot.source_root != snapshot.target_root ? tr_interned_string{ snapshot.source_root } :
-                                                                                tr_interned_string{};
+                                                                                  tr_interned_string{};
             tor->refresh_current_dir();
-            tor->set_relocation_state(TR_RELOC_DELETING_SOURCE, tor->relocation_bytes_total_, tor->relocation_bytes_total_, 0U, {});
+            tor->set_relocation_state(
+                TR_RELOC_DELETING_SOURCE,
+                tor->relocation_bytes_total_,
+                tor->relocation_bytes_total_,
+                0U,
+                {});
             tor->save_resume_file();
             session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
             ready_promise.set_value(true);
@@ -1863,7 +2037,10 @@ bool tr_torrent::RelocateMediator::on_verified_location_ready()
 void tr_torrent::RelocateMediator::on_source_deleted()
 {
     session_->run_in_session_thread(
-        [session = session_, torrent_id = torrent_id_, setme_state = setme_state_]()
+        [session = session_,
+         torrent_id = torrent_id_,
+         setme_state = setme_state_,
+         resume_after_relocation = snapshot_.resume_after_relocation]()
         {
             auto* const tor = session->torrents().get(torrent_id);
             if (tor == nullptr || tor->is_deleting_)
@@ -1883,6 +2060,11 @@ void tr_torrent::RelocateMediator::on_source_deleted()
             }
             session->rpcNotify(TR_RPC_TORRENT_MOVED, tor);
             session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
+
+            if (resume_after_relocation)
+            {
+                tor->start(false, {});
+            }
         });
 }
 
@@ -1910,6 +2092,63 @@ void tr_torrent::clear_relocation_state()
 {
     set_relocation_state(TR_RELOC_NONE, 0U, 0U, 0U, {});
     relocation_error_.clear();
+}
+
+bool tr_torrent::can_retry_relocation() const noexcept
+{
+    return relocation_state() == TR_RELOC_ERROR;
+}
+
+bool tr_torrent::can_resume_relocation() const noexcept
+{
+    return relocation_state() == TR_RELOC_CANCELLED;
+}
+
+bool tr_torrent::can_cancel_relocation() const noexcept
+{
+    return relocation_state() == TR_RELOC_QUEUED || relocation_state() == TR_RELOC_COPYING ||
+        relocation_state() == TR_RELOC_VERIFYING;
+}
+
+void tr_torrent::retry_relocation()
+{
+    auto const journal = load_relocation_journal_state(relocation_journal_file());
+    if (!can_retry_relocation() || !journal || std::empty(journal->target_root))
+    {
+        return;
+    }
+
+    session->run_in_session_thread([this, target_root = journal->target_root, resume_after = journal->resume_after_relocation]()
+                                   { queue_relocation_in_session_thread(target_root, nullptr, resume_after); });
+}
+
+void tr_torrent::resume_relocation()
+{
+    auto const journal = load_relocation_journal_state(relocation_journal_file());
+    if (!can_resume_relocation() || !journal || std::empty(journal->target_root))
+    {
+        return;
+    }
+
+    session->run_in_session_thread([this, target_root = journal->target_root, resume_after = journal->resume_after_relocation]()
+                                   { queue_relocation_in_session_thread(target_root, nullptr, resume_after); });
+}
+
+void tr_torrent::cancel_relocation()
+{
+    if (!can_cancel_relocation())
+    {
+        return;
+    }
+
+    if (session->am_in_session_thread())
+    {
+        (void)session->relocate_cancel(this);
+    }
+    else
+    {
+        session->run_in_session_thread([this]() { (void)session->relocate_cancel(this); });
+    }
 }
 
 // ---
@@ -2220,12 +2459,11 @@ bool tr_torrent::set_announce_list(tr_announce_list announce_list)
 
     if (save_error.has_value())
     {
-        error().set_local_error(
-            fmt::format(
-                fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-                fmt::arg("path", filename),
-                fmt::arg("error", save_error.message()),
-                fmt::arg("error_code", save_error.code())));
+        error().set_local_error(fmt::format(
+            fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
+            fmt::arg("path", filename),
+            fmt::arg("error", save_error.message()),
+            fmt::arg("error_code", save_error.code())));
         return false;
     }
 

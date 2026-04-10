@@ -303,6 +303,24 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     [self update];
 }
 
+- (void)retryRelocation
+{
+    tr_torrentRetryRelocation(self.fHandle);
+    [self update];
+}
+
+- (void)resumeRelocation
+{
+    tr_torrentResumeRelocation(self.fHandle);
+    [self update];
+}
+
+- (void)cancelRelocation
+{
+    tr_torrentCancelRelocation(self.fHandle);
+    [self update];
+}
+
 - (void)sleep
 {
     if ((self.fResumeOnWake = self.active))
@@ -945,6 +963,21 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     return self.fStat->finished;
 }
 
+- (BOOL)canRetryRelocation
+{
+    return tr_torrentCanRetryRelocation(self.fHandle);
+}
+
+- (BOOL)canResumeRelocation
+{
+    return tr_torrentCanResumeRelocation(self.fHandle);
+}
+
+- (BOOL)canCancelRelocation
+{
+    return tr_torrentCanCancelRelocation(self.fHandle);
+}
+
 - (BOOL)isError
 {
     return self.fStat->error == TR_STAT_LOCAL_ERROR;
@@ -1127,6 +1160,11 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         return string;
     }
 
+    if (self.fStat->relocationState == TR_RELOC_CANCELLED)
+    {
+        return NSLocalizedString(@"Move cancelled", "Torrent -> status string");
+    }
+
     if (self.fStat->relocationState != TR_RELOC_NONE)
     {
         NSString* phaseString = nil;
@@ -1157,9 +1195,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
                 (self.fStat->relocationState == TR_RELOC_COPYING || self.fStat->relocationState == TR_RELOC_VERIFYING))
             {
                 CGFloat progress = (CGFloat)self.fStat->relocationBytesCopied / self.fStat->relocationBytesTotal;
-                string = [NSString stringWithFormat:@"%@ (%@)",
-                                                    phaseString,
-                                                    [NSString percentString:progress longDecimals:YES]];
+                string = [NSString stringWithFormat:@"%@ (%@)", phaseString, [NSString percentString:progress longDecimals:YES]];
             }
             else
             {
@@ -1168,8 +1204,8 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
             if (self.fStat->relocationState == TR_RELOC_COPYING && self.fStat->relocationRate_Bps > 0)
             {
-                string = [string stringByAppendingFormat:@" — %@",
-                                                     [NSString stringForSpeed:(CGFloat)self.fStat->relocationRate_Bps / 1024.0]];
+                string = [string
+                    stringByAppendingFormat:@" — %@", [NSString stringForSpeed:(CGFloat)self.fStat->relocationRate_Bps / 1024.0]];
             }
 
             return string;

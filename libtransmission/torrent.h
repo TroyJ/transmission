@@ -174,7 +174,11 @@ struct tr_torrent
     class RelocateMediator : public tr_relocate_worker::Mediator
     {
     public:
-        RelocateMediator(tr_torrent* tor, std::string_view target_root, int volatile* setme_state = nullptr);
+        RelocateMediator(
+            tr_torrent* tor,
+            std::string_view target_root,
+            int volatile* setme_state = nullptr,
+            std::optional<bool> resume_after_relocation = std::nullopt);
         ~RelocateMediator() override = default;
 
         [[nodiscard]] tr_relocate_worker::Snapshot const& snapshot() const override;
@@ -233,6 +237,12 @@ struct tr_torrent
         uint64_t rate_bps,
         std::string_view error);
     void clear_relocation_state();
+    void retry_relocation();
+    void resume_relocation();
+    void cancel_relocation();
+    [[nodiscard]] bool can_retry_relocation() const noexcept;
+    [[nodiscard]] bool can_resume_relocation() const noexcept;
+    [[nodiscard]] bool can_cancel_relocation() const noexcept;
 
     [[nodiscard]] constexpr auto started_recently(time_t const now, time_t recent_secs = 120) const noexcept
     {
@@ -1399,7 +1409,10 @@ private:
     void update_file_path(tr_file_index_t file, std::optional<bool> has_file) const;
 
     void set_location_in_session_thread(std::string_view path, bool move_from_old_path, int volatile* setme_state);
-    void queue_relocation_in_session_thread(std::string_view path, int volatile* setme_state);
+    void queue_relocation_in_session_thread(
+        std::string_view path,
+        int volatile* setme_state,
+        std::optional<bool> resume_after_relocation = std::nullopt);
 
     void rename_path_in_session_thread(
         std::string_view oldpath,

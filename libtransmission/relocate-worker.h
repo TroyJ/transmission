@@ -41,6 +41,7 @@ public:
         std::string previous_download_dir;
         std::string previous_incomplete_dir;
         std::string journal_file;
+        bool resume_after_relocation = false;
     };
 
     class Mediator
@@ -71,6 +72,7 @@ public:
 
     [[nodiscard]] bool add(std::unique_ptr<Mediator> mediator, tr_priority_t priority);
     void remove(tr_sha1_digest_t const& info_hash);
+    bool cancel(tr_sha1_digest_t const& info_hash);
 
 private:
     struct Node
@@ -104,5 +106,6 @@ private:
     std::optional<Node> current_node_;
     std::optional<std::thread::id> relocate_thread_id_;
     std::atomic<bool> stop_current_ = false;
+    std::atomic<bool> cancel_current_ = false;
     std::condition_variable stop_current_cv_;
 };

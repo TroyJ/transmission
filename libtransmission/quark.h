@@ -477,6 +477,7 @@ enum // NOLINT(performance-enum-size)
     TR_KEY_relocation_bytes_copied,
     TR_KEY_relocation_bytes_total,
     TR_KEY_relocation_error,
+    TR_KEY_relocation_phase,
     TR_KEY_relocation_rate_bps,
     TR_KEY_relocation_state,
     TR_KEY_remote_session_enabled_kebab_APICOMPAT,
