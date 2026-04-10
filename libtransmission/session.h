@@ -436,7 +436,7 @@ public:
         bool script_torrent_done_enabled = false;
         bool script_torrent_done_seeding_enabled = false;
         bool seed_queue_enabled = false;
-        bool sequential_download = false;
+        bool sequential_download = true;
         bool should_delete_source_torrents = false;
         bool should_scrape_paused_torrents = true;
         bool should_start_added_torrents = true;
