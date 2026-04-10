@@ -25,6 +25,7 @@
 #include "libtransmission/file.h"
 #include "libtransmission/quark.h"
 #include "libtransmission/relocate-worker.h"
+#include "libtransmission/torrent-files.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-macros.h"
 #include "libtransmission/utils.h"
@@ -283,7 +284,19 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
 
 [[nodiscard]] auto source_path(tr_relocate_worker::Snapshot const& snapshot, Journal const& journal, tr_file_index_t const file_index)
 {
-    return tr_pathbuf{ journal.source_root, '/', snapshot.metainfo.file_subpath(file_index) };
+    auto const base = tr_pathbuf{ journal.source_root, '/', snapshot.metainfo.file_subpath(file_index) };
+    if (tr_sys_path_exists(base))
+    {
+        return std::string{ base };
+    }
+
+    auto const partial = tr_pathbuf{ base, tr_torrent_files::PartialFileSuffix };
+    if (tr_sys_path_exists(partial))
+    {
+        return std::string{ partial };
+    }
+
+    return std::string{ base };
 }
 
 [[nodiscard]] auto existing_completed_bytes(tr_relocate_worker::Snapshot const& snapshot)
@@ -413,7 +426,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         return true;
     }
 
-    auto const in = tr_sys_file_open(src, TR_SYS_FILE_READ | TR_SYS_FILE_SEQUENTIAL, 0, error);
+    auto const in = tr_sys_file_open(src.c_str(), TR_SYS_FILE_READ | TR_SYS_FILE_SEQUENTIAL, 0, error);
     if (in == TR_BAD_SYS_FILE)
     {
         return false;
