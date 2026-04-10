@@ -91,6 +91,7 @@ extern NSString* const kTorrentDidChangeGroupNotification;
 @property(nonatomic, readonly) BOOL canRetryRelocation;
 @property(nonatomic, readonly) BOOL canResumeRelocation;
 @property(nonatomic, readonly) BOOL canCancelRelocation;
+@property(nonatomic, readonly) tr_torrent_relocation_state relocationState;
 
 @property(nonatomic, readonly) BOOL alertForRemainingDiskSpace;
 

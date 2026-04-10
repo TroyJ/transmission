@@ -978,6 +978,11 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     return tr_torrentCanCancelRelocation(self.fHandle);
 }
 
+- (tr_torrent_relocation_state)relocationState
+{
+    return self.fStat->relocationState;
+}
+
 - (BOOL)isError
 {
     return self.fStat->error == TR_STAT_LOCAL_ERROR;
@@ -1191,8 +1196,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
         if (phaseString != nil)
         {
-            if (self.fStat->relocationBytesTotal > 0 &&
-                (self.fStat->relocationState == TR_RELOC_COPYING || self.fStat->relocationState == TR_RELOC_VERIFYING))
+            if (self.fStat->relocationBytesTotal > 0 && self.fStat->relocationState == TR_RELOC_COPYING)
             {
                 CGFloat progress = (CGFloat)self.fStat->relocationBytesCopied / self.fStat->relocationBytesTotal;
                 string = [NSString stringWithFormat:@"%@ (%@)", phaseString, [NSString percentString:progress longDecimals:YES]];
@@ -1347,6 +1351,11 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (NSString*)shortStatusString
 {
+    if (self.fStat->relocationState != TR_RELOC_NONE)
+    {
+        return self.statusString;
+    }
+
     NSString* string;
 
     switch (self.fStat->activity)

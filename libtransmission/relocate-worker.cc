@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef> // std::byte
 #include <cstdint>
@@ -38,8 +39,9 @@ using namespace std::literals::string_view_literals;
 namespace
 {
 auto constexpr CopyChunkSize = size_t{ 1024U * 1024U };
-auto constexpr ProgressSaveInterval = 64U * 1024U * 1024U;
-auto constexpr ProgressUpdateInterval = 5s;
+auto constexpr ProgressSaveInterval = 16U * 1024U * 1024U;
+auto constexpr ProgressUpdateInterval = 1s;
+auto constexpr VerifyRelocatedDataByDefault = false;
 
 [[nodiscard]] constexpr auto is_cancelable_state(tr_torrent_relocation_state const state) noexcept
 {
@@ -357,6 +359,61 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         {
             return false;
         }
+    }
+
+    return true;
+}
+
+[[nodiscard]] auto capacity_probe_path(std::string_view const target_root)
+{
+    auto probe = tr_pathbuf{ target_root };
+
+    while (!std::empty(probe) && !tr_sys_path_exists(probe))
+    {
+        auto parent = tr_pathbuf{ probe };
+        parent.popdir();
+        if (parent == probe)
+        {
+            break;
+        }
+
+        probe = std::move(parent);
+    }
+
+    return probe;
+}
+
+[[nodiscard]] bool preflight_target_capacity(tr_relocate_worker::Snapshot const& snapshot, tr_error* const error)
+{
+    auto const already_present = existing_completed_bytes(snapshot);
+    auto const bytes_needed = snapshot.metainfo.total_size() > already_present ?
+        snapshot.metainfo.total_size() - already_present :
+        0U;
+    if (bytes_needed == 0U)
+    {
+        return true;
+    }
+
+    auto const probe = capacity_probe_path(snapshot.target_root);
+    auto const capacity = tr_sys_path_get_capacity(probe, error);
+    if (!capacity)
+    {
+        return false;
+    }
+
+    if (capacity->free < 0 || static_cast<uint64_t>(capacity->free) < bytes_needed)
+    {
+        if (error != nullptr)
+        {
+            error->set(
+                ENOSPC,
+                fmt::format(
+                    "Not enough free space in '{}' to relocate torrent data (need {} bytes, have {} bytes free)",
+                    probe,
+                    bytes_needed,
+                    std::max<int64_t>(capacity->free, 0)));
+        }
+        return false;
     }
 
     return true;
@@ -1009,8 +1066,12 @@ void tr_relocate_worker::relocate_thread_func()
             continue;
         }
 
-        auto ok = copy_files(snapshot, journal, mediator, stop_current_, &error);
+        auto ok = preflight_target_capacity(snapshot, &error);
         if (ok)
+        {
+            ok = copy_files(snapshot, journal, mediator, stop_current_, &error);
+        }
+        if (ok && VerifyRelocatedDataByDefault)
         {
             ok = verify_files(snapshot, journal, mediator, stop_current_, &error);
         }

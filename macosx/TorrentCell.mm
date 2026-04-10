@@ -10,6 +10,59 @@
 
 @implementation TorrentCell
 
+- (void)setObjectValue:(id)objectValue
+{
+    [super setObjectValue:objectValue];
+    [self updateTextColors];
+}
+
+- (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
+{
+    [super setBackgroundStyle:backgroundStyle];
+    [self updateTextColors];
+}
+
+- (NSColor*)relocationStatusColorForTorrent:(Torrent*)torrent
+{
+    switch (torrent.relocationState)
+    {
+    case TR_RELOC_QUEUED:
+    case TR_RELOC_COPYING:
+    case TR_RELOC_VERIFYING:
+    case TR_RELOC_RENAMING:
+    case TR_RELOC_DELETING_SOURCE:
+        return NSColor.controlAccentColor;
+
+    case TR_RELOC_ERROR:
+        return NSColor.systemRedColor;
+
+    case TR_RELOC_CANCELLED:
+        return NSColor.systemOrangeColor;
+
+    case TR_RELOC_NONE:
+        break;
+    }
+
+    return NSColor.secondaryLabelColor;
+}
+
+- (void)updateTextColors
+{
+    if (self.backgroundStyle == NSBackgroundStyleEmphasized)
+    {
+        self.fTorrentTitleField.textColor = NSColor.whiteColor;
+        self.fTorrentProgressField.textColor = NSColor.whiteColor;
+        self.fTorrentStatusField.textColor = NSColor.whiteColor;
+        return;
+    }
+
+    self.fTorrentTitleField.textColor = NSColor.labelColor;
+    self.fTorrentProgressField.textColor = NSColor.secondaryLabelColor;
+
+    Torrent* torrent = [self.objectValue isKindOfClass:[Torrent class]] ? (Torrent*)self.objectValue : nil;
+    self.fTorrentStatusField.textColor = torrent != nil ? [self relocationStatusColorForTorrent:torrent] : NSColor.secondaryLabelColor;
+}
+
 - (void)drawRect:(NSRect)dirtyRect
 {
     if (self.fTorrentTableView)
