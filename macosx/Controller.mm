@@ -356,6 +356,7 @@ static void removeKeRangerRansomware()
 
 @property(nonatomic) NSTimer* fTimer;
 @property(nonatomic) dispatch_queue_t fMainWindowSampleQueue;
+@property(nonatomic) dispatch_queue_t fTorrentHistoryQueue;
 @property(nonatomic) BOOL fMainWindowSampleInFlight;
 @property(nonatomic) BOOL fMainWindowSampleDirty;
 @property(nonatomic) NSUInteger fMainWindowSampleRequestedGeneration;
@@ -415,6 +416,10 @@ static void removeKeRangerRansomware()
 @property(nonatomic) BOOL fGlobalPopoverShown;
 @property(nonatomic) NSView* fPositioningView;
 @property(nonatomic) BOOL fSoundPlaying;
+@property(nonatomic) BOOL fTorrentHistoryWriteInFlight;
+@property(nonatomic) BOOL fTorrentHistoryWriteDirty;
+@property(nonatomic) NSUInteger fTorrentHistoryRequestedGeneration;
+@property(nonatomic) NSUInteger fTorrentHistoryWrittenGeneration;
 
 - (BOOL)isInternetStateIndicatorVisible;
 - (void)invalidateInternetStateInboundProof;
@@ -430,10 +435,14 @@ static void removeKeRangerRansomware()
 - (BOOL)hasActiveRelocation;
 - (void)beginTerminationAfterRelocationCheckpoint;
 - (void)requestMainWindowSample;
+- (void)refreshMainWindowReadUI;
 - (void)refreshMainWindowFromCachedState;
 - (NSSet<NSString*>*)visibleTorrentHashesForPieceSampling;
 - (void)startMainWindowSampleWithGeneration:(NSUInteger)generation;
 - (void)applyMainWindowSampleResult:(ControllerMainWindowSampleResult*)sample;
+- (NSArray<NSDictionary*>*)currentTorrentHistorySnapshot;
+- (void)startTorrentHistoryWriteWithGeneration:(NSUInteger)generation snapshot:(NSArray<NSDictionary*>*)history;
+- (void)flushTorrentHistoryNow;
 
 - (void)removeTorrentsImpl:(NSArray<Torrent*>*)torrents deleteData:(BOOL)deleteData;
 
@@ -687,6 +696,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         _fDisplayedTorrents = [[NSMutableArray alloc] init];
         _fTorrentHashes = [[NSMutableDictionary alloc] init];
         _fMainWindowSampleQueue = dispatch_queue_create("org.m0k.transmission.main-window-sampler", DISPATCH_QUEUE_SERIAL);
+        _fTorrentHistoryQueue = dispatch_queue_create("org.m0k.transmission.torrent-history", DISPATCH_QUEUE_SERIAL);
         _fMainWindowPendingPieceTorrentHashes = [NSSet set];
         _fMainWindowCachedSessionStats = {};
         _fMainWindowCachedCumulativeStats = {};
@@ -928,7 +938,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     [nc addObserver:self.fWindow selector:@selector(makeKeyWindow) name:@"MakeWindowKey" object:nil];
 
-    [nc addObserver:self selector:@selector(fullUpdateUI) name:@"UpdateTorrentsState" object:nil];
+    [nc addObserver:self selector:@selector(refreshMainWindowReadUI) name:@"UpdateTorrentsState" object:nil];
 
     [nc addObserver:self selector:@selector(applyFilter) name:@"ApplyFilter" object:nil];
 
@@ -1282,7 +1292,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     [self.fBadger updateBadgeWithDownload:0 upload:0];
 
     //save history
-    [self updateTorrentHistory];
+    [self flushTorrentHistoryNow];
     [self.fTableView saveCollapsedGroups];
 
     _fileWatcherQueue = nil;
@@ -3093,17 +3103,18 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             self.fClearCompletedButton.hidden = !anyCompleted;
         }
 
-        //update non-constant parts of info window
-        if (self.fInfoController.window.visible)
-        {
-            [self.fInfoController updateInfoStats];
-        }
-
         [self.fTableView reloadVisibleRows];
     }
 
     //badge dock
     [self.fBadger updateBadgeWithDownload:dlRate upload:ulRate];
+}
+
+- (void)refreshMainWindowReadUI
+{
+    [self updateUI];
+    [self applyFilter];
+    [self.fWindow.toolbar validateVisibleItems];
 }
 
 - (void)updateUI
@@ -3112,12 +3123,9 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     [self refreshMainWindowFromCachedState];
 }
 
-#warning can this be removed or refined?
 - (void)fullUpdateUI
 {
-    [self updateUI];
-    [self applyFilter];
-    [self.fWindow.toolbar validateVisibleItems];
+    [self refreshMainWindowReadUI];
     [self updateTorrentHistory];
 }
 
@@ -3322,12 +3330,13 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
                                                                      object:torrent.dataLocation];
     }
 
-    [self fullUpdateUI];
+    [self refreshMainWindowReadUI];
 }
 
 - (void)torrentRestartedDownloading:(NSNotification*)notification
 {
-    [self fullUpdateUI];
+    [self refreshMainWindowReadUI];
+    [self updateTorrentHistory];
 }
 
 - (void)torrentFinishedSeeding:(NSNotification*)notification
@@ -3376,7 +3385,8 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             [self.fBadger addCompletedTorrent:torrent];
         }
 
-        [self fullUpdateUI];
+        [self refreshMainWindowReadUI];
+        [self updateTorrentHistory];
 
         if ([self.fTableView.selectedTorrents containsObject:torrent])
         {
@@ -3388,16 +3398,70 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
 - (void)updateTorrentHistory
 {
+    self.fTorrentHistoryRequestedGeneration++;
+
+    if (self.fTorrentHistoryWriteInFlight)
+    {
+        self.fTorrentHistoryWriteDirty = YES;
+        return;
+    }
+
+    [self startTorrentHistoryWriteWithGeneration:self.fTorrentHistoryRequestedGeneration snapshot:[self currentTorrentHistorySnapshot]];
+}
+
+- (NSArray<NSDictionary*>*)currentTorrentHistorySnapshot
+{
     NSMutableArray* history = [NSMutableArray arrayWithCapacity:self.fTorrents.count];
 
     for (Torrent* torrent in self.fTorrents)
     {
         [history addObject:torrent.history];
-        self.fTorrentHashes[torrent.hashString] = torrent;
     }
 
+    return history;
+}
+
+- (void)startTorrentHistoryWriteWithGeneration:(NSUInteger)generation snapshot:(NSArray<NSDictionary*>*)history
+{
+    self.fTorrentHistoryWriteInFlight = YES;
+
     NSString* historyFile = [self.fConfigDirectory stringByAppendingPathComponent:kTransferPlist];
-    [history writeToFile:historyFile atomically:YES];
+    dispatch_async(self.fTorrentHistoryQueue, ^{
+        [history writeToFile:historyFile atomically:YES];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation > self.fTorrentHistoryWrittenGeneration)
+            {
+                self.fTorrentHistoryWrittenGeneration = generation;
+            }
+
+            self.fTorrentHistoryWriteInFlight = NO;
+
+            if (self.fTorrentHistoryWriteDirty || self.fTorrentHistoryWrittenGeneration < self.fTorrentHistoryRequestedGeneration)
+            {
+                self.fTorrentHistoryWriteDirty = NO;
+                [self startTorrentHistoryWriteWithGeneration:self.fTorrentHistoryRequestedGeneration
+                                                    snapshot:[self currentTorrentHistorySnapshot]];
+            }
+        });
+    });
+}
+
+- (void)flushTorrentHistoryNow
+{
+    self.fTorrentHistoryWriteDirty = NO;
+    self.fTorrentHistoryRequestedGeneration++;
+
+    NSArray<NSDictionary*>* history = [self currentTorrentHistorySnapshot];
+    NSString* historyFile = [self.fConfigDirectory stringByAppendingPathComponent:kTransferPlist];
+    NSUInteger const generation = self.fTorrentHistoryRequestedGeneration;
+
+    dispatch_sync(self.fTorrentHistoryQueue, ^{
+        [history writeToFile:historyFile atomically:YES];
+    });
+
+    self.fTorrentHistoryWriteInFlight = NO;
+    self.fTorrentHistoryWrittenGeneration = generation;
 }
 
 - (void)setSort:(id)sender
@@ -6260,7 +6324,8 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
 - (void)rpcStartedStoppedTorrent:(Torrent*)torrent
 {
-    [self fullUpdateUI];
+    [self refreshMainWindowReadUI];
+    [self updateTorrentHistory];
 }
 
 - (void)rpcChangedTorrent:(Torrent*)torrent
