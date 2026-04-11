@@ -807,8 +807,12 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         return;
     }
 
+    // If the torrent has not created any local payload yet, treat this as a
+    // destination change for future data rather than a relocation job.
+    bool const moveFromOldPath = self.dataLocation != nil;
+
     int volatile status = TR_LOC_DONE;
-    tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, &status);
+    tr_torrentSetLocation(self.fHandle, folder.UTF8String, moveFromOldPath, &status);
     [self update];
 
     if (status == TR_LOC_ERROR)

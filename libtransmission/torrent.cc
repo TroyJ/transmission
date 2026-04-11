@@ -1257,12 +1257,14 @@ size_t buildSearchPathArray(tr_torrent const* tor, std::string_view* paths)
 
 void tr_torrent::set_location(std::string_view location, bool move_from_old_path, int volatile* setme_state)
 {
+    auto const should_move_existing_data = move_from_old_path && has_any_local_data();
+
     if (setme_state != nullptr)
     {
         *setme_state = TR_LOC_MOVING;
     }
 
-    if (move_from_old_path)
+    if (should_move_existing_data)
     {
         if (session->am_in_session_thread())
         {
@@ -1276,8 +1278,8 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
         return;
     }
 
-    session->run_in_session_thread([this, loc = std::string(location), move_from_old_path, setme_state]()
-                                   { set_location_in_session_thread(loc, move_from_old_path, setme_state); });
+    session->run_in_session_thread([this, loc = std::string(location), setme_state]()
+                                   { set_location_in_session_thread(loc, false, setme_state); });
 }
 
 void tr_torrent::queue_relocation_in_session_thread(

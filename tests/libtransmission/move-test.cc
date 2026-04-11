@@ -220,6 +220,28 @@ TEST_F(MoveTest, setLocation)
     tr_torrentRemove(tor, true, nullptr, nullptr);
 }
 
+TEST_F(MoveTest, setLocationWithoutLocalDataUpdatesDownloadDirWithoutRelocation)
+{
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/target-no-data"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    ASSERT_NE(nullptr, tor);
+    EXPECT_FALSE(tor->has_any_local_data());
+    EXPECT_NE(std::string_view{ target_dir }, tor->download_dir().sv());
+
+    auto state = -1;
+    tr_torrentSetLocation(tor, target_dir, true, &state);
+    ASSERT_TRUE(waitFor([&state]() { return state == TR_LOC_DONE; }, MaxWaitMsec));
+
+    EXPECT_EQ(TR_LOC_DONE, state);
+    EXPECT_EQ(TR_RELOC_NONE, tr_torrentStat(tor)->relocationState);
+    EXPECT_EQ(std::string_view{ target_dir }, tor->download_dir().sv());
+    EXPECT_TRUE(std::empty(tr_torrentFindFile(tor, 0)));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
 TEST_F(MoveTest, relocationControlPredicates)
 {
     auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
