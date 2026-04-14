@@ -4,6 +4,10 @@
 <dict>
 	<key>AutoImport</key>
 	<false/>
+	<key>AnnounceIP</key>
+	<string></string>
+	<key>AnnounceIPEnabled</key>
+	<false/>
 	<key>AutoSize</key>
 	<false/>
 	<key>AutoStartDownload</key>

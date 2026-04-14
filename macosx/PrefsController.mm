@@ -2,7 +2,12 @@
 // It may be used under the MIT (SPDX: MIT) license.
 // License text can be found in the licenses/ folder.
 
+#include <arpa/inet.h>
+
+#include <vector>
+
 #import <Sparkle/Sparkle.h>
+#include <libtransmission/variant.h>
 #include <libtransmission/utils.h>
 
 #import "VDKQueue.h"
@@ -41,6 +46,28 @@ static char const* const kRPCKeychainService = "Transmission:Remote";
 static char const* const kRPCKeychainName = "Remote";
 
 static NSString* const kWebUIURLFormat = @"http://localhost:%ld/";
+static NSString* const kAnnounceIPDefaultsKey = @"AnnounceIP";
+static NSString* const kAnnounceIPEnabledDefaultsKey = @"AnnounceIPEnabled";
+
+static NSTextField* CreatePrefsLabel(NSString* title, NSFont* font, NSColor* textColor, NSTextAlignment alignment)
+{
+    NSTextField* label = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.editable = NO;
+    label.bezeled = NO;
+    label.drawsBackground = NO;
+    label.selectable = NO;
+    label.font = font;
+    label.textColor = textColor;
+    label.alignment = alignment;
+    label.stringValue = title;
+    return label;
+}
+
+static NSString* StringFromStringView(std::string_view value)
+{
+    return [[NSString alloc] initWithBytes:value.data() length:value.size() encoding:NSUTF8StringEncoding] ?: @"";
+}
 
 @interface PrefsController ()<NSWindowRestoration>
 
@@ -97,6 +124,10 @@ static NSString* const kWebUIURLFormat = @"http://localhost:%ld/";
 @property(nonatomic) IBOutlet NSProgressIndicator* fPortStatusProgress;
 @property(nonatomic) NSTimer* fPortStatusTimer;
 @property(nonatomic) int fPeerPort, fNatStatus;
+@property(nonatomic) NSButton* fAnnounceIPCheck;
+@property(nonatomic) NSTextField* fAnnounceIPLabel;
+@property(nonatomic) NSTextField* fAnnounceIPField;
+@property(nonatomic) NSTextField* fAnnounceIPNoteField;
 
 @property(nonatomic) IBOutlet NSTextField* fRPCPortField;
 @property(nonatomic) IBOutlet NSTextField* fRPCPasswordField;
@@ -210,6 +241,9 @@ static NSString* const kWebUIURLFormat = @"http://localhost:%ld/";
     toolbar.sizeMode = NSToolbarSizeModeRegular;
     toolbar.selectedItemIdentifier = ToolbarTabGeneral;
     self.window.toolbar = toolbar;
+
+    [self setupAnnounceIPControls];
+    [self updateAnnounceIPControls];
 
     [self setWindowSize];
     [self.window center];
@@ -463,6 +497,239 @@ static NSString* const kWebUIURLFormat = @"http://localhost:%ld/";
         BOOL delay = natStatusChanged || tr_sessionIsPortForwardingEnabled(self.fHandle);
         self.fPortChecker = [[PortChecker alloc] initForPort:self.fPeerPort delay:delay withDelegate:self];
     }
+}
+
+- (void)setupAnnounceIPControls
+{
+    if (self.fAnnounceIPCheck != nil)
+    {
+        return;
+    }
+
+    NSView* container = self.fPortField.superview;
+    if (container == nil)
+    {
+        return;
+    }
+
+    NSTextField* natNoteField = nil;
+    NSButton* systemSleepButton = nil;
+
+    for (NSView* subview in container.subviews)
+    {
+        if (natNoteField == nil && [subview isKindOfClass:[NSTextField class]] && NSMinY(subview.frame) > 30.0 &&
+            NSMinY(subview.frame) < 50.0)
+        {
+            natNoteField = (NSTextField*)subview;
+        }
+        else if (systemSleepButton == nil && [subview isKindOfClass:[NSButton class]] && NSMinY(subview.frame) < 5.0)
+        {
+            systemSleepButton = (NSButton*)subview;
+        }
+    }
+
+    NSAssert(natNoteField != nil, @"Expected to find the NAT traversal helper text field");
+    NSAssert(systemSleepButton != nil, @"Expected to find the system sleep checkbox");
+
+    if (natNoteField == nil || systemSleepButton == nil)
+    {
+        return;
+    }
+
+    for (NSLayoutConstraint* constraint in [container.constraints copy])
+    {
+        if (constraint.firstItem == systemSleepButton && constraint.firstAttribute == NSLayoutAttributeTop &&
+            constraint.secondItem == natNoteField && constraint.secondAttribute == NSLayoutAttributeBottom)
+        {
+            [container removeConstraint:constraint];
+            break;
+        }
+    }
+
+    self.fAnnounceIPCheck = [[NSButton alloc] initWithFrame:NSZeroRect];
+    self.fAnnounceIPCheck.translatesAutoresizingMaskIntoConstraints = NO;
+    self.fAnnounceIPCheck.buttonType = NSButtonTypeSwitch;
+    self.fAnnounceIPCheck.bezelStyle = NSBezelStyleRegularSquare;
+    self.fAnnounceIPCheck.title = NSLocalizedString(
+        @"Override tracker announce IP",
+        "Preferences -> Network -> checkbox to override the IP sent to trackers");
+    self.fAnnounceIPCheck.target = self;
+    self.fAnnounceIPCheck.action = @selector(setAnnounceIPEnabled:);
+
+    self.fAnnounceIPLabel = CreatePrefsLabel(
+        NSLocalizedString(@"Public IPv4:", "Preferences -> Network -> announce IP field label"),
+        [NSFont systemFontOfSize:[NSFont systemFontSize]],
+        [NSColor controlTextColor],
+        NSTextAlignmentRight);
+
+    self.fAnnounceIPField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    self.fAnnounceIPField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.fAnnounceIPField.font = [NSFont systemFontOfSize:[NSFont systemFontSize]];
+    self.fAnnounceIPField.placeholderString = @"185.150.0.67";
+    self.fAnnounceIPField.target = self;
+    self.fAnnounceIPField.action = @selector(setAnnounceIP:);
+    self.fAnnounceIPField.delegate = (id<NSTextFieldDelegate>)self;
+    [(NSTextFieldCell*)self.fAnnounceIPField.cell setSendsActionOnEndEditing:YES];
+
+    self.fAnnounceIPNoteField = CreatePrefsLabel(
+        NSLocalizedString(@"Tracker announce only. Does not affect DHT or PEX.", "Preferences -> Network -> announce IP help note"),
+        [NSFont systemFontOfSize:[NSFont smallSystemFontSize]],
+        [NSColor disabledControlTextColor],
+        NSTextAlignmentLeft);
+
+    [container addSubview:self.fAnnounceIPCheck];
+    [container addSubview:self.fAnnounceIPLabel];
+    [container addSubview:self.fAnnounceIPField];
+    [container addSubview:self.fAnnounceIPNoteField];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.fAnnounceIPCheck.leadingAnchor constraintEqualToAnchor:self.fNatCheck.leadingAnchor],
+        [self.fAnnounceIPCheck.topAnchor constraintEqualToAnchor:natNoteField.bottomAnchor constant:12.0],
+        [self.fAnnounceIPCheck.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-20.0],
+
+        [self.fAnnounceIPLabel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:18.0],
+        [self.fAnnounceIPLabel.trailingAnchor constraintEqualToAnchor:self.fPortField.leadingAnchor constant:-4.0],
+        [self.fAnnounceIPLabel.centerYAnchor constraintEqualToAnchor:self.fAnnounceIPField.centerYAnchor],
+
+        [self.fAnnounceIPField.leadingAnchor constraintEqualToAnchor:self.fPortField.leadingAnchor],
+        [self.fAnnounceIPField.topAnchor constraintEqualToAnchor:self.fAnnounceIPCheck.bottomAnchor constant:7.0],
+        [self.fAnnounceIPField.widthAnchor constraintEqualToConstant:130.0],
+
+        [self.fAnnounceIPNoteField.leadingAnchor constraintEqualToAnchor:self.fAnnounceIPField.leadingAnchor],
+        [self.fAnnounceIPNoteField.topAnchor constraintEqualToAnchor:self.fAnnounceIPField.bottomAnchor constant:4.0],
+        [self.fAnnounceIPNoteField.trailingAnchor constraintLessThanOrEqualToAnchor:container.trailingAnchor constant:-20.0],
+
+        [systemSleepButton.topAnchor constraintEqualToAnchor:self.fAnnounceIPNoteField.bottomAnchor constant:12.0],
+    ]];
+
+    [self resizePreferenceViewToFit:self.fNetworkView];
+}
+
+- (void)updateAnnounceIPControls
+{
+    if (self.fAnnounceIPCheck == nil)
+    {
+        return;
+    }
+
+    BOOL const enabled = [self.fDefaults boolForKey:kAnnounceIPEnabledDefaultsKey];
+    self.fAnnounceIPCheck.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+    self.fAnnounceIPField.stringValue = [self.fDefaults stringForKey:kAnnounceIPDefaultsKey] ?: @"";
+    self.fAnnounceIPField.enabled = enabled;
+}
+
+- (BOOL)isValidAnnounceIPv4:(NSString*)announceIP
+{
+    if (announceIP.length == 0)
+    {
+        return NO;
+    }
+
+    in_addr address = {};
+    return inet_pton(AF_INET, announceIP.UTF8String, &address) == 1;
+}
+
+- (void)applyAnnounceIPOverrideEnabled:(BOOL)enabled address:(NSString*)announceIP reannounce:(BOOL)reannounce
+{
+    NSString* normalizedAddress = [announceIP stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString* previousAddress = [self.fDefaults stringForKey:kAnnounceIPDefaultsKey] ?: @"";
+    BOOL const previousEnabled = [self.fDefaults boolForKey:kAnnounceIPEnabledDefaultsKey];
+
+    [self.fDefaults setObject:normalizedAddress forKey:kAnnounceIPDefaultsKey];
+    [self.fDefaults setBool:enabled forKey:kAnnounceIPEnabledDefaultsKey];
+    [self updateAnnounceIPControls];
+
+    if (previousEnabled == enabled && [previousAddress isEqualToString:normalizedAddress])
+    {
+        return;
+    }
+
+    // `tr_sessionSet()` replaces the live settings object, so start from the
+    // current session settings and overwrite only the announce-IP keys.
+    auto settings = tr_sessionGetSettings(self.fHandle);
+    tr_variantDictAddStr(&settings, TR_KEY_announce_ip, normalizedAddress.UTF8String);
+    tr_variantDictAddBool(&settings, TR_KEY_announce_ip_enabled, enabled);
+    tr_sessionSet(self.fHandle, settings);
+
+    if (reannounce)
+    {
+        [self reannounceEligibleTorrents];
+    }
+}
+
+- (void)reannounceEligibleTorrents
+{
+    auto const torrentCount = tr_sessionGetAllTorrents(self.fHandle, nullptr, 0);
+    if (torrentCount == 0)
+    {
+        return;
+    }
+
+    auto torrents = std::vector<tr_torrent*>(torrentCount);
+    tr_sessionGetAllTorrents(self.fHandle, torrents.data(), torrents.size());
+
+    for (tr_torrent* torrent : torrents)
+    {
+        if (tr_torrentCanManualUpdate(torrent))
+        {
+            tr_torrentManualUpdate(torrent);
+        }
+    }
+}
+
+- (void)resizePreferenceViewToFit:(NSView*)view
+{
+    [view setNeedsLayout:YES];
+    [view layoutSubtreeIfNeeded];
+
+    CGFloat const targetHeight = view.fittingSize.height;
+    CGFloat const difference = targetHeight - NSHeight(view.frame);
+    if (difference > -0.5 && difference < 0.5)
+    {
+        return;
+    }
+
+    NSRect viewFrame = view.frame;
+    viewFrame.size.height = targetHeight;
+    view.frame = viewFrame;
+
+    if (self.window.contentView == view)
+    {
+        NSRect windowRect = self.window.frame;
+        windowRect.origin.y -= difference;
+        windowRect.size.height += difference;
+        [self.window setFrame:windowRect display:YES animate:NO];
+    }
+}
+
+- (void)setAnnounceIPEnabled:(id)sender
+{
+    BOOL const enabled = self.fAnnounceIPCheck.state == NSControlStateValueOn;
+    NSString* announceIP = [self.fAnnounceIPField.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+
+    if (enabled && ![self isValidAnnounceIPv4:announceIP])
+    {
+        NSBeep();
+        [self updateAnnounceIPControls];
+        return;
+    }
+
+    [self applyAnnounceIPOverrideEnabled:enabled address:announceIP reannounce:YES];
+}
+
+- (void)setAnnounceIP:(id)sender
+{
+    NSString* announceIP = [self.fAnnounceIPField.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    BOOL const enabled = [self.fDefaults boolForKey:kAnnounceIPEnabledDefaultsKey];
+
+    if (![self isValidAnnounceIPv4:announceIP])
+    {
+        NSBeep();
+        [self updateAnnounceIPControls];
+        return;
+    }
+
+    [self applyAnnounceIPOverrideEnabled:enabled address:announceIP reannounce:enabled];
 }
 
 - (void)portCheckerDidFinishProbing:(PortChecker*)portChecker
@@ -1371,6 +1638,17 @@ static NSString* const kWebUIURLFormat = @"http://localhost:%ld/";
     BOOL const randomPort = tr_sessionGetPeerPortRandomOnStart(self.fHandle);
     [self.fDefaults setBool:randomPort forKey:@"RandomPort"];
 
+    auto sessionSettings = tr_sessionGetSettings(self.fHandle);
+    BOOL announceIPEnabled = false;
+    NSString* announceIP = @"";
+    (void)tr_variantDictFindBool(&sessionSettings, TR_KEY_announce_ip_enabled, &announceIPEnabled);
+    if (auto announceIPString = std::string_view{}; tr_variantDictFindStrView(&sessionSettings, TR_KEY_announce_ip, &announceIPString))
+    {
+        announceIP = StringFromStringView(announceIPString);
+    }
+    [self.fDefaults setBool:announceIPEnabled forKey:kAnnounceIPEnabledDefaultsKey];
+    [self.fDefaults setObject:announceIP forKey:kAnnounceIPDefaultsKey];
+
     //speed limit - down
     BOOL const downLimitEnabled = tr_sessionIsSpeedLimited(self.fHandle, TR_DOWN);
     [self.fDefaults setBool:downLimitEnabled forKey:@"CheckDownload"];
@@ -1476,6 +1754,7 @@ static NSString* const kWebUIURLFormat = @"http://localhost:%ld/";
         //lpd handled by bindings
 
         self.fPortField.intValue = port;
+        [self updateAnnounceIPControls];
         //port forwarding (nat) handled by bindings
         //random port handled by bindings
 

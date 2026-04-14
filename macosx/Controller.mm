@@ -585,6 +585,14 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         tr_variantDictAddBool(&settings, TR_KEY_speed_limit_up_enabled, [_fDefaults boolForKey:@"CheckUpload"]);
 
         //hidden prefs
+        if ([_fDefaults objectForKey:@"AnnounceIP"])
+        {
+            tr_variantDictAddStr(&settings, TR_KEY_announce_ip, [_fDefaults stringForKey:@"AnnounceIP"].UTF8String);
+        }
+        if ([_fDefaults objectForKey:@"AnnounceIPEnabled"])
+        {
+            tr_variantDictAddBool(&settings, TR_KEY_announce_ip_enabled, [_fDefaults boolForKey:@"AnnounceIPEnabled"]);
+        }
         if ([_fDefaults objectForKey:@"BindAddressIPv4"])
         {
             tr_variantDictAddStr(&settings, TR_KEY_bind_address_ipv4, [_fDefaults stringForKey:@"BindAddressIPv4"].UTF8String);
