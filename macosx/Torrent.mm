@@ -67,7 +67,7 @@ static NSString* stringFromTorrentCString(char const* value)
 
 - (instancetype)initWithHashString:(NSString*)hashString
                               stat:(tr_stat)stat
-                        errorString:(NSString*)errorString
+                       errorString:(NSString*)errorString
              relocationErrorString:(NSString*)relocationErrorString
                               name:(NSString*)name
                             magnet:(BOOL)magnet
@@ -83,8 +83,8 @@ static NSString* stringFromTorrentCString(char const* value)
                 canRetryRelocation:(BOOL)canRetryRelocation
                canResumeRelocation:(BOOL)canResumeRelocation
                canCancelRelocation:(BOOL)canCancelRelocation
-                   piecePercentData:(NSData*)piecePercentData
-             includesPiecePercentData:(BOOL)includesPiecePercentData NS_DESIGNATED_INITIALIZER;
+                  piecePercentData:(NSData*)piecePercentData
+          includesPiecePercentData:(BOOL)includesPiecePercentData NS_DESIGNATED_INITIALIZER;
 
 @end
 
@@ -92,7 +92,7 @@ static NSString* stringFromTorrentCString(char const* value)
 
 - (instancetype)initWithHashString:(NSString*)hashString
                               stat:(tr_stat)stat
-                        errorString:(NSString*)errorString
+                       errorString:(NSString*)errorString
              relocationErrorString:(NSString*)relocationErrorString
                               name:(NSString*)name
                             magnet:(BOOL)magnet
@@ -108,8 +108,8 @@ static NSString* stringFromTorrentCString(char const* value)
                 canRetryRelocation:(BOOL)canRetryRelocation
                canResumeRelocation:(BOOL)canResumeRelocation
                canCancelRelocation:(BOOL)canCancelRelocation
-                   piecePercentData:(NSData*)piecePercentData
-             includesPiecePercentData:(BOOL)includesPiecePercentData
+                  piecePercentData:(NSData*)piecePercentData
+          includesPiecePercentData:(BOOL)includesPiecePercentData
 {
     if ((self = [super init]))
     {
@@ -142,6 +142,71 @@ static NSString* stringFromTorrentCString(char const* value)
 }
 
 @end
+
+static TorrentMainWindowSnapshot* torrentMainWindowSnapshot(tr_torrent* torrentStruct, BOOL includePieces)
+{
+    if (torrentStruct == nullptr)
+    {
+        return nil;
+    }
+
+    tr_stat stat = *tr_torrentStat(torrentStruct);
+    auto const view = tr_torrentView(torrentStruct);
+    NSString* hashString = @(view.hash_string);
+    NSString* errorString = stringFromTorrentCString(stat.errorString);
+    NSString* relocationErrorString = stringFromTorrentCString(stat.relocationErrorString);
+    NSString* name = @(tr_torrentName(torrentStruct));
+    BOOL const magnet = !tr_torrentHasMetadata(torrentStruct);
+    BOOL const folder = view.is_folder;
+    uint64_t const size = view.total_size;
+    NSInteger const pieceSize = view.piece_size;
+    NSInteger const pieceCount = view.n_pieces;
+    BOOL const privateTorrent = view.is_private;
+    tr_priority_t const priority = tr_torrentGetPriority(torrentStruct);
+
+    NSMutableArray<NSString*>* allTrackers = [NSMutableArray arrayWithCapacity:tr_torrentTrackerCount(torrentStruct)];
+    NSString* bestTrackerSortKey = nil;
+    for (size_t i = 0, n = tr_torrentTrackerCount(torrentStruct); i < n; ++i)
+    {
+        auto const tracker = tr_torrentTracker(torrentStruct, i);
+        NSString* announce = @(tracker.announce);
+        [allTrackers addObject:announce];
+
+        NSString* hostAndPort = @(tracker.host_and_port);
+        if (bestTrackerSortKey == nil || [hostAndPort localizedCaseInsensitiveCompare:bestTrackerSortKey] == NSOrderedAscending)
+        {
+            bestTrackerSortKey = hostAndPort;
+        }
+    }
+
+    NSData* piecePercentData = nil;
+    if (includePieces && !magnet && pieceCount > 0)
+    {
+        NSInteger const visiblePieceCount = MIN(pieceCount, kMainWindowMaxPieces);
+        NSMutableData* mutablePiecePercentData = [NSMutableData dataWithLength:visiblePieceCount * sizeof(float)];
+        tr_torrentAmountFinished(torrentStruct, static_cast<float*>(mutablePiecePercentData.mutableBytes), static_cast<int>(visiblePieceCount));
+        piecePercentData = mutablePiecePercentData;
+    }
+
+    return [[TorrentMainWindowSnapshot alloc] initWithHashString:hashString stat:stat errorString:errorString
+                                           relocationErrorString:relocationErrorString
+                                                            name:name
+                                                          magnet:magnet
+                                                          folder:folder
+                                                            size:size
+                                                       pieceSize:pieceSize
+                                                      pieceCount:pieceCount
+                                                  privateTorrent:privateTorrent
+                                                        priority:priority
+                                                 allTrackersFlat:allTrackers
+                                                  trackerSortKey:bestTrackerSortKey
+                                               canManualAnnounce:tr_torrentCanManualUpdate(torrentStruct)
+                                              canRetryRelocation:tr_torrentCanRetryRelocation(torrentStruct)
+                                             canResumeRelocation:tr_torrentCanResumeRelocation(torrentStruct)
+                                             canCancelRelocation:tr_torrentCanCancelRelocation(torrentStruct)
+                                                piecePercentData:piecePercentData
+                                        includesPiecePercentData:includePieces];
+}
 
 @interface Torrent ()
 {
@@ -434,66 +499,14 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:YES];
 }
 
++ (TorrentMainWindowSnapshot*)mainWindowSnapshotForTorrentStruct:(tr_torrent*)torrentStruct includePieces:(BOOL)includePieces
+{
+    return torrentMainWindowSnapshot(torrentStruct, includePieces);
+}
+
 - (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces
 {
-    tr_stat stat = *tr_torrentStat(self.fHandle);
-    auto const view = tr_torrentView(self.fHandle);
-    NSString* hashString = @(view.hash_string);
-    NSString* errorString = stringFromTorrentCString(stat.errorString);
-    NSString* relocationErrorString = stringFromTorrentCString(stat.relocationErrorString);
-    NSString* name = @(tr_torrentName(self.fHandle));
-    BOOL const magnet = !tr_torrentHasMetadata(self.fHandle);
-    BOOL const folder = view.is_folder;
-    uint64_t const size = view.total_size;
-    NSInteger const pieceSize = view.piece_size;
-    NSInteger const pieceCount = view.n_pieces;
-    BOOL const privateTorrent = view.is_private;
-    tr_priority_t const priority = tr_torrentGetPriority(self.fHandle);
-
-    NSMutableArray<NSString*>* allTrackers = [NSMutableArray arrayWithCapacity:tr_torrentTrackerCount(self.fHandle)];
-    NSString* bestTrackerSortKey = nil;
-    for (size_t i = 0, n = tr_torrentTrackerCount(self.fHandle); i < n; ++i)
-    {
-        auto const tracker = tr_torrentTracker(self.fHandle, i);
-        NSString* announce = @(tracker.announce);
-        [allTrackers addObject:announce];
-
-        NSString* hostAndPort = @(tracker.host_and_port);
-        if (bestTrackerSortKey == nil || [hostAndPort localizedCaseInsensitiveCompare:bestTrackerSortKey] == NSOrderedAscending)
-        {
-            bestTrackerSortKey = hostAndPort;
-        }
-    }
-
-    NSData* piecePercentData = nil;
-    if (includePieces && !magnet && pieceCount > 0)
-    {
-        NSInteger const visiblePieceCount = MIN(pieceCount, kMainWindowMaxPieces);
-        NSMutableData* mutablePiecePercentData = [NSMutableData dataWithLength:visiblePieceCount * sizeof(float)];
-        tr_torrentAmountFinished(self.fHandle, static_cast<float*>(mutablePiecePercentData.mutableBytes), static_cast<int>(visiblePieceCount));
-        piecePercentData = mutablePiecePercentData;
-    }
-
-    return [[TorrentMainWindowSnapshot alloc] initWithHashString:hashString
-                                                            stat:stat
-                                                      errorString:errorString
-                                           relocationErrorString:relocationErrorString
-                                                            name:name
-                                                          magnet:magnet
-                                                          folder:folder
-                                                            size:size
-                                                       pieceSize:pieceSize
-                                                      pieceCount:pieceCount
-                                                  privateTorrent:privateTorrent
-                                                        priority:priority
-                                                 allTrackersFlat:allTrackers
-                                                  trackerSortKey:bestTrackerSortKey
-                                               canManualAnnounce:tr_torrentCanManualUpdate(self.fHandle)
-                                              canRetryRelocation:tr_torrentCanRetryRelocation(self.fHandle)
-                                             canResumeRelocation:tr_torrentCanResumeRelocation(self.fHandle)
-                                             canCancelRelocation:tr_torrentCanCancelRelocation(self.fHandle)
-                                                 piecePercentData:piecePercentData
-                                           includesPiecePercentData:includePieces];
+    return torrentMainWindowSnapshot(self.fHandle, includePieces);
 }
 
 - (void)applyMainWindowSnapshot:(TorrentMainWindowSnapshot*)snapshot
@@ -526,8 +539,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         self.mainWindowPiecePercentData = snapshot.piecePercentData;
     }
 
-    if (previousName == nil || ![previousName isEqualToString:_fCachedName] || previousMagnet != _fCachedMagnet ||
-        previousFolder != _fCachedFolder)
+    if (previousName == nil || ![previousName isEqualToString:_fCachedName] || previousMagnet != _fCachedMagnet || previousFolder != _fCachedFolder)
     {
         self.fIcon = nil;
     }

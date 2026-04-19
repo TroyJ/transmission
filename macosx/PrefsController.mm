@@ -517,8 +517,7 @@ static NSString* StringFromStringView(std::string_view value)
 
     for (NSView* subview in container.subviews)
     {
-        if (natNoteField == nil && [subview isKindOfClass:[NSTextField class]] && NSMinY(subview.frame) > 30.0 &&
-            NSMinY(subview.frame) < 50.0)
+        if (natNoteField == nil && [subview isKindOfClass:[NSTextField class]] && NSMinY(subview.frame) > 30.0 && NSMinY(subview.frame) < 50.0)
         {
             natNoteField = (NSTextField*)subview;
         }
@@ -550,9 +549,7 @@ static NSString* StringFromStringView(std::string_view value)
     self.fAnnounceIPCheck.translatesAutoresizingMaskIntoConstraints = NO;
     self.fAnnounceIPCheck.buttonType = NSButtonTypeSwitch;
     self.fAnnounceIPCheck.bezelStyle = NSBezelStyleRegularSquare;
-    self.fAnnounceIPCheck.title = NSLocalizedString(
-        @"Override tracker announce IP",
-        "Preferences -> Network -> checkbox to override the IP sent to trackers");
+    self.fAnnounceIPCheck.title = NSLocalizedString(@"Override tracker announce IP", "Preferences -> Network -> checkbox to override the IP sent to trackers");
     self.fAnnounceIPCheck.target = self;
     self.fAnnounceIPCheck.action = @selector(setAnnounceIPEnabled:);
 

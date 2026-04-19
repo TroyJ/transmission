@@ -122,7 +122,7 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
 
 - (void)updateWithDownload:(CGFloat)dlRate
                     upload:(CGFloat)ulRate
-               sessionStats:(tr_session_stats)sessionStats
+              sessionStats:(tr_session_stats)sessionStats
            cumulativeStats:(tr_session_stats)cumulativeStats
              internetState:(InternetStateIndicatorSnapshot*)internetState
 {

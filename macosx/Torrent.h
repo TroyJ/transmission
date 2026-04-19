@@ -62,6 +62,7 @@ extern NSString* const kTorrentDidChangeGroupNotification;
 @property(nonatomic, readonly) NSData* mainWindowPiecePercentData;
 
 - (void)update;
++ (TorrentMainWindowSnapshot*)mainWindowSnapshotForTorrentStruct:(tr_torrent*)torrentStruct includePieces:(BOOL)includePieces;
 - (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces;
 - (void)applyMainWindowSnapshot:(TorrentMainWindowSnapshot*)snapshot;
 

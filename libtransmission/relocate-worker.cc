@@ -553,10 +553,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     return validated_size;
 }
 
-[[nodiscard]] bool recover_copy_state(
-    tr_relocate_worker::Snapshot const& snapshot,
-    Journal& journal,
-    tr_error* const error)
+[[nodiscard]] bool recover_copy_state(tr_relocate_worker::Snapshot const& snapshot, Journal& journal, tr_error* const error)
 {
     journal.bytes_total = snapshot.metainfo.total_size();
     journal.bytes_copied = 0U;
@@ -581,7 +578,8 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             continue;
         }
 
-        if (auto const final_size = file_size_if_exists(final_path(snapshot, file_index)); final_size && *final_size == file_size)
+        if (auto const final_size = file_size_if_exists(final_path(snapshot, file_index));
+            final_size && *final_size == file_size)
         {
             journal.bytes_copied += file_size;
             journal.file_index = file_index + 1U;
@@ -594,8 +592,8 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             return false;
         }
 
-        if (auto const existing_size = file_size_if_exists(temp_path(snapshot, file_index));
-            existing_size && recovered_size < *existing_size && !truncate_file_to(temp_path(snapshot, file_index), recovered_size, error))
+        if (auto const existing_size = file_size_if_exists(temp_path(snapshot, file_index)); existing_size &&
+            recovered_size < *existing_size && !truncate_file_to(temp_path(snapshot, file_index), recovered_size, error))
         {
             return false;
         }
@@ -757,7 +755,8 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         {
             if (auto const elapsed = now - last_rate_at; elapsed >= ProgressUpdateInterval)
             {
-                current_rate_bps = static_cast<uint64_t>(bytes_since_last_rate / std::chrono::duration<double>(elapsed).count());
+                current_rate_bps = static_cast<uint64_t>(
+                    bytes_since_last_rate / std::chrono::duration<double>(elapsed).count());
                 bytes_since_last_rate = 0U;
                 last_rate_at = now;
             }
@@ -769,12 +768,8 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
                 return false;
             }
 
-            mediator.on_relocate_state_changed(
-                TR_RELOC_COPYING,
-                journal.bytes_copied,
-                journal.bytes_total,
-                current_rate_bps,
-                {});
+            mediator
+                .on_relocate_state_changed(TR_RELOC_COPYING, journal.bytes_copied, journal.bytes_total, current_rate_bps, {});
             bytes_since_last_save = 0U;
             last_progress_at = now;
         }
