@@ -243,12 +243,13 @@ bool tr_torrentSetMetainfoFromFile(tr_torrent* tor, tr_torrent_metainfo const* m
     tor->use_metainfo_from_file(metainfo, filename, &error);
     if (error)
     {
-        tor->error().set_local_error(fmt::format(
-            fmt::runtime(_("Couldn't use metainfo from '{path}' for '{magnet}': {error} ({error_code})")),
-            fmt::arg("path", filename),
-            fmt::arg("magnet", tor->magnet()),
-            fmt::arg("error", error.message()),
-            fmt::arg("error_code", error.code())));
+        tor->error().set_local_error(
+            fmt::format(
+                fmt::runtime(_("Couldn't use metainfo from '{path}' for '{magnet}': {error} ({error_code})")),
+                fmt::arg("path", filename),
+                fmt::arg("magnet", tor->magnet()),
+                fmt::arg("error", error.message()),
+                fmt::arg("error_code", error.code())));
         return false;
     }
 
@@ -1089,11 +1090,12 @@ void tr_torrent::init(tr_ctor const& ctor)
 
         if (error)
         {
-            this->error().set_local_error(fmt::format(
-                fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-                fmt::arg("path", file_path),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
+            this->error().set_local_error(
+                fmt::format(
+                    fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
+                    fmt::arg("path", file_path),
+                    fmt::arg("error", error.message()),
+                    fmt::arg("error_code", error.code())));
         }
     }
 
@@ -1204,12 +1206,13 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
         ok = files().move(current_dir(), path, name(), &error);
         if (error)
         {
-            this->error().set_local_error(fmt::format(
-                fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
-                fmt::arg("old_path", current_dir()),
-                fmt::arg("path", path),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
+            this->error().set_local_error(
+                fmt::format(
+                    fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
+                    fmt::arg("old_path", current_dir()),
+                    fmt::arg("path", path),
+                    fmt::arg("error", error.message()),
+                    fmt::arg("error_code", error.code())));
             tr_torrentStop(this);
         }
     }
@@ -1880,10 +1883,10 @@ void tr_torrent::VerifyMediator::on_piece_checked(tr_piece_index_t const piece, 
     if (auto const had_piece = tor_->has_piece(piece); !has_piece || !had_piece)
     {
         tor_->set_has_piece(piece, has_piece);
-        tor_->set_dirty();
     }
 
     tor_->checked_pieces_.set(piece, true);
+    tor_->set_dirty();
     tor_->mark_changed();
     tor_->verify_progress_ = std::clamp(static_cast<float>(piece + 1U) / tor_->metainfo_.piece_count(), 0.0F, 1.0F);
 }
@@ -2467,11 +2470,12 @@ bool tr_torrent::set_announce_list(tr_announce_list announce_list)
 
     if (save_error.has_value())
     {
-        error().set_local_error(fmt::format(
-            fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-            fmt::arg("path", filename),
-            fmt::arg("error", save_error.message()),
-            fmt::arg("error_code", save_error.code())));
+        error().set_local_error(
+            fmt::format(
+                fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
+                fmt::arg("path", filename),
+                fmt::arg("error", save_error.message()),
+                fmt::arg("error_code", save_error.code())));
         return false;
     }
 
