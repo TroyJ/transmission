@@ -2245,7 +2245,7 @@ void tr_sessionClearStats(tr_session* session)
 namespace
 {
 auto constexpr QueueInterval = 1s;
-auto constexpr SaveInterval = 360s;
+auto constexpr SaveInterval = 60s;
 
 auto makeResumeDir(std::string_view config_dir)
 {
