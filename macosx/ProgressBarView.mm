@@ -9,10 +9,13 @@
 #import "NSApplicationAdditions.h"
 
 static CGFloat const kPiecesTotalPercent = 0.6;
+static NSInteger const kMaxPieces = 18 * 18;
 
 @interface ProgressBarView ()
 
 @property(nonatomic, readonly) NSUserDefaults* fDefaults;
+
+@property(nonatomic, strong) NSBitmapImageRep* fPiecesBitmap;
 
 @property(nonatomic, readonly) NSColor* fBarBorderColor;
 @property(nonatomic, readonly) NSColor* fBluePieceColor;
@@ -22,11 +25,26 @@ static CGFloat const kPiecesTotalPercent = 0.6;
 
 @implementation ProgressBarView
 
++ (ProgressBarView*)sharedInstance
+{
+    static ProgressBarView* sSharedInstance = [[ProgressBarView alloc] init];
+    return sSharedInstance;
+}
+
 - (instancetype)init
 {
     if ((self = [super init]))
     {
         _fDefaults = NSUserDefaults.standardUserDefaults;
+
+        _fPiecesBitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nil pixelsWide:kMaxPieces pixelsHigh:1
+                                                              bitsPerSample:8
+                                                            samplesPerPixel:4
+                                                                   hasAlpha:YES
+                                                                   isPlanar:NO
+                                                             colorSpaceName:NSCalibratedRGBColorSpace
+                                                                bytesPerRow:0
+                                                               bitsPerPixel:0];
 
         _fBluePieceColor = [NSColor colorWithCalibratedRed:0.0 green:0.4 blue:0.8 alpha:1.0];
         _fBarBorderColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.2];
@@ -46,7 +64,7 @@ static CGFloat const kPiecesTotalPercent = 0.6;
         NSDivideRect(barRect, &piecesBarRect, &regularBarRect, floor(NSHeight(barRect) * kPiecesTotalPercent * piecesBarPercent), NSMaxYEdge);
 
         [self drawRegularBar:regularBarRect forTorrent:torrent];
-        [self drawPiecesBar:piecesBarRect forTorrent:torrent];
+        [self drawPiecesBar:piecesBarRect forTorrent:torrent minimal:minimal];
     }
     else
     {
@@ -140,7 +158,7 @@ static CGFloat const kPiecesTotalPercent = 0.6;
     }
 }
 
-- (void)drawPiecesBar:(NSRect)barRect forTorrent:(Torrent*)torrent
+- (void)drawPiecesBar:(NSRect)barRect forTorrent:(Torrent*)torrent minimal:(BOOL)minimal
 {
     // Fill a solid color bar for magnet links
     if (torrent.magnet)
@@ -151,14 +169,16 @@ static CGFloat const kPiecesTotalPercent = 0.6;
         }
         else
         {
-            [[NSColor colorWithCalibratedWhite:1.0 alpha:[self.fDefaults boolForKey:@"SmallView"] ? 0.25 : 1.0] set];
+            [[NSColor colorWithCalibratedWhite:1.0 alpha:minimal ? 0.25 : 1.0] set];
         }
         NSRectFillUsingOperation(barRect, NSCompositingOperationSourceOver);
         return;
     }
 
+    // Piece data comes from the background sampler snapshot; never read it
+    // synchronously from the main thread here.
     NSData* piecePercentData = torrent.mainWindowPiecePercentData;
-    int const pieceCount = static_cast<int>(piecePercentData.length / sizeof(float));
+    int const pieceCount = static_cast<int>(MIN(piecePercentData.length / sizeof(float), kMaxPieces));
     if (pieceCount <= 0)
     {
         torrent.previousFinishedPieces = nil;
@@ -169,7 +189,7 @@ static CGFloat const kPiecesTotalPercent = 0.6;
         }
         else
         {
-            [[NSColor colorWithCalibratedWhite:1.0 alpha:[self.fDefaults boolForKey:@"SmallView"] ? 0.25 : 1.0] set];
+            [[NSColor colorWithCalibratedWhite:1.0 alpha:minimal ? 0.25 : 1.0] set];
         }
         NSRectFillUsingOperation(barRect, NSCompositingOperationSourceOver);
         return;
@@ -177,14 +197,7 @@ static CGFloat const kPiecesTotalPercent = 0.6;
 
     float const* piecesPercent = static_cast<float const*>(piecePercentData.bytes);
 
-    NSBitmapImageRep* bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nil pixelsWide:pieceCount pixelsHigh:1
-                                                                    bitsPerSample:8
-                                                                  samplesPerPixel:4
-                                                                         hasAlpha:YES
-                                                                         isPlanar:NO
-                                                                   colorSpaceName:NSCalibratedRGBColorSpace
-                                                                      bytesPerRow:0
-                                                                     bitsPerPixel:0];
+    NSBitmapImageRep* bitmap = self.fPiecesBitmap;
 
     NSIndexSet* previousFinishedIndexes = torrent.previousFinishedPieces;
     NSMutableIndexSet* finishedIndexes = [NSMutableIndexSet indexSet];
@@ -223,8 +236,8 @@ static CGFloat const kPiecesTotalPercent = 0.6;
     torrent.previousFinishedPieces = finishedIndexes.count > 0 ? finishedIndexes : nil; //don't bother saving if none are complete
 
     //actually draw image
-    [bitmap drawInRect:barRect fromRect:NSZeroRect operation:NSCompositingOperationSourceOver
-              fraction:[self.fDefaults boolForKey:@"SmallView"] ? 0.25 : 1.0
+    [bitmap drawInRect:barRect fromRect:NSMakeRect(0.0, 0.0, pieceCount, 1.0) operation:NSCompositingOperationSourceOver
+              fraction:minimal ? 0.25 : 1.0
         respectFlipped:YES
                  hints:nil];
 }
