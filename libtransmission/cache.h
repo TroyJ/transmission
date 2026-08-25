@@ -11,6 +11,7 @@
 
 #include <cstddef> // for size_t
 #include <cstdint> // for intX_t, uintX_t
+#include <functional>
 #include <map>
 #include <memory> // for std::unique_ptr
 #include <utility> // for std::pair
@@ -82,8 +83,34 @@ public:
         return write_worker_.pending_bytes();
     }
 
+    [[nodiscard]] size_t pending_jobs() const noexcept
+    {
+        return write_worker_.pending_jobs();
+    }
+
     /** Ceiling on bytes handed to the worker but not yet on disk. */
     static constexpr size_t MaxInFlightBytes = 32U * 1024U * 1024U;
+
+    /**
+     * Runs `on_session_thread` once everything currently queued has been
+     * written -- without blocking the session thread waiting for it.
+     *
+     * This is how the flush-then-act sequences are kept honest. The worker is
+     * FIFO, so a job queued now runs after every write already queued; when it
+     * completes, the continuation is posted back to the session thread. Callers
+     * get "the bytes are on disk, now do the thing" without a `drain()`.
+     */
+    void run_after_pending_writes(std::function<void()> on_session_thread);
+
+    /**
+     * Closes a descriptor on the write worker instead of here.
+     *
+     * Installed as tr_open_files' close handler. The worker's FIFO ordering
+     * means anything already queued for this file is written before the close
+     * lands, and `close()` -- which blocks for as long as a write on a stalled
+     * volume -- stops being the session thread's problem.
+     */
+    void close_fd_async(tr_sys_file_t fd);
 
     /** Testing only; see tr_disk_write_worker::set_paused(). */
     void set_write_paused(bool paused)

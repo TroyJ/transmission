@@ -167,6 +167,30 @@ Cache::BlockData const* Cache::find_in_flight(Key const& key) const noexcept
     return nullptr;
 }
 
+void Cache::run_after_pending_writes(std::function<void()> on_session_thread)
+{
+    auto job = tr_disk_write_worker::Job{}; // no chunks, no bytes: purely a barrier
+    job.on_done = [this, cb = std::move(on_session_thread)](int /*err*/) mutable
+    {
+        session_.run_in_session_thread(std::move(cb));
+    };
+    write_worker_.add(std::move(job));
+}
+
+void Cache::close_fd_async(tr_sys_file_t const fd)
+{
+    if (fd == TR_BAD_SYS_FILE)
+    {
+        return;
+    }
+
+    // A chunk with no bytes to write: run_job() closes the descriptors it is
+    // given once it has written them, so an empty one is exactly a close.
+    auto job = tr_disk_write_worker::Job{};
+    job.chunks.push_back({ fd, 0U, 0U });
+    write_worker_.add(std::move(job));
+}
+
 void Cache::drain()
 {
     // Once this returns the bytes are on disk, which is all any caller of
@@ -194,10 +218,16 @@ Cache::Cache(tr_session& session, tr_torrents const& torrents, Memory const max_
     , torrents_{ torrents }
     , max_blocks_{ get_max_blocks(max_size) }
 {
+    session_.openFiles().set_close_handler([this](tr_sys_file_t fd) { close_fd_async(fd); });
 }
 
 Cache::~Cache()
 {
+    // open_files_ outlives us (it is declared before `cache` in tr_session, so
+    // it is destroyed after), and its descriptors must not be routed to a
+    // worker that has gone away.
+    session_.openFiles().set_close_handler(nullptr);
+
     // Blocks already handed off must reach the disk before we go away. The
     // worker's own destructor drains too, but doing it here keeps the ordering
     // explicit and lets the in-flight bookkeeping unwind first.

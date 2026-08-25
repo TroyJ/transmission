@@ -15,7 +15,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef> // size_t
-#include <cstdint> // uintX_t
+#include <cstdint>
+#include <functional> // uintX_t
 #include <ctime> // time_t
 #include <future>
 #include <memory>
@@ -804,6 +805,17 @@ public:
     void flush_torrent_files(tr_torrent_id_t tor_id) const noexcept;
     void close_torrent_files(tr_torrent_id_t tor_id) noexcept;
     void close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept;
+
+    /**
+     * Flushes and closes one file, then runs `on_closed` on the session thread
+     * once its bytes are on disk -- without blocking in between.
+     *
+     * The synchronous close_torrent_file() waits for the flush, which on a
+     * stalled disk means the session thread waits too: a 430 second hold was
+     * measured that way. File completion happens per file, often many times per
+     * torrent, so it is much too hot to wait on.
+     */
+    void close_torrent_file_async(tr_torrent const& tor, tr_file_index_t file_num, std::function<void()> on_closed);
 
     // announce ip
 

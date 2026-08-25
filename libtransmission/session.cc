@@ -1500,6 +1500,13 @@ void tr_session::closeImplPart2(std::promise<void>* closed_promise, std::chrono:
     stats().save();
     peer_mgr_.reset();
     openFiles().close_all();
+
+    // close_all() hands its descriptors to the write worker (see
+    // tr_open_files::set_close_handler), so wait for them before going further.
+    if (this->cache)
+    {
+        this->cache->drain();
+    }
     tr_utp_close(this);
     this->udp_core_.reset();
 
@@ -2293,8 +2300,18 @@ void tr_session::close_torrent_files(tr_torrent_id_t const tor_id) noexcept
 void tr_session::close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept
 {
     this->cache->flush_file(tor, file_num);
-    this->cache->drain(); // as above: a `.part` rename may follow this
+    this->cache->drain();
     openFiles().close_file(tor.id(), file_num);
+}
+
+void tr_session::close_torrent_file_async(tr_torrent const& tor, tr_file_index_t file_num, std::function<void()> on_closed)
+{
+    this->cache->flush_file(tor, file_num); // queued, not written here
+    openFiles().close_file(tor.id(), file_num); // the close is queued behind it
+
+    // FIFO: this fires after both, so by the time `on_closed` runs the file's
+    // bytes are on disk and its descriptors are closed.
+    this->cache->run_after_pending_writes(std::move(on_closed));
 }
 
 // ---

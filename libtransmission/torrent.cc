@@ -2663,24 +2663,47 @@ std::string_view tr_torrent::primary_mime_type() const
 
 void tr_torrent::on_file_completed(tr_file_index_t const file)
 {
-    /* close the file so that we can reopen in read-only mode as needed */
-    session->close_torrent_file(*this, file);
+    /* Close the file so that we can reopen in read-only mode as needed, then
+     * finish up once its bytes are actually on disk.
+     *
+     * Everything below the flush depends on the write having landed: the mtime
+     * we record is read back off the disk, and the `.part` rename must not
+     * outrun the file's tail. That used to be guaranteed by flushing
+     * synchronously, which meant the session thread waited on the disk -- a 430
+     * second hold was measured that way on a stalled volume. So it is a
+     * continuation now: queued behind the file's writes, run on the session
+     * thread when they complete. See docs/async-write-path-2a.md. */
+    auto const tor_id = id();
+    auto const* const session_ptr = session;
 
-    // the file may be renamed below; in-flight checks hold the old path
-    invalidate_pending_piece_checks();
+    session->close_torrent_file_async(
+        *this,
+        file,
+        [session_ptr, tor_id, file]()
+        {
+            // The torrent may have been removed while the write was in flight.
+            auto* const tor = session_ptr->torrents().get(tor_id);
+            if (tor == nullptr || tor->is_deleting_)
+            {
+                return;
+            }
 
-    /* now that the file is complete, flushed and closed, we can start
-     * watching its mtime timestamp for changes to know if we need to
-     * reverify pieces. Use the on-disk mtime rather than "now": the
-     * resume file compares this against the real mtime on next load, and
-     * a mismatch wipes the file's verification state. */
-    auto const found = find_file(file);
-    file_mtimes_[file] = found ? found->last_modified_at : tr_time();
+            // the file may be renamed below; in-flight checks hold the old path
+            tor->invalidate_pending_piece_checks();
 
-    /* if the torrent's current filename isn't the same as the one in the
-     * metadata -- for example, if it had the ".part" suffix appended to
-     * it until now -- then rename it to match the one in the metadata */
-    update_file_path(file, true);
+            /* now that the file is complete, flushed and closed, we can start
+             * watching its mtime timestamp for changes to know if we need to
+             * reverify pieces. Use the on-disk mtime rather than "now": the
+             * resume file compares this against the real mtime on next load, and
+             * a mismatch wipes the file's verification state. */
+            auto const found = tor->find_file(file);
+            tor->file_mtimes_[file] = found ? found->last_modified_at : tr_time();
+
+            /* if the torrent's current filename isn't the same as the one in the
+             * metadata -- for example, if it had the ".part" suffix appended to
+             * it until now -- then rename it to match the one in the metadata */
+            tor->update_file_path(file, true);
+        });
 }
 
 void tr_torrent::on_piece_completed(tr_piece_index_t const piece)

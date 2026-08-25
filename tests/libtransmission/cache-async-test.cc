@@ -227,4 +227,74 @@ TEST_F(CacheAsyncTest, aZeroSizedCacheStillWritesOffThread)
     in_session_thread(session_, [this]() { session_->cache->drain(); });
 }
 
+TEST_F(CacheAsyncTest, fileClosesGoToTheWorkerNotTheSessionThread)
+{
+    // close() flushes the file's dirty pages; on a stalled volume it has been
+    // measured at 144 seconds. It must not happen on the session thread.
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    // Get a file open in the pool by writing a block through to disk.
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            session_->cache->write_block(tor->id(), 0, make_block(tor, 0));
+            EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+            session_->cache->drain();
+        });
+
+    session_->cache->set_write_paused(true);
+
+    // Closing the torrent's files must hand the descriptors off rather than
+    // closing them here, so the work shows up as pending on the worker.
+    in_session_thread(session_, [this, tor]() { session_->openFiles().close_torrent(tor->id()); });
+
+    EXPECT_LT(0U, session_->cache->pending_jobs()) << "the close should have been queued, not run inline";
+
+    session_->cache->set_write_paused(false);
+    in_session_thread(session_, [this]() { session_->cache->drain(); });
+
+    EXPECT_EQ(0U, session_->cache->pending_jobs());
+}
+
+TEST_F(CacheAsyncTest, continuationWaitsForThePendingWritesWithoutBlocking)
+{
+    // What replaced the drain() at file completion. The callback must not run
+    // until the file's writes have landed -- the `.part` rename and the mtime
+    // read both depend on it -- but the session thread must not wait either.
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    session_->cache->set_write_paused(true);
+
+    auto fired = std::atomic<bool>{ false };
+    in_session_thread(
+        session_,
+        [this, tor, &fired]()
+        {
+            for (tr_block_index_t block = 0; block < 8; ++block)
+            {
+                session_->cache->write_block(tor->id(), block, make_block(tor, block));
+            }
+            session_->close_torrent_file_async(*tor, 0, [&fired]() { fired = true; });
+        });
+
+    // The writes are parked, so the continuation must still be waiting...
+    EXPECT_FALSE(fired.load()) << "the continuation ran before its writes landed";
+    EXPECT_LT(0U, session_->cache->pending_jobs());
+
+    // ...but the session thread is not waiting with it.
+    auto ran = std::atomic<bool>{ false };
+    session_->run_in_session_thread([&ran]() { ran = true; });
+    EXPECT_TRUE(waitFor([&ran]() { return ran.load(); }, 5000)) << "the session thread is blocked";
+    EXPECT_FALSE(fired.load());
+
+    // Let the disk go, and only now should it fire.
+    session_->cache->set_write_paused(false);
+    EXPECT_TRUE(waitFor([&fired]() { return fired.load(); }, 5000)) << "the continuation never ran";
+
+    in_session_thread(session_, [this]() { session_->cache->drain(); });
+}
+
 } // namespace libtransmission::test

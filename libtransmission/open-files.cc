@@ -261,6 +261,7 @@ std::optional<tr_sys_file_t> tr_open_files::get(
     auto& entry = pool_.add(std::move(key));
     entry.fd_ = fd;
     entry.writable_ = writable;
+    entry.owner_ = this;
 
     return fd;
 }
@@ -280,10 +281,24 @@ void tr_open_files::close_file(tr_torrent_id_t tor_id, tr_file_index_t file_num)
     pool_.erase(make_key(tor_id, file_num));
 }
 
+void tr_open_files::set_close_handler(std::function<void(tr_sys_file_t)> handler)
+{
+    close_handler_ = std::move(handler);
+}
+
 tr_open_files::Val::~Val()
 {
-    if (is_open(fd_))
+    if (!is_open(fd_))
     {
-        tr_sys_file_close(fd_);
+        return;
     }
+
+    // close() blocks on a slow disk; hand it off if someone is willing to take it
+    if (owner_ != nullptr && owner_->close_handler_)
+    {
+        owner_->close_handler_(fd_);
+        return;
+    }
+
+    tr_sys_file_close(fd_);
 }
