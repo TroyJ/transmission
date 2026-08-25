@@ -851,6 +851,22 @@ tr_sys_file_t tr_sys_file_open_temp(char* path_template, tr_error* error)
     return ret;
 }
 
+tr_sys_file_t tr_sys_file_duplicate(tr_sys_file_t handle, tr_error* error)
+{
+    TR_ASSERT(handle != TR_BAD_SYS_FILE);
+
+    auto ret = TR_BAD_SYS_FILE;
+    auto const process = GetCurrentProcess();
+
+    if (!DuplicateHandle(process, handle, process, &ret, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    {
+        set_system_error(error, GetLastError());
+        return TR_BAD_SYS_FILE;
+    }
+
+    return ret;
+}
+
 bool tr_sys_file_close(tr_sys_file_t handle, tr_error* error)
 {
     TR_ASSERT(handle != TR_BAD_SYS_FILE);

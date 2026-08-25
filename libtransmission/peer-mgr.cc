@@ -1325,6 +1325,16 @@ std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(tr_torrent* torrent, tr_p
     {
         return {};
     }
+
+    // Backpressure. When the disk cannot keep up, stop asking for more instead
+    // of letting the cache grow without bound -- peers can only send what we
+    // requested, so declining to request is what bounds it. Blocking here, or
+    // flushing inline, would put the stall back on the session thread, which is
+    // the entire thing we are avoiding. See docs/async-write-path-2a.md.
+    if (torrent->session->is_disk_write_backlogged())
+    {
+        return {};
+    }
     return swarm.wishlist->next(numwant, [peer](tr_piece_index_t p) { return peer->has_piece(p); });
 }
 

@@ -11,6 +11,7 @@
 
 #include <cstddef> // for size_t
 #include <cstdint> // for intX_t, uintX_t
+#include <map>
 #include <memory> // for std::unique_ptr
 #include <utility> // for std::pair
 #include <vector>
@@ -20,10 +21,12 @@
 #include "libtransmission/transmission.h"
 
 #include "libtransmission/block-info.h"
+#include "libtransmission/disk-write-worker.h"
 #include "libtransmission/values.h"
 
 class tr_torrents;
 struct tr_torrent;
+struct tr_session;
 
 class Cache
 {
@@ -31,7 +34,13 @@ public:
     using BlockData = small::max_size_vector<uint8_t, tr_block_info::BlockSize>;
     using Memory = libtransmission::Values::Memory;
 
-    Cache(tr_torrents const& torrents, Memory max_size);
+    Cache(tr_session& session, tr_torrents const& torrents, Memory max_size);
+    ~Cache();
+
+    Cache(Cache const&) = delete;
+    Cache(Cache&&) = delete;
+    Cache& operator=(Cache const&) = delete;
+    Cache& operator=(Cache&&) = delete;
 
     int set_limit(Memory max_size);
 
@@ -44,6 +53,43 @@ public:
         const;
     int flush_torrent(tr_torrent_id_t tor_id);
     int flush_file(tr_torrent const& tor, tr_file_index_t file);
+
+    /** Flushes every cached block, for every torrent. Used at shutdown. */
+    int flush_all();
+
+    /**
+     * Blocks until every flush handed to the write worker has reached the disk.
+     *
+     * Callers that must see the bytes on disk -- the `.part` rename, the
+     * relocation worker, torrent removal, session shutdown -- use this. It is
+     * the one place the session thread still waits on the disk, and it happens
+     * per file or per torrent rather than per block.
+     */
+    void drain();
+
+    /**
+     * True when the write worker is far enough behind that we should stop
+     * asking peers for more blocks.
+     *
+     * Backpressure travels through the request pipeline, not by blocking:
+     * peers can only send what we asked for, so declining to ask is what
+     * bounds the cache. See tr_peerMgrGetNextRequests().
+     */
+    [[nodiscard]] bool is_write_backlogged() const noexcept;
+
+    [[nodiscard]] size_t pending_write_bytes() const noexcept
+    {
+        return write_worker_.pending_bytes();
+    }
+
+    /** Ceiling on bytes handed to the worker but not yet on disk. */
+    static constexpr size_t MaxInFlightBytes = 32U * 1024U * 1024U;
+
+    /** Testing only; see tr_disk_write_worker::set_paused(). */
+    void set_write_paused(bool paused)
+    {
+        write_worker_.set_paused(paused);
+    }
 
 private:
     using Key = std::pair<tr_torrent_id_t, tr_block_index_t>;
@@ -63,8 +109,11 @@ private:
 
     [[nodiscard]] static CIter find_span_end(CIter const& span_begin, CIter const& end) noexcept;
 
-    // @return any error code from tr_ioWrite()
-    [[nodiscard]] int write_contiguous(CIter const& begin, CIter const& end) const;
+    // Hands one contiguous span to the write worker. Copies the bytes and
+    // opens the files here, on the session thread, then returns without
+    // waiting: the `pwrite` itself happens on the worker.
+    // @return 0, or an errno if the files could not be opened
+    [[nodiscard]] int write_contiguous(CIter const& begin, CIter const& end);
 
     // @return any error code from writeContiguous()
     [[nodiscard]] int flush_span(CIter const& begin, CIter const& end);
@@ -82,7 +131,27 @@ private:
 
     [[nodiscard]] CIter get_block(tr_torrent const& tor, tr_block_info::Location const& loc) noexcept;
 
+    // Moves [begin, end) out of blocks_ and into in_flight_ under `job_id`.
+    // They stay readable there until the write commits.
+    void mark_in_flight(uint64_t job_id, CIter const& begin, CIter const& end);
+
+    // Session-thread half of a completed write: drop the blocks, report errors.
+    void on_write_done(uint64_t job_id, tr_torrent_id_t tor_id, int error_code);
+
+    // Serves a block still being written. Returns nullptr if not in flight.
+    [[nodiscard]] BlockData const* find_in_flight(Key const& key) const noexcept;
+
+    tr_session& session_;
     tr_torrents const& torrents_;
+
+    tr_disk_write_worker write_worker_;
+
+    // Blocks handed to the worker, keyed by job. Kept until the write commits
+    // so that peer requests and hash checks still see them (a block that has
+    // been received must be readable immediately, whether or not it has
+    // reached the platter yet).
+    std::map<uint64_t, Blocks> in_flight_;
+    uint64_t next_job_id_ = 0U;
 
     Blocks blocks_;
     size_t max_blocks_ = 0;

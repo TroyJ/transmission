@@ -20,6 +20,8 @@ target_sources(libtransmission-test
         dht-test.cc
         error-test.cc
         file-piece-map-test.cc
+        cache-async-test.cc
+        disk-write-worker-test.cc
         file-test.cc
         getopt-test.cc
         handshake-test.cc

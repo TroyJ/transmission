@@ -324,6 +324,24 @@ tr_sys_file_t tr_sys_file_open(char const* path, int flags, int permissions, tr_
 tr_sys_file_t tr_sys_file_open_temp(char* path_template, tr_error* error = nullptr);
 
 /**
+ * @brief Portability wrapper for `dup()`.
+ *
+ * The copy refers to the same file but has its own descriptor, so the original
+ * may be closed -- e.g. evicted from the `tr_open_files` pool -- while the copy
+ * is still in use. The two share a file position, so callers must use the
+ * positional `tr_sys_file_read_at()` / `tr_sys_file_write_at()` rather than the
+ * sequential forms.
+ *
+ * @param[in]  handle Valid file descriptor.
+ * @param[out] error  Pointer to error object. Optional, pass `nullptr` if you
+ *                    are not interested in error details.
+ *
+ * @return Duplicated file descriptor on success, `TR_BAD_SYS_FILE` otherwise
+ *         (with `error` set accordingly).
+ */
+tr_sys_file_t tr_sys_file_duplicate(tr_sys_file_t handle, tr_error* error = nullptr);
+
+/**
  * @brief Portability wrapper for `close()`.
  *
  * @param[in]  handle Valid file descriptor.

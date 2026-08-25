@@ -1416,6 +1416,16 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     utp_timer.reset();
     relocator_.reset();
     verifier_.reset();
+
+    // Everything the cache handed to the write worker has to reach the disk
+    // before anything else is torn down. The old synchronous flush made quit
+    // implicitly safe; an asynchronous one has to say so explicitly.
+    if (this->cache)
+    {
+        this->cache->flush_all();
+        this->cache->drain();
+    }
+
     piece_checker_.reset();
     save_timer_.reset();
     queue_timer_.reset();
@@ -2261,15 +2271,29 @@ void tr_session::flush_torrent_files(tr_torrent_id_t const tor_id) const noexcep
     this->cache->flush_torrent(tor_id);
 }
 
+bool tr_session::is_disk_write_backlogged() const noexcept
+{
+    return this->cache->is_write_backlogged();
+}
+
 void tr_session::close_torrent_files(tr_torrent_id_t const tor_id) noexcept
 {
     this->cache->flush_torrent(tor_id);
+
+    // Callers act on the bytes the moment this returns -- renaming `.part`,
+    // handing files to the relocation worker, deleting them. The flush is
+    // asynchronous now, so wait for it here. This waits per torrent, not per
+    // block, so it is a rare pause rather than the per-block stall that made
+    // the app unusable.
+    this->cache->drain();
+
     openFiles().close_torrent(tor_id);
 }
 
 void tr_session::close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept
 {
     this->cache->flush_file(tor, file_num);
+    this->cache->drain(); // as above: a `.part` rename may follow this
     openFiles().close_file(tor.id(), file_num);
 }
 

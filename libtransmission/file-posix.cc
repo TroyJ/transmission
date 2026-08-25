@@ -615,6 +615,29 @@ tr_sys_file_t tr_sys_file_open_temp(char* path_template, tr_error* error)
     return ret;
 }
 
+tr_sys_file_t tr_sys_file_duplicate(tr_sys_file_t handle, tr_error* error)
+{
+    TR_ASSERT(handle != TR_BAD_SYS_FILE);
+
+    auto const ret = dup(handle);
+
+    if (ret == -1)
+    {
+        if (error != nullptr)
+        {
+            error->set_from_errno(errno);
+        }
+
+        return TR_BAD_SYS_FILE;
+    }
+
+    // Keep the copy out of any child processes; nothing here ever wants to
+    // inherit a torrent data file.
+    (void)fcntl(ret, F_SETFD, FD_CLOEXEC);
+
+    return ret;
+}
+
 bool tr_sys_file_close(tr_sys_file_t handle, tr_error* error)
 {
     auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Close, handle, 0U, 0U };

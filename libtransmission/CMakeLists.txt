@@ -52,6 +52,8 @@ target_sources(${TR_NAME}
         crypto-utils-wolfssl.cc
         crypto-utils.cc
         crypto-utils.h
+        disk-write-worker.cc
+        disk-write-worker.h
         error-types.h
         error.cc
         error.h

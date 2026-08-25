@@ -795,6 +795,12 @@ public:
         return open_files_;
     }
 
+    /**
+     * True when the disk write worker is far enough behind that we should stop
+     * asking peers for more blocks. See Cache::is_write_backlogged().
+     */
+    [[nodiscard]] bool is_disk_write_backlogged() const noexcept;
+
     void flush_torrent_files(tr_torrent_id_t tor_id) const noexcept;
     void close_torrent_files(tr_torrent_id_t tor_id) noexcept;
     void close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept;
@@ -1445,7 +1451,7 @@ private:
 
 public:
     // depends-on: settings_, open_files_, torrents_
-    std::unique_ptr<Cache> cache = std::make_unique<Cache>(torrents_, Memory{ 2U, Memory::Units::MBytes });
+    std::unique_ptr<Cache> cache = std::make_unique<Cache>(*this, torrents_, Memory{ 2U, Memory::Units::MBytes });
 
 private:
     // depends-on: timer_maker_, blocklists_, top_bandwidth_, utp_context, torrents_, web_

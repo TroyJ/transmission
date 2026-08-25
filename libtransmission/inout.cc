@@ -15,6 +15,7 @@
 #include "libtransmission/transmission.h"
 
 #include "libtransmission/block-info.h" // tr_block_info
+#include "libtransmission/disk-write-worker.h"
 #include "libtransmission/crypto-utils.h"
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
@@ -266,6 +267,92 @@ int tr_ioWrite(tr_torrent& tor, tr_block_info::Location const& loc, size_t const
     }
 
     return error.code();
+}
+
+int tr_ioPrepareWrite(
+    tr_torrent& tor,
+    tr_block_info::Location const& loc,
+    size_t const len,
+    std::vector<tr_disk_write_worker::Chunk>& setme)
+{
+    setme.clear();
+
+    auto const close_all = [&setme]()
+    {
+        for (auto& chunk : setme)
+        {
+            if (chunk.fd != TR_BAD_SYS_FILE)
+            {
+                tr_sys_file_close(chunk.fd);
+            }
+        }
+        setme.clear();
+    };
+
+    if (loc.piece >= tor.piece_count())
+    {
+        return EINVAL;
+    }
+
+    auto error = tr_error{};
+    auto [file_index, file_offset] = tor.file_offset(loc);
+    auto& session = *tor.session;
+    auto& open_files = session.openFiles();
+    auto remaining = uint64_t{ len };
+
+    while (remaining != 0U)
+    {
+        auto const bytes_this_pass = std::min(remaining, tor.file_size(file_index) - file_offset);
+
+        // A zero-length file contributes nothing to write, but still advances
+        // the walk -- mirroring read_or_write_bytes()'s early return.
+        if (tor.file_size(file_index) != 0U && bytes_this_pass != 0U)
+        {
+            auto const fd = get_fd(session, open_files, tor, true /*writable*/, file_index, error);
+            if (!fd || error)
+            {
+                close_all();
+                return error.code() != 0 ? error.code() : EIO;
+            }
+
+            // Duplicate it: `open_files` is an LRU pool and may close its copy
+            // while this write is still queued.
+            auto const dup_fd = tr_sys_file_duplicate(*fd, &error);
+            if (dup_fd == TR_BAD_SYS_FILE)
+            {
+                close_all();
+                return error.code() != 0 ? error.code() : EIO;
+            }
+
+            setme.emplace_back(tr_disk_write_worker::Chunk{ dup_fd, file_offset, bytes_this_pass });
+        }
+
+        remaining -= bytes_this_pass;
+        ++file_index;
+        file_offset = 0U;
+
+        if (remaining != 0U && file_index >= tor.file_count())
+        {
+            close_all();
+            return EINVAL;
+        }
+    }
+
+    return 0;
+}
+
+void tr_ioReportWriteError(tr_torrent& tor, int const error_code)
+{
+    if (error_code == 0)
+    {
+        return;
+    }
+
+    if (tor.error().error_type() != TR_STAT_LOCAL_ERROR)
+    {
+        tor.error().set_local_error(tr_strerror(error_code));
+        tr_torrentStop(&tor);
+    }
 }
 
 bool tr_ioTestPiece(tr_torrent const& tor, tr_piece_index_t const piece)
