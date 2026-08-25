@@ -214,3 +214,34 @@ TEST_F(DiskWriteWorkerTest, pendingBytesTracksAcceptedWork)
     worker.drain();
     EXPECT_EQ(0U, worker.pending_bytes());
 }
+
+TEST_F(DiskWriteWorkerTest, runJobOpensByPathCreatingParentsAndClosesWhenDone)
+{
+    auto const path = tr_pathbuf{ sandboxDir(), "/a/b/c.part"sv };
+    static auto constexpr Payload = "hello, worker"sv;
+
+    auto job = tr_disk_write_worker::Job{};
+    job.data.assign(std::begin(Payload), std::end(Payload));
+    auto chunk = tr_disk_write_worker::Chunk{};
+    chunk.path = std::string{ path.sv() };
+    chunk.file_offset = 4U;
+    chunk.length = std::size(Payload);
+    chunk.file_size = 32U;
+    job.chunks.push_back(std::move(chunk));
+
+    EXPECT_FALSE(tr_sys_path_exists(path));
+    EXPECT_EQ(0, tr_disk_write_worker::run_job(job));
+    EXPECT_EQ(TR_BAD_SYS_FILE, job.chunks.front().fd) << "closed after the write";
+
+    auto const info = tr_sys_path_get_info(path);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(4U + std::size(Payload), info->size);
+
+    auto buf = std::array<char, 64>{};
+    auto const fd = tr_sys_file_open(path, TR_SYS_FILE_READ, 0);
+    ASSERT_NE(TR_BAD_SYS_FILE, fd);
+    auto n_read = uint64_t{};
+    EXPECT_TRUE(tr_sys_file_read_at(fd, std::data(buf), std::size(Payload), 4U, &n_read));
+    tr_sys_file_close(fd);
+    EXPECT_EQ(Payload, std::string_view(std::data(buf), n_read));
+}

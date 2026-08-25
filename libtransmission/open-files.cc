@@ -131,6 +131,123 @@ bool preallocate_file_full(tr_sys_file_t fd, uint64_t length, tr_error* error)
 
 // ---
 
+tr_sys_file_t tr_open_files::open_file(
+    std::string_view const filename_in,
+    bool writable,
+    Preallocation const allocation,
+    uint64_t const file_size,
+    tr_error* const error_out)
+{
+    // create subfolders, if any
+    auto const filename = tr_pathbuf{ filename_in };
+    auto error = tr_error{};
+    if (writable)
+    {
+        auto dir = tr_pathbuf{ filename.sv() };
+        dir.popdir();
+        if (!tr_sys_dir_create(dir, TR_SYS_DIR_CREATE_PARENTS, 0777, &error))
+        {
+            tr_logAddError(
+                fmt::format(
+                    fmt::runtime(_("Couldn't create '{path}': {error} ({error_code})")),
+                    fmt::arg("path", dir),
+                    fmt::arg("error", error.message()),
+                    fmt::arg("error_code", error.code())));
+            if (error_out != nullptr)
+            {
+                *error_out = std::move(error);
+            }
+            return TR_BAD_SYS_FILE;
+        }
+    }
+
+    auto const info = tr_sys_path_get_info(filename);
+    bool const already_existed = info && info->isFile();
+
+    // we need write permissions to resize the file
+    bool const resize_needed = already_existed && (file_size < info->size);
+    writable |= resize_needed;
+
+    // open the file
+    int flags = writable ? (TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE) : 0;
+    flags |= TR_SYS_FILE_READ;
+    auto const fd = tr_sys_file_open(filename, flags, 0666, &error);
+    if (!is_open(fd))
+    {
+        tr_logAddError(
+            fmt::format(
+                fmt::runtime(_("Couldn't open '{path}': {error} ({error_code})")),
+                fmt::arg("path", filename),
+                fmt::arg("error", error.message()),
+                fmt::arg("error_code", error.code())));
+        if (error_out != nullptr)
+        {
+            *error_out = std::move(error);
+        }
+        return TR_BAD_SYS_FILE;
+    }
+
+    if (writable && !already_existed && allocation != Preallocation::None)
+    {
+        bool success = false;
+        char const* type = nullptr;
+
+        if (allocation == Preallocation::Full)
+        {
+            success = preallocate_file_full(fd, file_size, &error);
+            type = "full";
+        }
+        else if (allocation == Preallocation::Sparse)
+        {
+            success = preallocate_file_sparse(fd, file_size, &error);
+            type = "sparse";
+        }
+
+        TR_ASSERT(type != nullptr);
+
+        if (!success)
+        {
+            tr_logAddError(
+                fmt::format(
+                    fmt::runtime(_("Couldn't preallocate '{path}': {error} ({error_code})")),
+                    fmt::arg("path", filename),
+                    fmt::arg("error", error.message()),
+                    fmt::arg("error_code", error.code())));
+            tr_sys_file_close(fd);
+            if (error_out != nullptr)
+            {
+                *error_out = std::move(error);
+            }
+            return TR_BAD_SYS_FILE;
+        }
+
+        tr_logAddDebug(fmt::format("Preallocated file '{}' ({}, size: {})", filename, type, file_size));
+    }
+
+    // If the file already exists and it's too large, truncate it.
+    // This is a fringe case that happens if a torrent's been updated
+    // and one of the updated torrent's files is smaller.
+    // https://trac.transmissionbt.com/ticket/2228
+    // https://bugs.launchpad.net/ubuntu/+source/transmission/+bug/318249
+    if (resize_needed && !tr_sys_file_truncate(fd, file_size, &error))
+    {
+        tr_logAddWarn(
+            fmt::format(
+                fmt::runtime(_("Couldn't truncate '{path}': {error} ({error_code})")),
+                fmt::arg("path", filename),
+                fmt::arg("error", error.message()),
+                fmt::arg("error_code", error.code())));
+        tr_sys_file_close(fd);
+        if (error_out != nullptr)
+        {
+            *error_out = std::move(error);
+        }
+        return TR_BAD_SYS_FILE;
+    }
+
+    return fd;
+}
+
 std::optional<tr_sys_file_t> tr_open_files::get(tr_torrent_id_t tor_id, tr_file_index_t file_num, bool writable)
 {
     if (auto* const found = pool_.get(make_key(tor_id, file_num)); found != nullptr)
@@ -166,94 +283,10 @@ std::optional<tr_sys_file_t> tr_open_files::get(
         pool_.erase(key); // close so we can re-open as writable
     }
 
-    // create subfolders, if any
-    auto const filename = tr_pathbuf{ filename_in };
     auto error = tr_error{};
-    if (writable)
-    {
-        auto dir = tr_pathbuf{ filename.sv() };
-        dir.popdir();
-        if (!tr_sys_dir_create(dir, TR_SYS_DIR_CREATE_PARENTS, 0777, &error))
-        {
-            tr_logAddError(
-                fmt::format(
-                    fmt::runtime(_("Couldn't create '{path}': {error} ({error_code})")),
-                    fmt::arg("path", dir),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-            return {};
-        }
-    }
-
-    auto const info = tr_sys_path_get_info(filename);
-    bool const already_existed = info && info->isFile();
-
-    // we need write permissions to resize the file
-    bool const resize_needed = already_existed && (file_size < info->size);
-    writable |= resize_needed;
-
-    // open the file
-    int flags = writable ? (TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE) : 0;
-    flags |= TR_SYS_FILE_READ;
-    auto const fd = tr_sys_file_open(filename, flags, 0666, &error);
+    auto const fd = open_file(filename_in, writable, allocation, file_size, &error);
     if (!is_open(fd))
     {
-        tr_logAddError(
-            fmt::format(
-                fmt::runtime(_("Couldn't open '{path}': {error} ({error_code})")),
-                fmt::arg("path", filename),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
-        return {};
-    }
-
-    if (writable && !already_existed && allocation != Preallocation::None)
-    {
-        bool success = false;
-        char const* type = nullptr;
-
-        if (allocation == Preallocation::Full)
-        {
-            success = preallocate_file_full(fd, file_size, &error);
-            type = "full";
-        }
-        else if (allocation == Preallocation::Sparse)
-        {
-            success = preallocate_file_sparse(fd, file_size, &error);
-            type = "sparse";
-        }
-
-        TR_ASSERT(type != nullptr);
-
-        if (!success)
-        {
-            tr_logAddError(
-                fmt::format(
-                    fmt::runtime(_("Couldn't preallocate '{path}': {error} ({error_code})")),
-                    fmt::arg("path", filename),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-            tr_sys_file_close(fd);
-            return {};
-        }
-
-        tr_logAddDebug(fmt::format("Preallocated file '{}' ({}, size: {})", filename, type, file_size));
-    }
-
-    // If the file already exists and it's too large, truncate it.
-    // This is a fringe case that happens if a torrent's been updated
-    // and one of the updated torrent's files is smaller.
-    // https://trac.transmissionbt.com/ticket/2228
-    // https://bugs.launchpad.net/ubuntu/+source/transmission/+bug/318249
-    if (resize_needed && !tr_sys_file_truncate(fd, file_size, &error))
-    {
-        tr_logAddWarn(
-            fmt::format(
-                fmt::runtime(_("Couldn't truncate '{path}': {error} ({error_code})")),
-                fmt::arg("path", filename),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
-        tr_sys_file_close(fd);
         return {};
     }
 

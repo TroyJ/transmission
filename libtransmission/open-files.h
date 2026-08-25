@@ -34,6 +34,20 @@ public:
 
     [[nodiscard]] std::optional<tr_sys_file_t> get(tr_torrent_id_t tor_id, tr_file_index_t file_num, bool writable);
 
+    /**
+     * Opens (creating and preallocating if needed, truncating if oversized)
+     * without touching the pool. Thread-safe: this is what the write worker
+     * uses, so that the open -- a metadata op that queues behind writes on a
+     * stalled volume -- happens on the disk thread and not under the session
+     * lock. `get()` uses it too, so the two never disagree.
+     */
+    [[nodiscard]] static tr_sys_file_t open_file(
+        std::string_view filename,
+        bool writable,
+        Preallocation allocation,
+        uint64_t file_size,
+        tr_error* error = nullptr);
+
     [[nodiscard]] std::optional<tr_sys_file_t> get(
         tr_torrent_id_t tor_id,
         tr_file_index_t file_num,

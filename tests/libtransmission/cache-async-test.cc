@@ -15,6 +15,7 @@
 
 #include <libtransmission/cache.h>
 #include <libtransmission/file.h>
+#include <libtransmission/open-files.h>
 #include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/values.h>
@@ -236,7 +237,9 @@ TEST_F(CacheAsyncTest, fileClosesGoToTheWorkerNotTheSessionThread)
     auto* const tor = torrentInitFromFile(TorFilename);
     ASSERT_NE(nullptr, tor);
 
-    // Get a file open in the pool by writing a block through to disk.
+    // Get a file open in the pool. Writes no longer go through the pool (the
+    // worker opens by path), so open one the way a read does: put the file on
+    // disk first, then have the pool open it read-only.
     in_session_thread(
         session_,
         [this, tor]()
@@ -244,6 +247,10 @@ TEST_F(CacheAsyncTest, fileClosesGoToTheWorkerNotTheSessionThread)
             session_->cache->write_block(tor->id(), 0, make_block(tor, 0));
             EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
             session_->cache->drain();
+            auto const path = tor->found_file_path(0);
+            ASSERT_TRUE(path.has_value());
+            EXPECT_TRUE(
+                session_->openFiles().get(tor->id(), 0, false, *path, tr_open_files::Preallocation::None, tor->file_size(0)));
         });
 
     session_->cache->set_write_paused(true);
@@ -305,19 +312,28 @@ TEST_F(CacheAsyncTest, removingATorrentWithDataDoesNotWaitForTheDisk)
     ASSERT_NE(nullptr, tor);
     auto const tor_id = tor->id();
 
-    // Park a flush on the "disk"...
-    session_->cache->set_write_paused(true);
+    // Put the file on disk, then park a second flush on the "disk"...
     in_session_thread(
         session_,
         [this, tor]()
         {
             session_->cache->write_block(tor->id(), 0, make_block(tor, 0));
             EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+            session_->cache->drain();
+        });
+    session_->cache->set_write_paused(true);
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            session_->cache->write_block(tor->id(), 1, make_block(tor, 1));
+            EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
         });
     EXPECT_LT(0U, session_->cache->pending_write_bytes());
 
     auto const path = std::string{ tor->found_file_path(0).value_or("") };
     ASSERT_FALSE(std::empty(path));
+    ASSERT_TRUE(tr_sys_path_exists(path.c_str()));
 
     // ...and remove the torrent with its data. This used to drain the worker
     // on the session thread: with the disk stalled, the app stopped here.

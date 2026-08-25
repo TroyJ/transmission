@@ -278,54 +278,47 @@ int tr_ioPrepareWrite(
 {
     setme.clear();
 
-    auto const close_all = [&setme]()
-    {
-        for (auto& chunk : setme)
-        {
-            if (chunk.fd != TR_BAD_SYS_FILE)
-            {
-                tr_sys_file_close(chunk.fd);
-            }
-        }
-        setme.clear();
-    };
-
     if (loc.piece >= tor.piece_count())
     {
         return EINVAL;
     }
 
-    auto error = tr_error{};
     auto [file_index, file_offset] = tor.file_offset(loc);
     auto& session = *tor.session;
-    auto& open_files = session.openFiles();
     auto remaining = uint64_t{ len };
 
     while (remaining != 0U)
     {
-        auto const bytes_this_pass = std::min(remaining, tor.file_size(file_index) - file_offset);
+        auto const file_size = tor.file_size(file_index);
+        auto const bytes_this_pass = std::min(remaining, file_size - file_offset);
 
         // A zero-length file contributes nothing to write, but still advances
         // the walk -- mirroring read_or_write_bytes()'s early return.
-        if (tor.file_size(file_index) != 0U && bytes_this_pass != 0U)
+        if (file_size != 0U && bytes_this_pass != 0U)
         {
-            auto const fd = get_fd(session, open_files, tor, true /*writable*/, file_index, error);
-            if (!fd || error)
+            // No disk access here: the path is the remembered one, or the
+            // name a new file will get. The worker does the open (and the
+            // mkdir, stat, preallocate) on the disk thread.
+            auto chunk = tr_disk_write_worker::Chunk{};
+            if (auto const found = tor.found_file_path(file_index); found)
             {
-                close_all();
-                return error.code() != 0 ? error.code() : EIO;
+                chunk.path = std::string{ *found };
+            }
+            else
+            {
+                auto const suffix = session.isIncompleteFileNamingEnabled() ? tr_torrent_files::PartialFileSuffix : ""sv;
+                auto const filename = tr_pathbuf{ tor.current_dir(), '/', tor.file_subpath(file_index), suffix };
+                chunk.path = std::string{ filename.sv() };
+                tor.remember_found_path(file_index, filename);
+                session.add_file_created(); // about to be
             }
 
-            // Duplicate it: `open_files` is an LRU pool and may close its copy
-            // while this write is still queued.
-            auto const dup_fd = tr_sys_file_duplicate(*fd, &error);
-            if (dup_fd == TR_BAD_SYS_FILE)
-            {
-                close_all();
-                return error.code() != 0 ? error.code() : EIO;
-            }
-
-            setme.emplace_back(tr_disk_write_worker::Chunk{ dup_fd, file_offset, bytes_this_pass });
+            chunk.file_offset = file_offset;
+            chunk.length = bytes_this_pass;
+            chunk.file_size = file_size;
+            chunk.preallocation = static_cast<uint8_t>(
+                tor.file_is_wanted(file_index) ? session.preallocationMode() : tr_open_files::Preallocation::None);
+            setme.emplace_back(std::move(chunk));
         }
 
         remaining -= bytes_this_pass;
@@ -334,7 +327,7 @@ int tr_ioPrepareWrite(
 
         if (remaining != 0U && file_index >= tor.file_count())
         {
-            close_all();
+            setme.clear();
             return EINVAL;
         }
     }

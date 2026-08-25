@@ -15,6 +15,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -51,6 +52,15 @@ public:
         tr_sys_file_t fd = TR_BAD_SYS_FILE; // owned by the job; closed when it completes
         uint64_t file_offset = 0U;
         uint64_t length = 0U;
+
+        // When `fd` is unset and `path` is not, the worker opens the file
+        // itself (creating, preallocating and truncating as tr_open_files
+        // would) and closes it when the chunk is written. This keeps every
+        // metadata op off the session thread: on a stalled exFAT/FSKit
+        // volume an open() or stat() blocks exactly like a write().
+        std::string path;
+        uint64_t file_size = 0U;
+        uint8_t preallocation = 0U; // tr_open_files::Preallocation
     };
 
     struct Job

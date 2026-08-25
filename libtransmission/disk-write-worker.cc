@@ -15,6 +15,7 @@
 #include "libtransmission/disk-write-worker.h"
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
+#include "libtransmission/open-files.h"
 #include "libtransmission/tr-assert.h"
 
 namespace
@@ -45,6 +46,23 @@ int tr_disk_write_worker::run_job(Job& job)
         if (err != 0)
         {
             break;
+        }
+
+        if (chunk.fd == TR_BAD_SYS_FILE && !std::empty(chunk.path))
+        {
+            auto error = tr_error{};
+            auto& mutable_chunk = const_cast<Chunk&>(chunk); // the job owns its chunks; this records the fd for close_chunks()
+            mutable_chunk.fd = tr_open_files::open_file(
+                chunk.path,
+                true,
+                static_cast<tr_open_files::Preallocation>(chunk.preallocation),
+                chunk.file_size,
+                &error);
+            if (mutable_chunk.fd == TR_BAD_SYS_FILE)
+            {
+                err = error.code() != 0 ? error.code() : EIO;
+                break;
+            }
         }
 
         if (chunk.fd == TR_BAD_SYS_FILE)
