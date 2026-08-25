@@ -839,6 +839,7 @@ void tr_torrentRemoveInSessionThread(tr_torrent* tor, bool delete_flag, tr_fileF
         };
 
         auto error = tr_error{};
+        tor->forget_found_paths();
         tor->files().remove(tor->current_dir(), tor->name(), delete_func_wrapper, &error);
         if (error)
         {
@@ -1261,6 +1262,7 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
         {
             incomplete_dir_.clear();
             current_dir_ = download_dir();
+            forget_found_paths();
         }
     }
 
@@ -1442,6 +1444,38 @@ std::optional<tr_torrent_files::FoundFile> tr_torrent::find_file(tr_file_index_t
     auto paths = std::array<std::string_view, 4>{};
     auto const n_paths = buildSearchPathArray(this, std::data(paths));
     return files().find(file_index, std::data(paths), n_paths);
+}
+
+std::optional<std::string_view> tr_torrent::found_file_path(tr_file_index_t const file_index) const
+{
+    if (auto const iter = found_paths_.find(file_index); iter != std::end(found_paths_))
+    {
+        return std::string_view{ iter->second };
+    }
+
+    auto const found = find_file(file_index);
+    if (!found)
+    {
+        return {};
+    }
+
+    auto const [iter, inserted] = found_paths_.insert_or_assign(file_index, std::string{ found->filename().sv() });
+    return std::string_view{ iter->second };
+}
+
+void tr_torrent::remember_found_path(tr_file_index_t const file_index, std::string_view const path) const
+{
+    found_paths_.insert_or_assign(file_index, std::string{ path });
+}
+
+void tr_torrent::forget_found_path(tr_file_index_t const file_index) const noexcept
+{
+    found_paths_.erase(file_index);
+}
+
+void tr_torrent::forget_found_paths() const noexcept
+{
+    found_paths_.clear();
 }
 
 bool tr_torrent::has_any_local_data() const
@@ -1944,6 +1978,7 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
     }
 
     tor_->set_verify_state(VerifyState::None);
+    tor_->forget_found_paths(); // a verify is how the user tells us the files changed underneath us
 
     if (!aborted && !tor_->is_deleting_)
     {
@@ -2104,6 +2139,7 @@ void tr_torrent::RelocateMediator::on_source_deleted()
 
             tor->incomplete_dir_.clear();
             tor->current_dir_ = tor->download_dir();
+            tor->forget_found_paths();
             tor->clear_relocation_state();
             tor->mark_edited();
             tor->set_dirty();
@@ -2166,6 +2202,7 @@ bool tr_torrent::can_cancel_relocation() const noexcept
 
 void tr_torrent::discard_relocation_leftovers()
 {
+    forget_found_paths();
     auto const journal_file = relocation_journal_file();
     if (!tr_sys_path_exists(journal_file))
     {
@@ -2331,27 +2368,6 @@ void tr_torrent::recheck_completeness()
 
         completeness_ = new_completeness;
 
-        if (is_done())
-        {
-            session->close_torrent_files(id());
-
-            if (recent_change)
-            {
-                // https://www.bittorrent.org/beps/bep_0003.html
-                // ...and one using completed is sent when the download is complete.
-                // No completed is sent if the file was complete when started.
-                tr_announcerTorrentCompleted(this);
-            }
-            date_done_ = tr_time();
-
-            if (current_dir() == incomplete_dir())
-            {
-                set_location(download_dir(), true, nullptr);
-            }
-
-            done_.emit(this, recent_change);
-        }
-
         session->onTorrentCompletenessChanged(this, completeness_, was_running);
 
         set_dirty();
@@ -2359,10 +2375,58 @@ void tr_torrent::recheck_completeness()
 
         if (is_done())
         {
-            save_resume_file();
-            callScriptIfEnabled(this, TR_SCRIPT_ON_TORRENT_DONE);
+            /* Everything that announces "done" -- the tracker event, the move
+             * out of the incomplete dir, the done signal the GUI acts on, the
+             * resume file, the done-script -- must wait for the torrent's last
+             * bytes to actually be on disk and its files closed. That used to
+             * be a synchronous drain of the write worker, on the session
+             * thread, under the lock: on a stalled volume it was measured
+             * parking the app for 21 minutes. So, like on_file_completed(),
+             * it is a continuation queued behind the torrent's writes. */
+            auto const tor_id = id();
+            auto const* const session_ptr = session;
+            session->close_torrent_files_async(
+                tor_id,
+                [session_ptr, tor_id, recent_change]()
+                {
+                    auto* const tor = session_ptr->torrents().get(tor_id);
+                    if (tor == nullptr || tor->is_deleting_ || !tor->is_done())
+                    {
+                        return;
+                    }
+
+                    tor->on_done_and_flushed(recent_change);
+                });
         }
     }
+}
+
+void tr_torrent::on_done_and_flushed(bool const recent_change)
+{
+    using namespace completeness_helpers;
+
+    auto const lock = unique_lock();
+
+    if (recent_change)
+    {
+        // https://www.bittorrent.org/beps/bep_0003.html
+        // ...and one using completed is sent when the download is complete.
+        // No completed is sent if the file was complete when started.
+        tr_announcerTorrentCompleted(this);
+    }
+    date_done_ = tr_time();
+
+    if (current_dir() == incomplete_dir())
+    {
+        set_location(download_dir(), true, nullptr);
+    }
+
+    done_.emit(this, recent_change);
+
+    set_dirty();
+    mark_changed();
+    save_resume_file();
+    callScriptIfEnabled(this, TR_SCRIPT_ON_TORRENT_DONE);
 }
 
 // --- File DND
@@ -2690,6 +2754,7 @@ void tr_torrent::on_file_completed(tr_file_index_t const file)
 
             // the file may be renamed below; in-flight checks hold the old path
             tor->invalidate_pending_piece_checks();
+            tor->forget_found_path(file);
 
             /* now that the file is complete, flushed and closed, we can start
              * watching its mtime timestamp for changes to know if we need to
@@ -2703,6 +2768,7 @@ void tr_torrent::on_file_completed(tr_file_index_t const file)
              * metadata -- for example, if it had the ".part" suffix appended to
              * it until now -- then rename it to match the one in the metadata */
             tor->update_file_path(file, true);
+            tor->forget_found_path(file);
         });
 }
 
@@ -2818,6 +2884,8 @@ void tr_torrent::set_download_dir(std::string_view path, bool is_new_torrent)
 // decide whether we should be looking for files in downloadDir or incompleteDir
 void tr_torrent::refresh_current_dir()
 {
+    forget_found_paths();
+
     auto dir = tr_interned_string{};
 
     if (std::empty(incomplete_dir()))
@@ -3001,6 +3069,8 @@ void tr_torrent::rename_path_in_session_thread(
     {
         error = renamePath(this, oldpath, newname);
 
+        forget_found_paths(); // renamePath() moved things whether or not it fully succeeded
+
         if (error == 0)
         {
             /* update tr_info.files */
@@ -3181,9 +3251,9 @@ std::vector<tr_piece_check_worker::Span> tr_torrent::snapshot_spans(uint64_t con
         if (len != 0U) // skip zero-length files
         {
             auto span = tr_piece_check_worker::Span{};
-            if (auto const found = find_file(file_index); found)
+            if (auto const found = found_file_path(file_index); found)
             {
-                span.path = found->filename().sv();
+                span.path = *found;
             }
             span.file_offset = file_offset;
             span.length = len;

@@ -132,6 +132,7 @@ void set_file_for_single_pass(tr_sys_file_t handle)
 
 bool tr_sys_path_exists(char const* path, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, std::string_view{ path } };
     TR_ASSERT(path != nullptr);
 
     bool const ret = access(path, F_OK) != -1;
@@ -146,6 +147,7 @@ bool tr_sys_path_exists(char const* path, tr_error* error)
 
 std::optional<tr_sys_path_info> tr_sys_path_get_info(std::string_view path, int flags, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, path };
     struct stat sb = {};
 
     bool ok = false;
@@ -311,6 +313,7 @@ std::string_view tr_sys_path_dirname(std::string_view path)
 
 bool tr_sys_path_rename(char const* src_path, char const* dst_path, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, std::string_view{ src_path } };
     TR_ASSERT(src_path != nullptr);
     TR_ASSERT(dst_path != nullptr);
 
@@ -329,6 +332,7 @@ bool tr_sys_path_rename(char const* src_path, char const* dst_path, tr_error* er
  * use a user-space fallback instead. */
 bool tr_sys_path_copy(char const* src_path, char const* dst_path, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, std::string_view{ src_path } };
     TR_ASSERT(src_path != nullptr);
     TR_ASSERT(dst_path != nullptr);
 
@@ -532,6 +536,7 @@ bool tr_sys_path_copy(char const* src_path, char const* dst_path, tr_error* erro
 
 bool tr_sys_path_remove(char const* path, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, std::string_view{ path } };
     TR_ASSERT(path != nullptr);
 
     bool const ret = remove(path) != -1;
@@ -1105,6 +1110,7 @@ namespace
 
 bool tr_sys_dir_create(char const* path, int flags, int permissions, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, std::string_view{ path } };
     TR_ASSERT(path != nullptr);
 
     auto ret = false;
@@ -1173,6 +1179,7 @@ bool tr_sys_dir_create_temp(char* path_template, tr_error* error)
 
 tr_sys_dir_t tr_sys_dir_open(std::string_view path, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Path, -1, 0U, 0U, path };
     if (auto* const ret = opendir(tr_pathbuf{ path }); ret != nullptr)
     {
         return (tr_sys_dir_t)ret;

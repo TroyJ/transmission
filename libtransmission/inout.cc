@@ -91,9 +91,9 @@ bool write_entire_buf(tr_sys_file_t const fd, uint64_t file_offset, uint8_t cons
     auto const file_size = tor.file_size(file_index);
     auto const prealloc = writable && tor.file_is_wanted(file_index) ? session.preallocationMode() :
                                                                        tr_open_files::Preallocation::None;
-    if (auto const found = tor.find_file(file_index); found)
+    if (auto const found = tor.found_file_path(file_index); found)
     {
-        return open_files.get(tor_id, file_index, writable, found->filename(), prealloc, file_size);
+        return open_files.get(tor_id, file_index, writable, *found, prealloc, file_size);
     }
 
     // do we want to create it?
@@ -107,6 +107,7 @@ bool write_entire_buf(tr_sys_file_t const fd, uint64_t file_offset, uint8_t cons
         {
             // make a note that we just created a file
             session.add_file_created();
+            tor.remember_found_path(file_index, filename);
             return fd;
         }
 

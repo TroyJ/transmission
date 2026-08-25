@@ -587,6 +587,29 @@ struct tr_torrent
 
     [[nodiscard]] std::optional<tr_torrent_files::FoundFile> find_file(tr_file_index_t file_index) const;
 
+    /**
+     * The on-disk path of a file, resolved once and remembered.
+     *
+     * find_file() stat()s up to eight candidate paths, and on a stalled
+     * exFAT/FSKit volume a single stat() has been measured at 29 seconds --
+     * under the session lock, freezing the GUI and RPC for that long. The
+     * hot paths (every cache flush, every received block's piece check, every
+     * peer prefetch) only need the name, so they use this: one find_file()
+     * the first time a file is seen, then no disk access at all until
+     * something that can move, rename or delete a file calls
+     * forget_found_paths().
+     *
+     * Never remembers a miss: a file that does not exist yet is created by
+     * the next write, which records the name it chose via remember_found_path().
+     *
+     * The returned view points into the cache entry, so copy it before
+     * anything that might forget it.
+     */
+    [[nodiscard]] std::optional<std::string_view> found_file_path(tr_file_index_t file_index) const;
+    void remember_found_path(tr_file_index_t file_index, std::string_view path) const;
+    void forget_found_path(tr_file_index_t file_index) const noexcept;
+    void forget_found_paths() const noexcept;
+
     [[nodiscard]] bool has_any_local_data() const;
 
     /// METAINFO - TRACKERS
@@ -1459,6 +1482,10 @@ private:
     void create_empty_files() const;
     void recheck_completeness();
 
+    // second half of recheck_completeness(): runs once the finished torrent's
+    // bytes are on disk and its files are closed
+    void on_done_and_flushed(bool recent_change);
+
     [[nodiscard]] bool use_new_metainfo(tr_error* error);
 
     void update_file_path(tr_file_index_t file, std::optional<bool> has_file) const;
@@ -1508,6 +1535,9 @@ private:
     void on_block_prefetched(PrefetchKey key, uint64_t generation, std::vector<uint8_t> data, bool readable);
     void queue_seed_probe();
     std::map<PrefetchKey, std::pair<std::vector<uint8_t>, bool /*readable*/>> prefetched_blocks_;
+
+    // see found_file_path()
+    mutable std::map<tr_file_index_t, std::string> found_paths_;
     std::deque<PrefetchKey> prefetch_order_;
     std::set<PrefetchKey> prefetch_in_flight_;
 

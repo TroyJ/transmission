@@ -529,4 +529,47 @@ TEST_F(TorrentTest, staleRelocationJournalIsSweptAtStartup)
     EXPECT_TRUE(tr_sys_path_exists(keep));
 }
 
+// The hot paths (cache flushes, piece checks, peer prefetch) must not stat()
+// the data volume: on a stalled exFAT/FSKit disk a single stat() was measured
+// at 112 seconds while the session lock was held. So a file's path is
+// resolved once and remembered until something that could move it says so.
+TEST_F(TorrentTest, foundFilePathIsRememberedUntilForgotten)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(tor, nullptr);
+
+    auto const first_view = tor->found_file_path(0);
+    ASSERT_TRUE(first_view.has_value());
+    auto const first = std::optional<std::string>{ std::string{ *first_view } }; // the view dies with the entry
+    EXPECT_TRUE(tr_sys_path_exists(tr_pathbuf{ *first }));
+
+    // Remove the file behind its back. A remembered path is returned without
+    // touching the disk, so it still comes back...
+    EXPECT_TRUE(tr_sys_path_remove(tr_pathbuf{ *first }));
+    auto const second = tor->found_file_path(0);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(*first, *second);
+
+    // ...until forgotten, at which point it is resolved again for real.
+    tor->forget_found_paths();
+    EXPECT_FALSE(tor->found_file_path(0).has_value());
+
+    // A miss is never remembered: once the file is back, so is the path.
+    auto const restored = tr_pathbuf{ *first };
+    tr_sys_file_close(tr_sys_file_open(restored, TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE, 0600));
+    auto const third = tor->found_file_path(0);
+    ASSERT_TRUE(third.has_value());
+    EXPECT_EQ(*first, *third);
+
+    // What the write path creates is remembered too.
+    tor->forget_found_paths();
+    tor->remember_found_path(0, "/nonexistent/but/remembered");
+    EXPECT_EQ("/nonexistent/but/remembered", tor->found_file_path(0));
+
+    // Finishing a file renames it (.part off), so the entry is dropped and the
+    // final name is what comes back afterwards.
+    tor->forget_found_path(0);
+    EXPECT_EQ(*first, tor->found_file_path(0));
+}
+
 } // namespace libtransmission::test

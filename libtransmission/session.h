@@ -817,6 +817,15 @@ public:
      */
     void close_torrent_file_async(tr_torrent const& tor, tr_file_index_t file_num, std::function<void()> on_closed);
 
+    /**
+     * Like close_torrent_files(), but without waiting: `on_closed` runs on the
+     * session thread once every queued write and close for the torrent has
+     * reached the disk. The synchronous form parked the session thread for as
+     * long as the write worker's whole queue took to drain -- 21 minutes
+     * measured on a stalled volume, at torrent completion, on the peer path.
+     */
+    void close_torrent_files_async(tr_torrent_id_t tor_id, std::function<void()> on_closed);
+
     // announce ip
 
     [[nodiscard]] constexpr std::string const& announceIP() const noexcept

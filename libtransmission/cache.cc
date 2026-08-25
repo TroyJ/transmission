@@ -20,6 +20,7 @@
 #include "libtransmission/cache.h"
 #include "libtransmission/disk-write-worker.h"
 #include "libtransmission/inout.h"
+#include "libtransmission/io-trace.h"
 #include "libtransmission/session.h"
 #include "libtransmission/log.h"
 #include "libtransmission/torrent.h"
@@ -122,6 +123,7 @@ int Cache::write_contiguous(CIter const& begin, CIter const& end)
     disk_write_bytes_ += buflen;
 
     write_worker_.add(std::move(job));
+    tr_io_trace::gauge("pending-write-bytes", write_worker_.pending_bytes());
     return 0;
 }
 
@@ -193,6 +195,7 @@ void Cache::close_fd_async(tr_sys_file_t const fd)
 
 void Cache::drain()
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Wait, -1, 0U, write_worker_.pending_bytes(), "cache-drain" };
     // Once this returns the bytes are on disk, which is all any caller of
     // drain() needs. The completion callbacks that tidy up `in_flight_` and
     // report errors are posted to the session thread and land on the next turn

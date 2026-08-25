@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 
@@ -27,6 +28,16 @@
  * The clock lives entirely in session-lock.cc and the start timestamp is held
  * here as a plain nanosecond count.
  */
+/**
+ * How deeply the calling thread currently holds the session mutex, and the
+ * call site of its outermost hold. Only maintained while TR_TRACE_IO is on;
+ * both read as "not held" otherwise. Used by io-trace to flag disk I/O done
+ * while the lock is held -- the one invariant behind every GUI/RPC freeze.
+ */
+[[nodiscard]] std::size_t tr_session_lock_depth() noexcept;
+[[nodiscard]] char const* tr_session_lock_outer_file() noexcept;
+[[nodiscard]] int tr_session_lock_outer_line() noexcept;
+
 class tr_session_lock
 {
 public:

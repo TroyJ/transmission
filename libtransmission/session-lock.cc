@@ -23,6 +23,8 @@ namespace
 // it again. Only the outermost hold is timed; to everyone blocked behind the
 // mutex, a nested hold is just more of the same wait.
 thread_local auto depth = std::size_t{ 0U };
+thread_local char const* outer_file = nullptr;
+thread_local int outer_line = 0;
 
 [[nodiscard]] std::uint64_t now_nsec() noexcept
 {
@@ -31,6 +33,21 @@ thread_local auto depth = std::size_t{ 0U };
 }
 
 } // namespace
+
+std::size_t tr_session_lock_depth() noexcept
+{
+    return depth;
+}
+
+char const* tr_session_lock_outer_file() noexcept
+{
+    return outer_file;
+}
+
+int tr_session_lock_outer_line() noexcept
+{
+    return outer_line;
+}
 
 void tr_session_lock::begin_timing() noexcept
 {
@@ -45,6 +62,8 @@ void tr_session_lock::begin_timing() noexcept
     {
         began_nsec_ = now_nsec();
         timed_ = true;
+        outer_file = file_;
+        outer_line = line_;
     }
 }
 
@@ -64,6 +83,8 @@ void tr_session_lock::end_timing() noexcept
     }
 
     timed_ = false;
+    outer_file = nullptr;
+    outer_line = 0;
 
     auto const end_nsec = now_nsec();
     auto const elapsed_nsec = end_nsec > began_nsec_ ? end_nsec - began_nsec_ : 0U;

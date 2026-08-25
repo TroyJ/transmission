@@ -152,6 +152,15 @@ TEST_P(IncompleteDirTest, incompleteDir)
     };
     EXPECT_TRUE(waitFor(test, MaxWaitMsec));
     EXPECT_EQ(TR_SEED, completeness);
+
+    // The move out of the incomplete dir is queued behind the torrent's last
+    // writes rather than started synchronously with the completeness change,
+    // so wait for it to begin as well as to finish.
+    auto const moved_to_download_dir = [tor, &download_dir]()
+    {
+        return tor->current_dir() == download_dir;
+    };
+    EXPECT_TRUE(waitFor(moved_to_download_dir, MaxWaitMsec));
     EXPECT_TRUE(waitForRelocationToFinish(tor, MaxWaitMsec));
 
     auto const n = tr_torrentFileCount(tor);

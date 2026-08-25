@@ -2304,6 +2304,13 @@ void tr_session::close_torrent_file(tr_torrent const& tor, tr_file_index_t file_
     openFiles().close_file(tor.id(), file_num);
 }
 
+void tr_session::close_torrent_files_async(tr_torrent_id_t const tor_id, std::function<void()> on_closed)
+{
+    this->cache->flush_torrent(tor_id); // queued, not written here
+    openFiles().close_torrent(tor_id); // the closes are queued behind it
+    this->cache->run_after_pending_writes(std::move(on_closed));
+}
+
 void tr_session::close_torrent_file_async(tr_torrent const& tor, tr_file_index_t file_num, std::function<void()> on_closed)
 {
     this->cache->flush_file(tor, file_num); // queued, not written here

@@ -34,6 +34,15 @@
  *   TR_TRACE_IO=1            enable tracing
  *   TR_TRACE_IO_MS=100       log individual operations at or above this many ms
  *   TR_TRACE_IO_DUMP_SEC=60  log the latency histogram this often; 0 disables
+ *   TR_TRACE_IO_LOCKED_BT=3  print a backtrace for the first N I/O calls made
+ *                            while the session lock is held, per (op, lock site)
+ *
+ * Lock invariant: any disk operation begun while the calling thread holds the
+ * session mutex is a freeze waiting for a slow disk, regardless of how long it
+ * took this time. Every such call is counted separately in the histogram (as
+ * `<op>@lock`) and the first few per call site are logged with a backtrace, so
+ * the complete list of offenders falls out of one ordinary run rather than
+ * out of a stress test that happens to catch them being slow.
  *
  * Example:
  *   TR_TRACE_IO=1 TR_TRACE_IO_MS=250 \
@@ -50,10 +59,12 @@ enum class Op : std::uint8_t
     Write,
     Truncate,
     Preallocate,
+    Path, // stat/rename/remove/mkdir/opendir: metadata ops, which queue behind writes on a stalled volume
+    Wait, // the session thread blocking on the write worker (Cache::drain)
     LockHold,
 };
 
-inline auto constexpr NumOps = std::size_t{ 7U };
+inline auto constexpr NumOps = std::size_t{ 9U };
 
 namespace detail
 {
@@ -78,7 +89,29 @@ extern std::uint64_t trace_threshold_usec;
 /** Best-effort path for an open descriptor. Empty if it can't be resolved. */
 [[nodiscard]] std::string path_for_fd(int fd);
 
-void record(Op op, std::uint64_t elapsed_usec, int fd, std::uint64_t offset, std::uint64_t size, std::string_view note);
+void record(
+    Op op,
+    std::uint64_t elapsed_usec,
+    int fd,
+    std::uint64_t offset,
+    std::uint64_t size,
+    std::string_view note,
+    bool under_session_lock = false);
+
+/**
+ * Called when an I/O op is about to run while the session lock is held.
+ * Logs the op, the lock's call site, and a backtrace (rate-limited per site).
+ */
+void report_locked_io(Op op, std::string_view note);
+
+/** True if the calling thread holds the session mutex (tracing on only). */
+[[nodiscard]] bool session_lock_held() noexcept;
+
+/**
+ * Records a named quantity (e.g. bytes queued for the write worker). The
+ * histogram dump prints each gauge's latest and highest value.
+ */
+void gauge(std::string_view name, std::uint64_t value) noexcept;
 
 /** Human-readable latency histogram for every op seen so far. */
 [[nodiscard]] std::string dump();
@@ -109,6 +142,17 @@ public:
         // A close() invalidates the fd, so resolve its path while we still can.
         // Only done for the rare ops; never on the read/write hot path.
         note_ = op == Op::Close && std::empty(note) ? path_for_fd(fd) : std::string{ note };
+
+        if (session_lock_held())
+        {
+            under_lock_ = true;
+            if (std::empty(note_))
+            {
+                note_ = path_for_fd(fd);
+            }
+            report_locked_io(op, note_);
+        }
+
         began_ = std::chrono::steady_clock::now();
     }
 
@@ -125,7 +169,7 @@ public:
         {
             auto const elapsed = std::chrono::steady_clock::now() - began_;
             auto const usec = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
-            record(op_, static_cast<std::uint64_t>(usec < 0 ? 0 : usec), fd_, offset_, size_, note_);
+            record(op_, static_cast<std::uint64_t>(usec < 0 ? 0 : usec), fd_, offset_, size_, note_, under_lock_);
         }
         catch (...)
         {
@@ -143,6 +187,7 @@ private:
     std::uint64_t offset_;
     std::uint64_t size_;
     bool enabled_;
+    bool under_lock_ = false;
     std::string note_;
     std::chrono::steady_clock::time_point began_;
 };
