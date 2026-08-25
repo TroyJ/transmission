@@ -97,6 +97,14 @@ struct Snapshot
 
 [[nodiscard]] Snapshot snapshot() noexcept;
 
+/**
+ * How many times `op` has run on the data volume while the session lock was
+ * held (config-dir I/O is not counted). The test suite asserts this stays at
+ * zero for the unbounded ops -- read, write, close, wait -- which is the
+ * regression gate for every freeze fixed in docs/HANDOVER-disk-stalls-and-2a.md.
+ */
+[[nodiscard]] std::uint64_t locked_count(Op op) noexcept;
+
 [[nodiscard]] inline bool enabled() noexcept
 {
     return detail::trace_enabled;
@@ -164,19 +172,22 @@ public:
             // A close() invalidates the fd, so resolve its path while we still can.
             // Only done for the rare ops; never on the read/write hot path.
             note_ = op == Op::Close && std::empty(note) ? path_for_fd(fd) : std::string{ note };
-
-            if (under_lock_)
-            {
-                if (std::empty(note_))
-                {
-                    note_ = path_for_fd(fd);
-                }
-                report_locked_io(op, note_);
-            }
         }
-        else if (under_lock_)
+        else
         {
-            report_locked_io(op, note);
+            note_ = std::string{ note };
+        }
+
+        if (under_lock_)
+        {
+            // Under the lock the path is always resolved, tracing or not: the
+            // config-dir allowlist that keeps the locked counters honest (and
+            // the test-suite gate quiet) needs it.
+            if (std::empty(note_))
+            {
+                note_ = path_for_fd(fd);
+            }
+            report_locked_io(op, note_);
         }
 
         began_ = std::chrono::steady_clock::now();

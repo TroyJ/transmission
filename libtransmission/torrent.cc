@@ -2300,10 +2300,15 @@ void tr_torrent::discard_relocation_leftovers()
     {
         auto const& target_root = !std::empty(journal->target_root) ? journal->target_root : std::string{ download_dir() };
         auto const mediator = RelocateMediator{ this, target_root, nullptr, {} };
-        tr_relocate_worker::discard_staged_files(mediator.snapshot());
+        // The staged files live on the target volume; deleting them is disk
+        // work and runs on the disk thread. The snapshot is self-contained.
+        session->cache->run_after_pending_writes_on_worker([snapshot = mediator.snapshot()]()
+                                                           { tr_relocate_worker::discard_staged_files(snapshot); });
     }
-
-    tr_sys_path_remove(journal_file, nullptr);
+    else
+    {
+        tr_sys_path_remove(journal_file, nullptr); // discard_staged_files() removes it otherwise
+    }
 }
 
 void tr_torrent::retry_relocation()

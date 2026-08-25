@@ -312,7 +312,8 @@ bool session_lock_held() noexcept
 // still counted; it is just not printed or aborted on.
 [[nodiscard]] bool is_config_dir_io(std::string_view path) noexcept
 {
-    for (auto const needle : { "/Resume/"sv, "/Torrents/"sv, "/blocklists"sv, "/dht.dat"sv, ".resume"sv, ".torrent"sv })
+    for (auto const needle :
+         { "/Resume/"sv, "/Torrents/"sv, "/blocklists"sv, "/dht.dat"sv, "/relocations/"sv, ".resume"sv, ".torrent"sv })
     {
         if (path.find(needle) != std::string_view::npos)
         {
@@ -400,7 +401,7 @@ void record(
         return;
     }
 
-    if (under_session_lock)
+    if (under_session_lock && !is_config_dir_io(note))
     {
         auto& lst = locked_stats[idx];
         lst.count.fetch_add(1U, std::memory_order_relaxed);
@@ -456,6 +457,12 @@ void record(
     {
         maybe_dump(std::chrono::steady_clock::now());
     }
+}
+
+std::uint64_t locked_count(Op const op) noexcept
+{
+    auto const idx = static_cast<std::size_t>(op);
+    return idx < NumOps ? locked_stats[idx].count.load(std::memory_order_relaxed) : 0U;
 }
 
 Snapshot snapshot() noexcept
