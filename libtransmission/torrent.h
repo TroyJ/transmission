@@ -61,6 +61,7 @@ namespace libtransmission::test
 
 class RenameTest_multifileTorrent_Test;
 class TorrentTest_downloadedPieceIsCheckedAndRecorded_Test;
+class TorrentTest_absentFilesKeepVerificationState_Test;
 class RenameTest_singleFilenameTorrent_Test;
 
 } // namespace libtransmission::test
@@ -96,6 +97,7 @@ struct tr_torrent
     private:
         friend class libtransmission::test::RenameTest_multifileTorrent_Test;
         friend class libtransmission::test::RenameTest_singleFilenameTorrent_Test;
+        friend class libtransmission::test::TorrentTest_absentFilesKeepVerificationState_Test;
         friend struct tr_torrent;
 
         explicit ResumeHelper(tr_torrent& tor)
@@ -1472,6 +1474,7 @@ private:
     // files' mtimes (file_mtimes_). If checked_pieces_.test(piece) is false,
     // it means that piece needs to be checked before its data is used.
     friend class libtransmission::test::TorrentTest_downloadedPieceIsCheckedAndRecorded_Test;
+    friend class libtransmission::test::TorrentTest_absentFilesKeepVerificationState_Test;
     tr_bitfield checked_pieces_ = tr_bitfield{ 0 };
 
     // pieces with a hash job in flight on the piece-check worker
@@ -1495,6 +1498,9 @@ private:
 
     // when Transmission thinks the torrent's files were last changed
     std::vector<time_t> file_mtimes_;
+
+    // set by ResumeHelper::load_checked_pieces(): did any of the files exist on disk?
+    bool any_local_data_found_at_load_ = false;
 
     tr_interned_string bandwidth_group_;
 

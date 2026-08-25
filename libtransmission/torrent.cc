@@ -1085,12 +1085,9 @@ void tr_torrent::init(tr_ctor const& ctor)
     auto has_any_local_data = std::optional<bool>{};
     if ((loaded & tr_resume::Progress) != 0)
     {
-        // if tr_resume::load() loaded progress info, then initCheckedPieces()
+        // if tr_resume::load() loaded progress info, then load_checked_pieces()
         // has already looked for local data on the filesystem
-        has_any_local_data = std::any_of(
-            std::begin(file_mtimes_),
-            std::end(file_mtimes_),
-            [](auto mtime) { return mtime > 0; });
+        has_any_local_data = any_local_data_found_at_load_;
     }
 
     auto const file_path = store_file();
@@ -1951,6 +1948,13 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
                 for (tr_file_index_t file = 0, n_files = tor->file_count(); file < n_files; ++file)
                 {
                     tor->update_file_path(file, {});
+
+                    // Record the mtime the verification is valid for. Without
+                    // this a freshly-added-then-verified torrent saves
+                    // mtimes of 0 and load_checked_pieces() wipes the whole
+                    // bitfield on the next launch.
+                    auto const found = tor->find_file(file);
+                    tor->file_mtimes_[file] = found ? found->last_modified_at : 0;
                 }
 
                 tor->recheck_completeness();
@@ -2633,9 +2637,13 @@ void tr_torrent::on_file_completed(tr_file_index_t const file)
     // the file may be renamed below; in-flight checks hold the old path
     invalidate_pending_piece_checks();
 
-    /* now that the file is complete and closed, we can start watching its
-     * mtime timestamp for changes to know if we need to reverify pieces */
-    file_mtimes_[file] = tr_time();
+    /* now that the file is complete, flushed and closed, we can start
+     * watching its mtime timestamp for changes to know if we need to
+     * reverify pieces. Use the on-disk mtime rather than "now": the
+     * resume file compares this against the real mtime on next load, and
+     * a mismatch wipes the file's verification state. */
+    auto const found = find_file(file);
+    file_mtimes_[file] = found ? found->last_modified_at : tr_time();
 
     /* if the torrent's current filename isn't the same as the one in the
      * metadata -- for example, if it had the ".part" suffix appended to
@@ -3240,12 +3248,27 @@ void tr_torrent::ResumeHelper::load_checked_pieces(tr_bitfield const& checked, t
     auto const n_files = tor_.file_count();
     tor_.file_mtimes_.resize(n_files);
 
+    tor_.any_local_data_found_at_load_ = false;
+
     for (size_t file = 0; file < n_files; ++file)
     {
         auto const found = tor_.find_file(file);
-        auto const mtime = found ? found->last_modified_at : 0;
+        if (!found)
+        {
+            // The file is absent -- typically its volume is not mounted.
+            // Absence is not evidence that the data changed, so keep the
+            // saved mtime and verification state instead of wiping them;
+            // otherwise the next resume save persists `pieces = none`
+            // and the torrent must re-hash everything once the volume
+            // returns. If the file really did change while away, its
+            // mtime will differ on the next load and get unset then.
+            tor_.file_mtimes_[file] = mtimes[file];
+            continue;
+        }
 
+        auto const mtime = found->last_modified_at;
         tor_.file_mtimes_[file] = mtime;
+        tor_.any_local_data_found_at_load_ = true;
 
         // if a file has changed, mark its pieces as unchecked
         if (mtime == 0 || mtime != mtimes[file])

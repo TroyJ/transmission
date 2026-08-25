@@ -8,8 +8,11 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <libtransmission/cache.h>
+#include <libtransmission/file.h>
+#include <libtransmission/tr-strbuf.h>
 #include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
 
@@ -243,6 +246,66 @@ TEST_F(TorrentTest, downloadedCorruptPieceIsRejected)
 
     EXPECT_TRUE(waitFor([&n_failed]() { return n_failed.load() > 0; }, 5000));
     EXPECT_FALSE(tor->has_piece(piece));
+
+    tr_torrentRemove(tor, true, nullptr, nullptr);
+}
+
+// Regression: files that are absent at load time (e.g. an unmounted
+// volume) must not have their verification state wiped, or the next
+// resume save persists `progress.pieces = none`.
+TEST_F(TorrentTest, absentFilesKeepVerificationState)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    EXPECT_NE(nullptr, tor);
+    blockingTorrentVerify(tor);
+    EXPECT_TRUE(tor->checked_pieces_.has_all());
+
+    auto const saved_checked = tor->checked_pieces_;
+    auto const saved_mtimes = tor->file_mtimes_;
+    ASSERT_EQ(tor->file_count(), std::size(saved_mtimes));
+    for (auto const mtime : saved_mtimes)
+    {
+        EXPECT_GT(mtime, 0);
+    }
+
+    auto const load = [&](std::vector<time_t> const& mtimes)
+    {
+        auto done = std::atomic<bool>{ false };
+        session_->run_in_session_thread(
+            [&]()
+            {
+                tr_torrent::ResumeHelper{ *tor }.load_checked_pieces(saved_checked, std::data(mtimes));
+                done = true;
+            });
+        EXPECT_TRUE(waitFor([&done]() { return done.load(); }, 5000));
+    };
+
+    // hide the data, as if its volume were unmounted
+    auto const dir = tr_pathbuf{ tr_sessionGetDownloadDir(session_), "/files-filled-with-zeroes"sv };
+    auto const hidden = tr_pathbuf{ tr_sessionGetDownloadDir(session_), "/hidden"sv };
+    ASSERT_TRUE(tr_sys_path_rename(dir, hidden));
+
+    load(saved_mtimes);
+    EXPECT_TRUE(tor->checked_pieces_.has_all()) << "absent files must keep their verification state";
+    EXPECT_EQ(saved_mtimes, tor->file_mtimes_) << "absent files must keep their saved mtimes";
+    EXPECT_FALSE(tor->any_local_data_found_at_load_);
+
+    // bring it back unchanged: still verified
+    ASSERT_TRUE(tr_sys_path_rename(hidden, dir));
+    load(saved_mtimes);
+    EXPECT_TRUE(tor->checked_pieces_.has_all());
+    EXPECT_TRUE(tor->any_local_data_found_at_load_);
+
+    // bring it back changed: that file's pieces are unset
+    auto changed = saved_mtimes;
+    changed[0] += 1;
+    load(changed);
+    EXPECT_FALSE(tor->checked_pieces_.has_all());
+    auto const [begin, end] = tor->piece_span_for_file(0);
+    for (auto piece = begin; piece < end; ++piece)
+    {
+        EXPECT_FALSE(tor->is_piece_checked(piece));
+    }
 
     tr_torrentRemove(tor, true, nullptr, nullptr);
 }
