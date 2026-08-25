@@ -944,13 +944,24 @@ bool tr_torrent::is_new_torrent_a_seed()
         }
     }
 
-    // check the first piece. This is the one remaining synchronous
-    // hash: add-time seed detection needs the answer now.
-    if (!is_piece_checked(0))
-    {
-        checked_pieces_.set(0, check_piece(0));
-    }
-    return is_piece_checked(0);
+    // Looks like a seed. The caller marks it complete and queues an
+    // off-thread probe of piece 0 (queue_seed_probe()); if that fails
+    // the torrent is sent to a full verify. Nothing is served to peers
+    // before it is checked, so the optimistic answer is safe.
+    return true;
+}
+
+void tr_torrent::queue_seed_probe()
+{
+    session->run_in_session_thread(
+        [session = this->session, tor_id = id()]()
+        {
+            auto const lock = session->unique_lock();
+            if (auto* const tor = session->torrents().get(tor_id); tor != nullptr && !tor->is_deleting_ && tor->has_metainfo())
+            {
+                tor->start_piece_check(0, PieceCheckOrigin::SeedProbe);
+            }
+        });
 }
 
 void tr_torrent::on_metainfo_updated()
@@ -985,6 +996,7 @@ void tr_torrent::on_metainfo_completed()
         completion_.set_has_all();
         recheck_completeness();
         date_done_ = date_added_; // Must be after recheck_completeness()
+        queue_seed_probe();
 
         if (start_when_stable_)
         {
@@ -2751,6 +2763,7 @@ void tr_torrent::set_download_dir(std::string_view path, bool is_new_torrent)
             completion_.set_has_all();
             recheck_completeness();
             date_done_ = date_added_; // Must be after recheck_completeness()
+            queue_seed_probe();
         }
     }
     else if (error_.error_type() == TR_STAT_LOCAL_ERROR && !set_local_error_if_files_disappeared(this))
@@ -3061,29 +3074,8 @@ void tr_torrent::start_piece_check(tr_piece_index_t const piece, PieceCheckOrigi
 
     // snapshot where the piece's bytes live on disk
     {
-        auto left = uint64_t{ job.piece_size };
-        auto [file_index, file_offset] = this->file_offset(piece_loc(piece));
-        while (left != 0U)
-        {
-            auto const len = std::min(left, file_size(file_index) - file_offset);
-            if (len == 0U) // zero-length file
-            {
-                ++file_index;
-                file_offset = 0U;
-                continue;
-            }
-            auto span = tr_piece_check_worker::Span{};
-            if (auto const found = find_file(file_index); found)
-            {
-                span.path = found->filename().sv();
-            }
-            span.file_offset = file_offset;
-            span.length = len;
-            job.spans.emplace_back(std::move(span));
-            left -= len;
-            ++file_index;
-            file_offset = 0U;
-        }
+        auto const [begin_byte, end_byte] = block_info().byte_span_for_piece(piece);
+        job.spans = snapshot_spans(begin_byte, end_byte);
     }
 
     // snapshot any blocks still sitting in the write cache
@@ -3133,6 +3125,127 @@ void tr_torrent::start_piece_check(tr_piece_index_t const piece, PieceCheckOrigi
         this,
         fmt::format("[LAZY] queued piece {} for off-thread check (origin {})", piece, static_cast<int>(origin)));
     session->piece_check_add(std::move(job));
+}
+
+std::vector<tr_piece_check_worker::Span> tr_torrent::snapshot_spans(uint64_t const byte_begin, uint64_t const byte_end) const
+{
+    auto spans = std::vector<tr_piece_check_worker::Span>{};
+    auto left = byte_end - byte_begin;
+    auto [file_index, file_offset] = fpm_.file_offset(byte_begin);
+    while (left != 0U)
+    {
+        auto const len = std::min(left, file_size(file_index) - file_offset);
+        if (len != 0U) // skip zero-length files
+        {
+            auto span = tr_piece_check_worker::Span{};
+            if (auto const found = find_file(file_index); found)
+            {
+                span.path = found->filename().sv();
+            }
+            span.file_offset = file_offset;
+            span.length = len;
+            spans.emplace_back(std::move(span));
+            left -= len;
+        }
+        ++file_index;
+        file_offset = 0U;
+    }
+    return spans;
+}
+
+std::optional<bool> tr_torrent::read_block_for_peer(tr_block_info::Location const loc, uint32_t const len, uint8_t* const setme)
+{
+    TR_ASSERT(session->am_in_session_thread());
+
+    // still in the write cache? then it's a memory copy
+    if (session->cache->copy_cached_block(*this, loc, len, setme))
+    {
+        return true;
+    }
+
+    auto const key = PrefetchKey{ loc.byte, len };
+    if (auto const iter = prefetched_blocks_.find(key); iter != std::end(prefetched_blocks_))
+    {
+        auto const& [data, readable] = iter->second;
+        if (readable)
+        {
+            std::copy_n(std::begin(data), len, setme);
+        }
+        auto const ok = readable;
+        prefetched_blocks_.erase(iter);
+        return ok;
+    }
+
+    prefetch_block_for_peer(loc, len);
+    return {};
+}
+
+void tr_torrent::prefetch_block_for_peer(tr_block_info::Location const loc, uint32_t const len)
+{
+    TR_ASSERT(session->am_in_session_thread());
+
+    auto const key = PrefetchKey{ loc.byte, len };
+    if (len == 0U || loc.byte + len > total_size() || prefetched_blocks_.count(key) != 0U ||
+        prefetch_in_flight_.count(key) != 0U)
+    {
+        return;
+    }
+
+    prefetch_in_flight_.insert(key);
+    session->run_disk_task(
+        [session = this->session,
+         tor_id = id(),
+         key,
+         generation = piece_check_generation_,
+         spans = snapshot_spans(loc.byte, loc.byte + len)]()
+        {
+            auto data = std::vector<uint8_t>(key.second);
+            auto const readable = tr_piece_check_worker::read_spans(spans, reinterpret_cast<std::byte*>(std::data(data)));
+
+            // Do not capture the torrent pointer directly, or else we will crash if program
+            // execution reaches this point while the session thread is about to free this torrent.
+            session->run_in_session_thread(
+                [session, tor_id, key, generation, data = std::move(data), readable]()
+                {
+                    auto const lock = session->unique_lock();
+                    if (auto* const tor = session->torrents().get(tor_id); tor != nullptr && !tor->is_deleting_)
+                    {
+                        tor->on_block_prefetched(key, generation, data, readable);
+                    }
+                });
+        });
+}
+
+void tr_torrent::on_block_prefetched(
+    PrefetchKey const key,
+    uint64_t const generation,
+    std::vector<uint8_t> data,
+    bool const readable)
+{
+    TR_ASSERT(session->am_in_session_thread());
+
+    prefetch_in_flight_.erase(key);
+
+    if (generation != piece_check_generation_)
+    {
+        // files moved or were renamed since the snapshot; the peer's
+        // request is still queued and its retry will take a fresh snapshot
+        return;
+    }
+
+    // Bounded: a peer's outstanding requests are prefetched a few at a time,
+    // so steady state is small. Cap protects against a peer that vanishes.
+    static auto constexpr MaxPrefetchedBlocks = size_t{ 64 };
+    while (std::size(prefetch_order_) >= MaxPrefetchedBlocks)
+    {
+        prefetched_blocks_.erase(prefetch_order_.front());
+        prefetch_order_.pop_front();
+    }
+
+    prefetched_blocks_[key] = { std::move(data), readable };
+    prefetch_order_.push_back(key);
+
+    tr_peerMgrPulseTorrentPeers(this);
 }
 
 void tr_torrent::on_piece_check_done(
@@ -3227,6 +3340,15 @@ void tr_torrent::on_piece_check_done(
             set_has_piece(piece, false);
             set_needs_completeness_check();
             error().set_local_error(fmt::format("Please Verify Local Data! Piece #{:d} is corrupt.", piece));
+        }
+        break;
+
+    case PieceCheckOrigin::SeedProbe:
+        if (!pass)
+        {
+            // add-time seed detection was optimistic and wrong: do it properly
+            tr_logAddDebugTor(this, "New torrent looked like a seed but piece 0 failed; verifying");
+            tr_torrentVerify(this);
         }
         break;
     }

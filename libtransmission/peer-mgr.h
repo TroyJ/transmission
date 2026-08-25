@@ -709,6 +709,11 @@ enum : uint8_t
 
 void tr_peerMgrAddTorrent(tr_peerMgr* manager, struct tr_torrent* tor);
 
+// Give the torrent's peers a chance to send queued data now rather than
+// waiting for the next bandwidth pulse. Used when an off-thread disk read
+// that a peer was waiting on has completed.
+void tr_peerMgrPulseTorrentPeers(struct tr_torrent* tor);
+
 // return the number of connected peers that have `piece`, or -1 if we already have it
 [[nodiscard]] int8_t tr_peerMgrPieceAvailability(tr_torrent const* tor, tr_piece_index_t piece);
 

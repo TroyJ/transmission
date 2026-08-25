@@ -2556,6 +2556,21 @@ void pumpAllPeers(tr_peerMgr* mgr)
 } // namespace bandwidth_helpers
 } // namespace
 
+void tr_peerMgrPulseTorrentPeers(tr_torrent* const tor)
+{
+    auto const* const swarm = tor->swarm;
+    if (swarm == nullptr || !swarm->is_running)
+    {
+        return;
+    }
+
+    auto const peers = swarm->peers; // copy: pulse() may disconnect a peer
+    for (auto const& peer : peers)
+    {
+        peer->pulse();
+    }
+}
+
 void tr_peerMgr::bandwidth_pulse()
 {
     using namespace bandwidth_helpers;

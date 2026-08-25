@@ -2050,7 +2050,31 @@ void tr_peerMsgsImpl::check_request_timeout(time_t const now)
 
     if (ok)
     {
-        ok = session->cache->read_block(tor_, tor_.piece_loc(req.index, req.offset), req.length, std::data(buf)) == 0;
+        auto const got = tor_.read_block_for_peer(tor_.piece_loc(req.index, req.offset), req.length, std::data(buf));
+        if (!got)
+        {
+            // The bytes are being read off-thread. Put the request back,
+            // prefetch the next few queued requests so they are ready too,
+            // and return; tr_peerMgrPulseTorrentPeers() wakes us when the
+            // data lands.
+            peer_requested_.push_front(req);
+            static auto constexpr PrefetchAhead = size_t{ 8 };
+            auto n = size_t{};
+            for (auto const& next : peer_requested_)
+            {
+                if (++n > PrefetchAhead)
+                {
+                    break;
+                }
+                if (is_valid_request(next) && tor_.has_piece(next.index) && tor_.is_piece_checked(next.index))
+                {
+                    tor_.prefetch_block_for_peer(tor_.piece_loc(next.index, next.offset), next.length);
+                }
+            }
+            return {};
+        }
+
+        ok = *got;
     }
 
     if (ok)

@@ -76,14 +76,24 @@ public:
 
     void add(Job&& job);
 
+    // Run an arbitrary task on the worker thread. Same rules as hash jobs:
+    // the task must not touch tr_session / tr_torrent state; post back to
+    // the session thread to commit its result.
+    void run(std::function<void()> task);
+
     [[nodiscard]] static Result hash_job(Job const& job, std::vector<std::byte>& buffer);
+
+    // Reads the spans, in order, into `buffer` (which must hold their total
+    // length). Short reads leave the tail as-is. Returns false if any file
+    // could not be opened.
+    [[nodiscard]] static bool read_spans(std::vector<Span> const& spans, std::byte* buffer);
 
 private:
     void thread_func();
 
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<Job> todo_;
+    std::deque<std::function<void()>> todo_;
     std::thread thread_;
     bool stopping_ = false;
 };

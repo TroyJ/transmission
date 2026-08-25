@@ -16,6 +16,33 @@
 #include "libtransmission/file.h"
 #include "libtransmission/piece-check.h"
 
+bool tr_piece_check_worker::read_spans(std::vector<Span> const& spans, std::byte* const buffer)
+{
+    auto pos = uint64_t{};
+    auto readable = true;
+    for (auto const& span : spans)
+    {
+        if (std::empty(span.path))
+        {
+            readable = false;
+        }
+        else if (auto const fd = tr_sys_file_open(span.path.c_str(), TR_SYS_FILE_READ, 0); fd == TR_BAD_SYS_FILE)
+        {
+            readable = false;
+        }
+        else
+        {
+            auto n_read = uint64_t{};
+            (void)tr_sys_file_read_at(fd, buffer + pos, span.length, span.file_offset, &n_read);
+            tr_sys_file_close(fd);
+        }
+
+        pos += span.length;
+    }
+
+    return readable;
+}
+
 tr_piece_check_worker::Result tr_piece_check_worker::hash_job(Job const& job, std::vector<std::byte>& buffer)
 {
     buffer.assign(job.piece_size, std::byte{});
@@ -24,31 +51,7 @@ tr_piece_check_worker::Result tr_piece_check_worker::hash_job(Job const& job, st
     // missing tail may be supplied by the cache overlay below; a
     // file that cannot be opened at all is reported distinctly so
     // the caller can tell "renamed/moved under us" from "corrupt".
-    auto pos = uint64_t{};
-    auto unreadable = false;
-    for (auto const& span : job.spans)
-    {
-        if (!std::empty(span.path))
-        {
-            auto const fd = tr_sys_file_open(span.path.c_str(), TR_SYS_FILE_READ, 0);
-            if (fd == TR_BAD_SYS_FILE)
-            {
-                unreadable = true;
-            }
-            else
-            {
-                auto n_read = uint64_t{};
-                (void)tr_sys_file_read_at(fd, std::data(buffer) + pos, span.length, span.file_offset, &n_read);
-                tr_sys_file_close(fd);
-            }
-        }
-        else
-        {
-            unreadable = true;
-        }
-
-        pos += span.length;
-    }
+    auto const unreadable = !read_spans(job.spans, std::data(buffer));
 
     // overlay the blocks that were still in the write cache at snapshot time
     for (auto const& cached : job.cached)
@@ -75,11 +78,9 @@ tr_piece_check_worker::Result tr_piece_check_worker::hash_job(Job const& job, st
 
 void tr_piece_check_worker::thread_func()
 {
-    auto buffer = std::vector<std::byte>{};
-
     for (;;)
     {
-        auto job = Job{};
+        auto task = std::function<void()>{};
 
         {
             auto lock = std::unique_lock{ mutex_ };
@@ -88,19 +89,29 @@ void tr_piece_check_worker::thread_func()
             {
                 return;
             }
-            job = std::move(todo_.front());
+            task = std::move(todo_.front());
             todo_.pop_front();
         }
 
-        auto const result = hash_job(job, buffer);
-        if (job.on_done)
-        {
-            job.on_done(result);
-        }
+        task();
     }
 }
 
 void tr_piece_check_worker::add(Job&& job)
+{
+    run(
+        [job = std::move(job)]()
+        {
+            auto buffer = std::vector<std::byte>{};
+            auto const result = hash_job(job, buffer);
+            if (job.on_done)
+            {
+                job.on_done(result);
+            }
+        });
+}
+
+void tr_piece_check_worker::run(std::function<void()> task)
 {
     auto const lock = std::scoped_lock{ mutex_ };
     if (stopping_)
@@ -108,7 +119,7 @@ void tr_piece_check_worker::add(Job&& job)
         return;
     }
 
-    todo_.emplace_back(std::move(job));
+    todo_.emplace_back(std::move(task));
 
     if (!thread_.joinable())
     {

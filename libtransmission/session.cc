@@ -2155,6 +2155,14 @@ void tr_session::piece_check_add(tr_piece_check_worker::Job&& job)
     }
 }
 
+void tr_session::run_disk_task(std::function<void()> task)
+{
+    if (piece_checker_)
+    {
+        piece_checker_->run(std::move(task));
+    }
+}
+
 void tr_session::verify_add(tr_torrent* const tor)
 {
     if (verifier_)

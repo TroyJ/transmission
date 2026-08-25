@@ -13,6 +13,9 @@
 #include <cstddef> // size_t
 #include <cstdint> // uint64_t, uint16_t
 #include <ctime>
+#include <deque>
+#include <map>
+#include <set>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -724,6 +727,16 @@ struct tr_torrent
     {
         return checked_pieces_.test(piece);
     }
+    // Serve `len` bytes at `loc` to a peer without blocking on disk.
+    // Returns true and fills `setme` if the bytes were available in
+    // memory (write cache or a completed prefetch); nullopt if a disk
+    // read was queued on the worker -- the caller should re-queue the
+    // request and will be pulsed via tr_peerMgrPulseTorrentPeers() when
+    // the data lands; false if the data is unreadable.
+    [[nodiscard]] std::optional<bool> read_block_for_peer(tr_block_info::Location loc, uint32_t len, uint8_t* setme);
+
+    // Queue a disk read so a later read_block_for_peer() can be served from memory.
+    void prefetch_block_for_peer(tr_block_info::Location loc, uint32_t len);
 
     /// METAINFO - MAGNET
 
@@ -1278,7 +1291,8 @@ private:
     enum class PieceCheckOrigin : uint8_t
     {
         Download, // piece just finished downloading
-        Upload // a peer asked for an unverified piece
+        Upload, // a peer asked for an unverified piece
+        SeedProbe // add-time "is this new torrent already a seed?" check of piece 0
     };
 
     // Snapshot the piece's on-disk layout + unflushed cache blocks under
@@ -1480,6 +1494,18 @@ private:
     // pieces with a hash job in flight on the piece-check worker
     tr_bitfield piece_check_pending_ = tr_bitfield{ 0 };
     uint64_t piece_check_generation_ = 0U;
+
+    // where the bytes in [byte_begin, byte_end) live on disk right now
+    [[nodiscard]] std::vector<tr_piece_check_worker::Span> snapshot_spans(uint64_t byte_begin, uint64_t byte_end) const;
+
+    // blocks read off-thread for peers, waiting to be served. Bounded; entries
+    // are removed when served or evicted FIFO.
+    using PrefetchKey = std::pair<uint64_t /*byte*/, uint32_t /*len*/>;
+    void on_block_prefetched(PrefetchKey key, uint64_t generation, std::vector<uint8_t> data, bool readable);
+    void queue_seed_probe();
+    std::map<PrefetchKey, std::pair<std::vector<uint8_t>, bool /*readable*/>> prefetched_blocks_;
+    std::deque<PrefetchKey> prefetch_order_;
+    std::set<PrefetchKey> prefetch_in_flight_;
 
     labels_t labels_;
 

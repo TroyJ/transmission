@@ -1150,6 +1150,7 @@ public:
     void verify_add(tr_torrent* tor);
     void verify_remove(tr_torrent const* tor);
     void piece_check_add(tr_piece_check_worker::Job&& job);
+    void run_disk_task(std::function<void()> task);
     [[nodiscard]] bool relocate_add(std::unique_ptr<tr_relocate_worker::Mediator> mediator, tr_priority_t priority);
     void relocate_remove(tr_torrent const* tor);
     [[nodiscard]] bool relocate_cancel(tr_torrent const* tor);

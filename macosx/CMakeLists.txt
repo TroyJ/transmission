@@ -34,6 +34,12 @@ add_subdirectory(VDKQueue)
 
 add_executable(${TR_NAME}-mac MACOSX_BUNDLE)
 
+# Objective-C++ sources can't be analysed by a non-Apple clang-tidy (Homebrew
+# LLVM fails with "could not build module 'Foundation'"), and every commit
+# regenerates version.h which forces a recompile here. Keep tidy for the
+# library; skip it for the app.
+set_target_properties(${TR_NAME}-mac PROPERTIES CXX_CLANG_TIDY "" OBJCXX_CLANG_TIDY "")
+
 target_sources(${TR_NAME}-mac
     PRIVATE
         AboutWindowController.h
