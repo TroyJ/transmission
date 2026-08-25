@@ -2034,12 +2034,18 @@ void tr_peerMsgsImpl::check_request_timeout(time_t const now)
 
     if (ok)
     {
-        ok = tor_.ensure_piece_is_checked(req.index);
-
-        if (!ok)
+        auto const checked = tor_.ensure_piece_is_checked(req.index);
+        if (!checked)
         {
-            tor_.error().set_local_error(fmt::format("Please Verify Local Data! Piece #{:d} is corrupt.", req.index));
+            // The piece is being hashed off-thread. Put the request back
+            // and try again on a later pulse; the peer waits a little
+            // longer, but nothing else stalls behind the session lock.
+            peer_requested_.push_front(req);
+            return {};
         }
+
+        // (a failed check already dropped the piece and set the torrent's local error)
+        ok = *checked;
     }
 
     if (ok)

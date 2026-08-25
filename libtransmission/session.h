@@ -67,6 +67,7 @@
 #include "libtransmission/tr-lpd.h"
 #include "libtransmission/tr-macros.h"
 #include "libtransmission/utils-ev.h"
+#include "libtransmission/piece-check.h"
 #include "libtransmission/verify.h"
 #include "libtransmission/web.h"
 
@@ -1148,6 +1149,7 @@ public:
 
     void verify_add(tr_torrent* tor);
     void verify_remove(tr_torrent const* tor);
+    void piece_check_add(tr_piece_check_worker::Job&& job);
     [[nodiscard]] bool relocate_add(std::unique_ptr<tr_relocate_worker::Mediator> mediator, tr_priority_t priority);
     void relocate_remove(tr_torrent const* tor);
     [[nodiscard]] bool relocate_cancel(tr_torrent const* tor);
@@ -1478,6 +1480,7 @@ private:
     std::unique_ptr<libtransmission::Timer> save_timer_;
 
     std::unique_ptr<tr_verify_worker> verifier_ = std::make_unique<tr_verify_worker>();
+    std::unique_ptr<tr_piece_check_worker> piece_checker_ = std::make_unique<tr_piece_check_worker>();
     std::unique_ptr<tr_relocate_worker> relocator_ = std::make_unique<tr_relocate_worker>();
 
 public:

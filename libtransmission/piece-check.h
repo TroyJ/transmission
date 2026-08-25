@@ -1,0 +1,89 @@
+// This file Copyright © Mnemosyne LLC.
+// It may be used under GPLv2 (SPDX: GPL-2.0-only), GPLv3 (SPDX: GPL-3.0-only),
+// or any future license endorsed by Mnemosyne LLC.
+// License text can be found in the licenses/ folder.
+
+#pragma once
+
+#ifndef __TRANSMISSION__
+#error only libtransmission should #include this header.
+#endif
+
+#include <condition_variable>
+#include <cstddef> // std::byte
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "libtransmission/transmission.h"
+
+#include "libtransmission/crypto-utils.h" // tr_sha1_digest_t
+
+/**
+ * Hashes single pieces on a background thread so that the session
+ * mutex is never held across the disk reads.
+ *
+ * A job is a self-contained snapshot: file paths + offsets for the
+ * piece's bytes, plus copies of any blocks that were still sitting
+ * in the write cache when the snapshot was taken. The worker never
+ * touches tr_session or tr_torrent state; the caller's `on_done`
+ * callback is responsible for re-entering the session thread and
+ * revalidating before committing the result.
+ */
+class tr_piece_check_worker
+{
+public:
+    enum class Result : uint8_t
+    {
+        Pass, // the data hashed to the expected digest
+        Fail, // the data was readable but did not match
+        Unreadable // a file in the snapshot could not be opened
+    };
+
+    struct Span
+    {
+        std::string path; // empty if the file does not exist on disk
+        uint64_t file_offset = 0U;
+        uint64_t length = 0U;
+    };
+
+    struct CachedBytes
+    {
+        uint64_t piece_offset = 0U;
+        std::vector<uint8_t> data;
+    };
+
+    struct Job
+    {
+        tr_sha1_digest_t expected_hash = {};
+        uint64_t piece_size = 0U;
+        std::vector<Span> spans; // in piece order; lengths sum to piece_size
+        std::vector<CachedBytes> cached; // overlays applied after the disk reads
+        std::function<void(Result)> on_done; // invoked on the worker thread
+    };
+
+    tr_piece_check_worker() = default;
+    ~tr_piece_check_worker();
+
+    tr_piece_check_worker(tr_piece_check_worker const&) = delete;
+    tr_piece_check_worker(tr_piece_check_worker&&) = delete;
+    tr_piece_check_worker& operator=(tr_piece_check_worker const&) = delete;
+    tr_piece_check_worker& operator=(tr_piece_check_worker&&) = delete;
+
+    void add(Job&& job);
+
+    [[nodiscard]] static Result hash_job(Job const& job, std::vector<std::byte>& buffer);
+
+private:
+    void thread_func();
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<Job> todo_;
+    std::thread thread_;
+    bool stopping_ = false;
+};

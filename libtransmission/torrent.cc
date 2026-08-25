@@ -944,8 +944,13 @@ bool tr_torrent::is_new_torrent_a_seed()
         }
     }
 
-    // check the first piece
-    return ensure_piece_is_checked(0);
+    // check the first piece. This is the one remaining synchronous
+    // hash: add-time seed detection needs the answer now.
+    if (!is_piece_checked(0))
+    {
+        checked_pieces_.set(0, check_piece(0));
+    }
+    return is_piece_checked(0);
 }
 
 void tr_torrent::on_metainfo_updated()
@@ -957,6 +962,8 @@ void tr_torrent::on_metainfo_updated()
     file_priorities_ = tr_file_priorities{ &fpm_ };
     files_wanted_ = tr_files_wanted{ &fpm_ };
     checked_pieces_ = tr_bitfield{ size_t(piece_count()) };
+    piece_check_pending_ = tr_bitfield{ size_t(piece_count()) };
+    invalidate_pending_piece_checks();
 }
 
 void tr_torrent::on_metainfo_completed()
@@ -1803,6 +1810,7 @@ void tr_torrentVerify(tr_torrent* tor)
             }
 
             session->verify_remove(tor);
+            tor->invalidate_pending_piece_checks();
 
             if (!tor->has_metainfo())
             {
@@ -2622,6 +2630,9 @@ void tr_torrent::on_file_completed(tr_file_index_t const file)
     /* close the file so that we can reopen in read-only mode as needed */
     session->close_torrent_file(*this, file);
 
+    // the file may be renamed below; in-flight checks hold the old path
+    invalidate_pending_piece_checks();
+
     /* now that the file is complete and closed, we can start watching its
      * mtime timestamp for changes to know if we need to reverify pieces */
     file_mtimes_[file] = tr_time();
@@ -2692,14 +2703,9 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
             continue;
         }
 
-        if (check_piece(piece))
-        {
-            on_piece_completed(piece);
-        }
-        else
-        {
-            on_piece_failed(piece);
-        }
+        // Hash off-thread; on_piece_check_done() records the result and
+        // calls on_piece_completed() / on_piece_failed() on the session thread.
+        start_piece_check(piece, PieceCheckOrigin::Download);
     }
 }
 
@@ -2721,6 +2727,7 @@ size_t tr_torrentFindFileToBuf(tr_torrent const* tor, tr_file_index_t file_num, 
 void tr_torrent::set_download_dir(std::string_view path, bool is_new_torrent)
 {
     download_dir_ = path;
+    invalidate_pending_piece_checks();
     mark_edited();
     set_dirty();
     refresh_current_dir();
@@ -3017,7 +3024,7 @@ void tr_torrent::mark_changed()
     this->bump_date_changed(tr_time());
 }
 
-[[nodiscard]] bool tr_torrent::ensure_piece_is_checked(tr_piece_index_t piece)
+[[nodiscard]] std::optional<bool> tr_torrent::ensure_piece_is_checked(tr_piece_index_t piece)
 {
     TR_ASSERT(piece < this->piece_count());
 
@@ -3026,12 +3033,195 @@ void tr_torrent::mark_changed()
         return true;
     }
 
-    bool const checked = check_piece(piece);
+    start_piece_check(piece, PieceCheckOrigin::Upload);
+    return {};
+}
+
+void tr_torrent::start_piece_check(tr_piece_index_t const piece, PieceCheckOrigin const origin, unsigned const attempt)
+{
+    TR_ASSERT(session->am_in_session_thread());
+    TR_ASSERT(piece < piece_count());
+
+    if (piece_check_pending_.test(piece))
+    {
+        return; // already in flight
+    }
+
+    auto job = tr_piece_check_worker::Job{};
+    job.expected_hash = piece_hash(piece);
+    job.piece_size = piece_size(piece);
+
+    // snapshot where the piece's bytes live on disk
+    {
+        auto left = uint64_t{ job.piece_size };
+        auto [file_index, file_offset] = this->file_offset(piece_loc(piece));
+        while (left != 0U)
+        {
+            auto const len = std::min(left, file_size(file_index) - file_offset);
+            if (len == 0U) // zero-length file
+            {
+                ++file_index;
+                file_offset = 0U;
+                continue;
+            }
+            auto span = tr_piece_check_worker::Span{};
+            if (auto const found = find_file(file_index); found)
+            {
+                span.path = found->filename().sv();
+            }
+            span.file_offset = file_offset;
+            span.length = len;
+            job.spans.emplace_back(std::move(span));
+            left -= len;
+            ++file_index;
+            file_offset = 0U;
+        }
+    }
+
+    // snapshot any blocks still sitting in the write cache
+    {
+        auto const [begin_byte, end_byte] = block_info().byte_span_for_piece(piece);
+        auto const [begin_block, end_block] = block_span_for_piece(piece);
+        auto buffer = std::vector<uint8_t>(tr_block_info::BlockSize);
+        for (auto block = begin_block; block < end_block; ++block)
+        {
+            auto const block_loc = this->block_loc(block);
+            auto const block_len = block_size(block);
+            if (!session->cache->copy_cached_block(*this, block_loc, block_len, std::data(buffer)))
+            {
+                continue;
+            }
+
+            // blocks may straddle piece boundaries; keep only the overlap
+            auto const block_begin = block_loc.byte;
+            auto const block_end = block_begin + block_len;
+            auto const begin = std::max(block_begin, begin_byte);
+            auto const end = std::min(block_end, end_byte);
+            auto cached = tr_piece_check_worker::CachedBytes{};
+            cached.piece_offset = begin - begin_byte;
+            cached.data.assign(std::begin(buffer) + (begin - block_begin), std::begin(buffer) + (end - block_begin));
+            job.cached.emplace_back(std::move(cached));
+        }
+    }
+
+    job.on_done = [session = this->session, tor_id = id(), piece, origin, generation = piece_check_generation_, attempt](
+                      tr_piece_check_worker::Result result)
+    {
+        // Do not capture the torrent pointer directly, or else we will crash if program
+        // execution reaches this point while the session thread is about to free this torrent.
+        session->run_in_session_thread(
+            [session, tor_id, piece, origin, generation, attempt, result]()
+            {
+                auto const lock = session->unique_lock();
+                if (auto* const tor = session->torrents().get(tor_id); tor != nullptr && !tor->is_deleting_)
+                {
+                    tor->on_piece_check_done(piece, origin, generation, attempt, result);
+                }
+            });
+    };
+
+    piece_check_pending_.set(piece, true);
+    tr_logAddTraceTor(
+        this,
+        fmt::format("[LAZY] queued piece {} for off-thread check (origin {})", piece, static_cast<int>(origin)));
+    session->piece_check_add(std::move(job));
+}
+
+void tr_torrent::on_piece_check_done(
+    tr_piece_index_t const piece,
+    PieceCheckOrigin const origin,
+    uint64_t const generation,
+    unsigned const attempt,
+    tr_piece_check_worker::Result const result)
+{
+    TR_ASSERT(session->am_in_session_thread());
+    using Result = tr_piece_check_worker::Result;
+
+    if (piece >= piece_count())
+    {
+        return; // metainfo changed under us
+    }
+
+    piece_check_pending_.set(piece, false);
+
+    // Revalidation rules. A stale result must never be committed into
+    // torrent state that has moved on since the snapshot was taken:
+    //
+    // 1. The on-disk layout / verification epoch is unchanged
+    //    (piece_check_generation_) and every file could be opened.
+    // 2. We still hold every block of the piece. If a full verify or
+    //    on_piece_failed() dropped it, the download will refetch it and
+    //    re-check.
+    //
+    // Note that checked_pieces_ is deliberately NOT a guard: a full verify
+    // marks missing pieces as "checked" too, so a piece downloaded after
+    // that must still be committed here. A verify started after the
+    // snapshot is caught by rule 1.
+    auto const stale = generation != piece_check_generation_;
+    auto const retry = origin == PieceCheckOrigin::Download && (stale || result == Result::Unreadable);
+    if (retry)
+    {
+        // For a piece we just downloaded, a stale snapshot or an unopenable
+        // file usually means the file was renamed or moved while we were
+        // hashing. Re-snapshot and try again rather than falsely failing it.
+        static auto constexpr MaxAttempts = 3U;
+        if (has_piece(piece) && attempt + 1U < MaxAttempts)
+        {
+            start_piece_check(piece, origin, attempt + 1U);
+            return;
+        }
+        if (stale)
+        {
+            tr_logAddTraceTor(this, fmt::format("[LAZY] dropping stale check result for piece {}", piece));
+            return;
+        }
+        // out of retries on an unreadable file: fall through and fail it
+    }
+    else if (stale)
+    {
+        // upload-path checks are cheap to redo: the peer's request is still
+        // queued and the next pulse will start a fresh check
+        tr_logAddTraceTor(this, fmt::format("[LAZY] dropping stale check result for piece {}", piece));
+        return;
+    }
+
+    if (!has_piece(piece))
+    {
+        return;
+    }
+
+    auto const pass = result == Result::Pass;
+    tr_logAddTraceTor(this, fmt::format("[LAZY] tr_torrent.checkPiece tested piece {}, pass=={}", piece, pass));
+
+    checked_pieces_.set(piece, pass);
     mark_changed();
     set_dirty();
 
-    checked_pieces_.set(piece, checked);
-    return checked;
+    switch (origin)
+    {
+    case PieceCheckOrigin::Download:
+        if (pass)
+        {
+            on_piece_completed(piece);
+        }
+        else
+        {
+            on_piece_failed(piece);
+        }
+        break;
+
+    case PieceCheckOrigin::Upload:
+        if (!pass)
+        {
+            // Drop the piece so peers stop asking for it (they get a
+            // reject instead of an endless re-check) and so the torrent
+            // can refetch it if it is running.
+            set_has_piece(piece, false);
+            set_needs_completeness_check();
+            error().set_local_error(fmt::format("Please Verify Local Data! Piece #{:d} is corrupt.", piece));
+        }
+        break;
+    }
 }
 
 // --- RESUME HELPER
@@ -3045,6 +3235,7 @@ void tr_torrent::ResumeHelper::load_checked_pieces(tr_bitfield const& checked, t
 {
     TR_ASSERT(std::size(checked) == tor_.piece_count());
     tor_.checked_pieces_ = checked;
+    tor_.invalidate_pending_piece_checks();
 
     auto const n_files = tor_.file_count();
     tor_.file_mtimes_.resize(n_files);

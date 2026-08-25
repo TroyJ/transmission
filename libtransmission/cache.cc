@@ -172,6 +172,19 @@ Cache::CIter Cache::get_block(tr_torrent const& tor, tr_block_info::Location con
     return std::end(blocks_);
 }
 
+bool Cache::copy_cached_block(tr_torrent const& tor, tr_block_info::Location const& loc, size_t len, uint8_t* setme) const
+{
+    auto const key = make_key(tor, loc);
+    auto const iter = std::lower_bound(std::begin(blocks_), std::end(blocks_), key, CompareCacheBlockByKey);
+    if (iter == std::end(blocks_) || iter->key != key)
+    {
+        return false;
+    }
+
+    std::copy_n(std::begin(*iter->buf), std::min(len, std::size(*iter->buf)), setme);
+    return true;
+}
+
 int Cache::read_block(tr_torrent const& tor, tr_block_info::Location const& loc, size_t len, uint8_t* setme)
 {
     if (auto const iter = get_block(tor, loc); iter != std::end(blocks_))

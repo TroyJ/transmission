@@ -1416,6 +1416,7 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     utp_timer.reset();
     relocator_.reset();
     verifier_.reset();
+    piece_checker_.reset();
     save_timer_.reset();
     queue_timer_.reset();
     now_timer_.reset();
@@ -2143,6 +2144,14 @@ void tr_session::verify_remove(tr_torrent const* const tor)
     if (verifier_)
     {
         verifier_->remove(tor->info_hash());
+    }
+}
+
+void tr_session::piece_check_add(tr_piece_check_worker::Job&& job)
+{
+    if (piece_checker_)
+    {
+        piece_checker_->add(std::move(job));
     }
 }
 

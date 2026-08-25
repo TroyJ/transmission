@@ -33,6 +33,7 @@
 #include "libtransmission/interned-string.h"
 #include "libtransmission/log.h"
 #include "libtransmission/observable.h"
+#include "libtransmission/piece-check.h"
 #include "libtransmission/session.h"
 #include "libtransmission/torrent-files.h"
 #include "libtransmission/torrent-magnet.h"
@@ -59,6 +60,7 @@ namespace libtransmission::test
 {
 
 class RenameTest_multifileTorrent_Test;
+class TorrentTest_downloadedPieceIsCheckedAndRecorded_Test;
 class RenameTest_singleFilenameTorrent_Test;
 
 } // namespace libtransmission::test
@@ -710,7 +712,16 @@ struct tr_torrent
 
     /// METAINFO - PIECE CHECKSUMS
 
-    [[nodiscard]] bool ensure_piece_is_checked(tr_piece_index_t piece);
+    // Returns true/false once the piece has been verified/failed.
+    // Returns nullopt if the check is in flight on the piece-check
+    // worker; the caller should retry later. Never hashes on the
+    // calling thread, so it is safe to call under the session lock.
+    [[nodiscard]] std::optional<bool> ensure_piece_is_checked(tr_piece_index_t piece);
+
+    [[nodiscard]] TR_CONSTEXPR20 bool is_piece_checked(tr_piece_index_t piece) const
+    {
+        return checked_pieces_.test(piece);
+    }
 
     /// METAINFO - MAGNET
 
@@ -1258,12 +1269,36 @@ private:
         return n_secs;
     }
 
-    [[nodiscard]] TR_CONSTEXPR20 bool is_piece_checked(tr_piece_index_t piece) const
-    {
-        return checked_pieces_.test(piece);
-    }
-
+    // Synchronous whole-piece hash on the calling thread. Only for
+    // add-time seed detection; everything else must use start_piece_check().
     [[nodiscard]] bool check_piece(tr_piece_index_t piece) const;
+
+    enum class PieceCheckOrigin : uint8_t
+    {
+        Download, // piece just finished downloading
+        Upload // a peer asked for an unverified piece
+    };
+
+    // Snapshot the piece's on-disk layout + unflushed cache blocks under
+    // the lock and hand it to the piece-check worker. The result comes
+    // back through on_piece_check_done() on the session thread.
+    void start_piece_check(tr_piece_index_t piece, PieceCheckOrigin origin, unsigned attempt = 0U);
+
+    void on_piece_check_done(
+        tr_piece_index_t piece,
+        PieceCheckOrigin origin,
+        uint64_t generation,
+        unsigned attempt,
+        tr_piece_check_worker::Result result);
+
+    // Bump whenever something changes where a piece's bytes live or
+    // what "checked" means (verify, relocate, rename, metainfo, resume
+    // load). In-flight checks snapshotted before the bump are stale
+    // and will not be committed.
+    constexpr void invalidate_pending_piece_checks() noexcept
+    {
+        ++piece_check_generation_;
+    }
 
     [[nodiscard]] constexpr std::optional<uint16_t> effective_idle_limit_minutes() const noexcept
     {
@@ -1436,7 +1471,12 @@ private:
     // true iff the piece was verified more recently than any of the piece's
     // files' mtimes (file_mtimes_). If checked_pieces_.test(piece) is false,
     // it means that piece needs to be checked before its data is used.
+    friend class libtransmission::test::TorrentTest_downloadedPieceIsCheckedAndRecorded_Test;
     tr_bitfield checked_pieces_ = tr_bitfield{ 0 };
+
+    // pieces with a hash job in flight on the piece-check worker
+    tr_bitfield piece_check_pending_ = tr_bitfield{ 0 };
+    uint64_t piece_check_generation_ = 0U;
 
     labels_t labels_;
 

@@ -39,6 +39,9 @@ public:
     int write_block(tr_torrent_id_t tor, tr_block_index_t block, std::unique_ptr<BlockData> writeme);
 
     int read_block(tr_torrent const& tor, tr_block_info::Location const& loc, size_t len, uint8_t* setme);
+    // copies the block into `setme` iff it is still in the write cache. Never touches disk.
+    [[nodiscard]] bool copy_cached_block(tr_torrent const& tor, tr_block_info::Location const& loc, size_t len, uint8_t* setme)
+        const;
     int flush_torrent(tr_torrent_id_t tor_id);
     int flush_file(tr_torrent const& tor, tr_file_index_t file);
 
