@@ -23,6 +23,7 @@
 #include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/tr-strbuf.h>
+#include <libtransmission/utils.h> // tr_strv_ends_with
 #include <libtransmission/values.h>
 
 #include "gtest/gtest.h"
@@ -506,6 +507,46 @@ TEST_F(CacheAsyncTest, shutdownDoesNotCloseDataFilesSynchronouslyOnAStalledDisk)
     EXPECT_LT(took, tr_session::ShutdownDiskGrace * 2) << "shutdown waited on something other than the bounded grace";
     EXPECT_NE(-1, fcntl(*fd, F_GETFD)) << "the data file was closed after the worker was abandoned";
     static_cast<void>(tr_sys_file_close(*fd));
+}
+
+TEST_F(CacheAsyncTest, completionIsWithheldWhenTheVolumeKeptFewerBytesThanWritten)
+{
+    // Seen live on exFAT/FSKit: a torrent reported 100% while its file was
+    // 311,875 bytes short. The audit runs after the final flush and forgets
+    // the blocks past the file's real end instead of declaring done.
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    ASSERT_NE(nullptr, tor);
+    auto const n_blocks = tor->block_count();
+
+    // the volume "keeps" all of the first (1 MiB) file but its final block
+    auto const short_file = tr_file_index_t{ 0U };
+    auto const file_end = tor->file_size(short_file); // the first file starts at byte 0
+    auto const last_block = tor->byte_loc(file_end - 1U).block;
+    auto const kept = tor->block_loc(last_block).byte;
+    auto const short_name = std::string{ tor->file_subpath(short_file) };
+    session_->file_size_probe_for_tests = [kept, short_name](std::string_view path)
+    {
+        return tr_strv_ends_with(path, short_name) ? std::optional<uint64_t>{ kept } : std::nullopt;
+    };
+
+    in_session_thread(
+        session_,
+        [this, tor, n_blocks]()
+        {
+            for (tr_block_index_t block = 0; block < n_blocks; ++block)
+            {
+                auto buf = std::make_unique<Cache::BlockData>(tor->block_size(block)); // zeroes: the real content
+                session_->cache->write_block(tor->id(), block, std::move(buf));
+                tor->on_block_received(block);
+            }
+        });
+
+    // the piece checks complete off-thread, completeness flips to done, and
+    // the audit queued behind the writes takes the last block back
+    EXPECT_TRUE(waitFor([tor, last_block]() { return tor->has_block(0U) && !tor->has_block(last_block); }, 10000))
+        << "the block past the volume's real end should have been forgotten";
+    EXPECT_FALSE(tor->is_done());
+    EXPECT_EQ(time_t{}, tr_torrentStat(tor)->doneDate);
 }
 
 } // namespace libtransmission::test

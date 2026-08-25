@@ -617,6 +617,9 @@ struct tr_torrent
     // Cache::abandon_pending()
     void forget_unwritten_block(tr_block_index_t block);
 
+    /** Blocks past a file's actual on-disk length are marked not-had. See recheck_completeness(). */
+    void forget_bytes_missing_on_disk(std::vector<std::pair<tr_file_index_t, uint64_t>> const& short_files);
+
     /// METAINFO - TRACKERS
 
     [[nodiscard]] constexpr auto const& announce_list() const noexcept

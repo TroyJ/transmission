@@ -821,6 +821,9 @@ public:
 
     void flush_torrent_files(tr_torrent_id_t tor_id) const noexcept;
 
+    /** Test seam for the completion-time file-size audit: returns the on-disk size for a path. */
+    std::function<std::optional<uint64_t>(std::string_view path)> file_size_probe_for_tests;
+
     /**
      * Flush a torrent's cached blocks soon, coalesced across pieces.
      *

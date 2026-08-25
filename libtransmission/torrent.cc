@@ -15,6 +15,7 @@
 #include <string_view>
 #include <utility>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <fmt/chrono.h>
@@ -2521,21 +2522,113 @@ void tr_torrent::recheck_completeness()
              * parking the app for 21 minutes. So, like on_file_completed(),
              * it is a continuation queued behind the torrent's writes. */
             auto const tor_id = id();
-            auto const* const session_ptr = session;
-            session->close_torrent_files_async(
-                tor_id,
-                [session_ptr, tor_id, recent_change]()
+            auto* const session_ptr = session;
+
+            /* And before any of that: audit the files' on-disk sizes, on the
+             * worker, once the writes and closes have landed. The piece hash
+             * that marked the last piece complete ran against the cache, so
+             * it cannot see bytes the volume accepted and then lost -- seen
+             * live on an exFAT/FSKit SD card, where a torrent announced as
+             * 100% had a file 311,875 bytes short. A short file here means the
+             * blocks past its end are forgotten and fetched again, instead of
+             * the torrent seeding a truncated file. */
+            // No I/O here: the worker probes `base` and `base.part` itself.
+            auto expected = std::vector<std::tuple<tr_file_index_t, std::string, uint64_t>>{};
+            for (tr_file_index_t i = 0, n = file_count(); i < n; ++i)
+            {
+                if (file_size(i) != 0U)
                 {
-                    auto* const tor = session_ptr->torrents().get(tor_id);
-                    if (tor == nullptr || tor->is_deleting_ || !tor->is_done())
+                    expected.emplace_back(i, std::string{ tr_pathbuf{ current_dir(), '/', file_subpath(i) } }, file_size(i));
+                }
+            }
+
+            session->cache->flush_torrent(tor_id);
+            session->openFiles().close_torrent(tor_id);
+            session->cache->run_after_pending_writes_on_worker(
+                [session_ptr, tor_id, recent_change, expected = std::move(expected)]()
+                {
+                    auto short_files = std::vector<std::pair<tr_file_index_t, uint64_t>>{};
+                    for (auto const& [file, path, size] : expected)
                     {
-                        return;
+                        auto const probe_one = [session_ptr](std::string_view candidate) -> std::optional<uint64_t>
+                        {
+                            if (session_ptr->file_size_probe_for_tests)
+                            {
+                                return session_ptr->file_size_probe_for_tests(candidate);
+                            }
+                            if (auto const info = tr_sys_path_get_info(candidate); info && info->isFile())
+                            {
+                                return info->size;
+                            }
+                            return std::nullopt;
+                        };
+                        auto probe = probe_one(path);
+                        if (!probe)
+                        {
+                            probe = probe_one(tr_pathbuf{ path, tr_torrent_files::PartialFileSuffix });
+                        }
+                        if (probe && *probe < size)
+                        {
+                            short_files.emplace_back(file, *probe);
+                        }
                     }
 
-                    tor->on_done_and_flushed(recent_change);
+                    session_ptr->run_in_session_thread(
+                        [session_ptr, tor_id, recent_change, short_files = std::move(short_files)]()
+                        {
+                            auto* const tor = session_ptr->torrents().get(tor_id);
+                            if (tor == nullptr || tor->is_deleting_ || !tor->is_done())
+                            {
+                                return;
+                            }
+
+                            if (!std::empty(short_files))
+                            {
+                                tor->forget_bytes_missing_on_disk(short_files);
+                                return;
+                            }
+
+                            tor->on_done_and_flushed(recent_change);
+                        });
                 });
         }
     }
+}
+
+void tr_torrent::forget_bytes_missing_on_disk(std::vector<std::pair<tr_file_index_t, uint64_t>> const& short_files)
+{
+    auto const lock = unique_lock();
+    auto n_blocks = size_t{};
+
+    for (auto const& [file, actual_size] : short_files)
+    {
+        auto const span = byte_span_for_file(file);
+        auto const begin_block = byte_loc(span.begin + actual_size).block;
+        auto const end_block = byte_loc(span.end - 1U).block + 1U;
+        for (auto block = begin_block; block < end_block; ++block)
+        {
+            completion_.remove_block(block);
+            ++n_blocks;
+        }
+
+        auto const [piece_begin, piece_end] = piece_span_for_file(file);
+        auto const first_short_piece = byte_loc(span.begin + actual_size).piece;
+        checked_pieces_.unset_span(std::max(piece_begin, first_short_piece), piece_end);
+
+        tr_logAddWarnTor(
+            this,
+            fmt::format(
+                fmt::runtime(
+                    _("'{path}' is {actual} bytes on disk but should be {expected}; downloading the missing part again")),
+                fmt::arg("path", file_subpath(file)),
+                fmt::arg("actual", actual_size),
+                fmt::arg("expected", file_size(file))));
+    }
+
+    tr_logAddWarnTor(this, fmt::format("forgot {} blocks that the volume did not keep", n_blocks));
+    set_dirty();
+    set_needs_completeness_check();
+    recheck_completeness();
 }
 
 void tr_torrent::forget_unwritten_block(tr_block_index_t const block)
