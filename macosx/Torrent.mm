@@ -231,6 +231,8 @@ static TorrentMainWindowSnapshot* torrentMainWindowSnapshot(tr_torrent* torrentS
     BOOL _fCachedCanCancelRelocation;
 }
 
+- (NSString*)pendingCommandStatusString;
+
 @property(nonatomic, readonly) tr_torrent* fHandle;
 @property(nonatomic) tr_stat const* fStat;
 
@@ -348,12 +350,47 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (instancetype)initWithTorrentStruct:(tr_torrent*)torrentStruct location:(NSString*)location lib:(tr_session*)lib
 {
+    return [self initWithTorrentStruct:torrentStruct location:location lib:lib snapshot:nil];
+}
+
+- (instancetype)initWithTorrentStruct:(tr_torrent*)torrentStruct
+                             location:(NSString*)location
+                                  lib:(tr_session*)lib
+                             snapshot:(TorrentMainWindowSnapshot*)snapshot
+{
     self = [self initWithPath:nil hash:nil torrentStruct:torrentStruct magnetAddress:nil lib:lib groupValue:nil
         removeWhenFinishSeeding:nil
                  downloadFolder:location
-         legacyIncompleteFolder:nil];
+         legacyIncompleteFolder:nil
+                       snapshot:snapshot];
 
     return self;
+}
+
++ (void)updateTimeMachineExcludeForStruct:(tr_torrent*)torrentStruct
+{
+    // Off-main twin of updateTimeMachineExclude (phase 1c): the data path
+    // is a stat() on the data volume and the flag an xattr on it.
+    tr_stat const* stat = tr_torrentStat(torrentStruct);
+    BOOL const exclude = stat->leftUntilDone != 0;
+    NSString* path = nil;
+    if (tr_torrentHasMetadata(torrentStruct))
+    {
+        if (tr_torrentView(torrentStruct).is_folder)
+        {
+            NSString* dir = @(tr_torrentGetCurrentDir(torrentStruct));
+            NSString* candidate = [dir stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))];
+            path = [NSFileManager.defaultManager fileExistsAtPath:candidate] ? candidate : nil;
+        }
+        else if (auto const location = tr_torrentFindFile(torrentStruct, 0); !std::empty(location))
+        {
+            path = @(location.c_str());
+        }
+    }
+    if (path != nil)
+    {
+        CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:path], exclude, false);
+    }
 }
 
 - (instancetype)initWithMagnetAddress:(NSString*)address location:(NSString*)location lib:(tr_session*)lib
@@ -413,6 +450,22 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
     tr_torrentRemove(self.fHandle, trashFiles, trashDataFile, nullptr);
     _fHandle = nullptr;
+}
+
++ (void)removeTorrentStruct:(tr_torrent*)torrentStruct trashFiles:(BOOL)trashFiles
+{
+    // The off-main twin of closeRemoveTorrent:, for the controller's command
+    // queue: the wrapper has already detached its handle on the main thread.
+    if (auto const location = tr_torrentFindFile(torrentStruct, 0); !std::empty(location))
+    {
+        NSString* dir = @(tr_torrentGetCurrentDir(torrentStruct));
+        NSString* path = tr_torrentView(torrentStruct).is_folder ?
+            [dir stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))] :
+            @(location.c_str());
+        CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:path], false, false);
+    }
+
+    tr_torrentRemove(torrentStruct, trashFiles, trashDataFile, nullptr);
 }
 
 - (void)changeDownloadFolderBeforeUsing:(NSString*)folder determinationType:(TorrentDeterminationType)determinationType
@@ -801,6 +854,66 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     return NO;
 }
 
+- (BOOL)canMoveTorrentDataFileTo:(NSString*)folder
+{
+    NSString* oldFolder = self.currentDirectory;
+    if ([oldFolder isEqualToString:folder])
+    {
+        return NO;
+    }
+
+    //check if moving inside itself
+    NSArray *oldComponents = oldFolder.pathComponents, *newComponents = folder.pathComponents;
+    NSUInteger const oldCount = oldComponents.count;
+
+    if (oldCount < newComponents.count && [newComponents[oldCount] isEqualToString:self.name] && [folder hasPrefix:oldFolder])
+    {
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.messageText = NSLocalizedString(@"A folder cannot be moved to inside itself.", "Move inside itself alert -> title");
+        alert.informativeText = [NSString
+            stringWithFormat:NSLocalizedString(@"The move operation of \"%@\" cannot be done.", "Move inside itself alert -> message"),
+                             self.name];
+        [alert addButtonWithTitle:NSLocalizedString(@"OK", "Move inside itself alert -> button")];
+
+        [alert runModal];
+
+        return NO;
+    }
+
+    return YES;
+}
+
+- (void)moveTorrentStruct:(tr_torrent*)torrentStruct dataFileTo:(NSString*)folder
+{
+    // Off-main twin of moveTorrentDataFileTo: (phase 1b). Errors surface
+    // through the relocation state the sampler picks up, not a modal alert.
+    bool moveFromOldPath = false;
+    if (tr_torrentHasMetadata(torrentStruct))
+    {
+        if (tr_torrentView(torrentStruct).is_folder)
+        {
+            NSString* dataLocation = [@(tr_torrentGetCurrentDir(torrentStruct))
+                stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))];
+            moveFromOldPath = [NSFileManager.defaultManager fileExistsAtPath:dataLocation];
+        }
+        else
+        {
+            moveFromOldPath = !std::empty(tr_torrentFindFile(torrentStruct, 0));
+        }
+    }
+
+    // the exclusion moves with the data; relocation-done re-applies it
+    if (moveFromOldPath)
+    {
+        if (auto const location = tr_torrentFindFile(torrentStruct, 0); !std::empty(location))
+        {
+            CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:@(location.c_str())], false, false);
+        }
+    }
+
+    tr_torrentSetLocation(torrentStruct, folder.UTF8String, moveFromOldPath, nullptr);
+}
+
 - (void)moveTorrentDataFileTo:(NSString*)folder
 {
     NSString* oldFolder = self.currentDirectory;
@@ -854,6 +967,31 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     [NSFileManager.defaultManager copyItemAtPath:self.torrentLocation toPath:path error:NULL];
 }
 
+- (BOOL)hasEnoughRemainingDiskSpaceForStruct:(tr_torrent*)torrentStruct
+{
+    if (![self.fDefaults boolForKey:@"WarningRemainingSpace"])
+    {
+        return YES;
+    }
+
+    tr_stat const* stat = tr_torrentStat(torrentStruct);
+    if (stat->leftUntilDone == 0)
+    {
+        return YES;
+    }
+
+    NSString* downloadFolder = @(tr_torrentGetCurrentDir(torrentStruct));
+    NSDictionary* systemAttributes = [NSFileManager.defaultManager attributesOfFileSystemForPath:downloadFolder error:NULL];
+    if (systemAttributes == nil)
+    {
+        return YES;
+    }
+
+    uint64_t const remainingSpace = ((NSNumber*)systemAttributes[NSFileSystemFreeSize]).unsignedLongLongValue;
+    //if the remaining space is greater than the size left, then there is enough space regardless of preallocation
+    return !(remainingSpace < stat->leftUntilDone && remainingSpace < tr_torrentGetBytesLeftToAllocate(torrentStruct));
+}
+
 - (BOOL)alertForRemainingDiskSpace
 {
     if (self.allDownloaded || ![self.fDefaults boolForKey:@"WarningRemainingSpace"])
@@ -861,14 +999,13 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
         return YES;
     }
 
-    NSString* downloadFolder = self.currentDirectory;
-    NSDictionary* systemAttributes;
-    if ((systemAttributes = [NSFileManager.defaultManager attributesOfFileSystemForPath:downloadFolder error:NULL]))
-    {
-        uint64_t const remainingSpace = ((NSNumber*)systemAttributes[NSFileSystemFreeSize]).unsignedLongLongValue;
+    return [self hasEnoughRemainingDiskSpaceForStruct:self.fHandle] || [self presentRemainingDiskSpaceAlert];
+}
 
-        //if the remaining space is greater than the size left, then there is enough space regardless of preallocation
-        if (remainingSpace < self.sizeLeft && remainingSpace < tr_torrentGetBytesLeftToAllocate(self.fHandle))
+- (BOOL)presentRemainingDiskSpaceAlert
+{
+    NSString* downloadFolder = self.currentDirectory;
+    {
         {
             NSString* volumeName = [NSFileManager.defaultManager componentsToDisplayForPath:downloadFolder][0];
 
@@ -896,7 +1033,43 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
             return result != NSAlertFirstButtonReturn;
         }
     }
-    return YES;
+}
+
+- (BOOL)hasPendingCommand
+{
+    return self.pendingCommand != TorrentPendingCommandNone;
+}
+
+- (int)torrentId
+{
+    return self.fHandle != nullptr ? tr_torrentId(self.fHandle) : -1;
+}
+
+- (void)detachTorrentStruct
+{
+    _fHandle = nullptr;
+}
+
+- (NSString*)pendingCommandStatusString
+{
+    switch (self.pendingCommand)
+    {
+    case TorrentPendingCommandStart:
+        return NSLocalizedString(@"Starting…", "Torrent -> status string");
+    case TorrentPendingCommandStop:
+        return NSLocalizedString(@"Stopping…", "Torrent -> status string");
+    case TorrentPendingCommandVerify:
+        return NSLocalizedString(@"Verifying…", "Torrent -> status string");
+    case TorrentPendingCommandAnnounce:
+        return NSLocalizedString(@"Announcing…", "Torrent -> status string");
+    case TorrentPendingCommandRelocate:
+        return NSLocalizedString(@"Moving…", "Torrent -> status string");
+    case TorrentPendingCommandRemove:
+        return NSLocalizedString(@"Removing…", "Torrent -> status string");
+    case TorrentPendingCommandNone:
+        return nil;
+    }
+    return nil;
 }
 
 - (NSImage*)icon
@@ -1452,6 +1625,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 - (NSString*)statusString
 {
     NSString* string;
+    if (NSString* pending = self.pendingCommandStatusString)
+    {
+        return pending;
+    }
+
     if (self.fStat->relocationState == TR_RELOC_ERROR)
     {
         string = NSLocalizedString(@"Move failed", "Torrent -> status string");
@@ -1651,6 +1829,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (NSString*)shortStatusString
 {
+    if (NSString* pending = self.pendingCommandStatusString)
+    {
+        return pending;
+    }
+
     if (self.fStat->relocationState != TR_RELOC_NONE)
     {
         return self.statusString;
@@ -2212,6 +2395,25 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
               downloadFolder:(NSString*)downloadFolder
       legacyIncompleteFolder:(NSString*)incompleteFolder
 {
+    return [self initWithPath:path hash:hashString torrentStruct:torrentStruct magnetAddress:magnetAddress lib:lib
+                     groupValue:groupValue
+        removeWhenFinishSeeding:removeWhenFinishSeeding
+                 downloadFolder:downloadFolder
+         legacyIncompleteFolder:incompleteFolder
+                       snapshot:nil];
+}
+
+- (instancetype)initWithPath:(NSString*)path
+                        hash:(NSString*)hashString
+               torrentStruct:(tr_torrent*)torrentStruct
+               magnetAddress:(NSString*)magnetAddress
+                         lib:(tr_session*)lib
+                  groupValue:(NSNumber*)groupValue
+     removeWhenFinishSeeding:(NSNumber*)removeWhenFinishSeeding
+              downloadFolder:(NSString*)downloadFolder
+      legacyIncompleteFolder:(NSString*)incompleteFolder
+                    snapshot:(TorrentMainWindowSnapshot*)snapshot
+{
     if (!(self = [super init]))
     {
         return nil;
@@ -2292,7 +2494,16 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
                                                name:@"GroupValueRemoved"
                                              object:nil];
 
-    [self update];
+    // Phase 1c: a snapshot built where the lock was already held (the RPC
+    // callback runs on the session thread) saves a main-thread stat pull.
+    if (snapshot != nil)
+    {
+        [self applyMainWindowSnapshot:snapshot];
+    }
+    else
+    {
+        [self update];
+    }
     [self updateTimeMachineExclude];
 
     return self;

@@ -38,19 +38,59 @@ typedef NS_ENUM(NSUInteger, TorrentDeterminationType) { TorrentDeterminationAuto
 
 extern NSString* const kTorrentDidChangeGroupNotification;
 
+/// Phase 1b: a conservative marker that a mutation has been handed to the
+/// controller's command queue and has not yet been reflected by a sample.
+/// Main-thread only. It disables conflicting actions and labels the row; it is
+/// not shadow state -- the backend stays authoritative.
+typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
+    TorrentPendingCommandNone = 0,
+    TorrentPendingCommandStart,
+    TorrentPendingCommandStop,
+    TorrentPendingCommandVerify,
+    TorrentPendingCommandAnnounce,
+    TorrentPendingCommandRelocate,
+    TorrentPendingCommandRemove,
+};
+
 @interface Torrent : NSObject<NSCopying, QLPreviewItem>
+
+@property(nonatomic) TorrentPendingCommand pendingCommand;
+@property(nonatomic, readonly) BOOL hasPendingCommand;
+/// libtransmission id, for looking the live object up again on another queue
+/// (tr_torrentFindFromId under the session lock). -1 once detached.
+@property(nonatomic, readonly) int torrentId;
+/// Forget the live handle (main thread) before an asynchronous remove.
+- (void)detachTorrentStruct;
+
+/// Off-main half of the remaining-disk-space check: statfs on the download
+/// volume, which can stall. YES means "fine to start"; NO means the main
+/// thread should ask via -presentRemainingDiskSpaceAlert.
+- (BOOL)hasEnoughRemainingDiskSpaceForStruct:(tr_torrent*)torrentStruct;
+/// Main-thread half: shows the alert; YES means "download anyway".
+- (BOOL)presentRemainingDiskSpaceAlert;
+/// Both halves, synchronously (kept for the magnet-metadata path).
+- (BOOL)alertForRemainingDiskSpace;
 
 - (instancetype)initWithPath:(NSString*)path
                     location:(NSString*)location
            deleteTorrentFile:(BOOL)torrentDelete
                          lib:(tr_session*)lib;
 - (instancetype)initWithTorrentStruct:(tr_torrent*)torrentStruct location:(NSString*)location lib:(tr_session*)lib;
+/// Phase 1c: with a snapshot already built under the session lock, the init does no stat pull of its own.
+- (instancetype)initWithTorrentStruct:(tr_torrent*)torrentStruct
+                             location:(NSString*)location
+                                  lib:(tr_session*)lib
+                             snapshot:(TorrentMainWindowSnapshot*)snapshot;
++ (void)updateTimeMachineExcludeForStruct:(tr_torrent*)torrentStruct;
 - (instancetype)initWithMagnetAddress:(NSString*)address location:(NSString*)location lib:(tr_session*)lib;
 - (void)setResumeStatusForTorrent:(Torrent*)torrent withHistory:(NSDictionary*)history forcePause:(BOOL)pause;
 
 @property(nonatomic, readonly) NSDictionary* history;
 
 - (void)closeRemoveTorrent:(BOOL)trashFiles;
+- (BOOL)canMoveTorrentDataFileTo:(NSString*)folder;
+- (void)moveTorrentStruct:(tr_torrent*)torrentStruct dataFileTo:(NSString*)folder;
++ (void)removeTorrentStruct:(tr_torrent*)torrentStruct trashFiles:(BOOL)trashFiles;
 
 - (void)changeDownloadFolderBeforeUsing:(NSString*)folder determinationType:(TorrentDeterminationType)determinationType;
 

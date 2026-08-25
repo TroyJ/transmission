@@ -810,6 +810,10 @@ static NSTimeInterval const kToggleProgressSeconds = 0.175;
 - (IBAction)toggleControlForTorrent:(id)sender
 {
     Torrent* torrent = [self itemAtRow:[self rowForView:[sender superview]]];
+    if (torrent.hasPendingCommand)
+    {
+        return; // a command is already in flight; wait for the sample to catch up
+    }
     if (torrent.active)
     {
         [self.fController stopTorrents:@[ torrent ]];
