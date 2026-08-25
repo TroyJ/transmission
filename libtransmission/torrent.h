@@ -38,6 +38,7 @@
 #include "libtransmission/observable.h"
 #include "libtransmission/piece-check.h"
 #include "libtransmission/session.h"
+#include "libtransmission/file.h" // tr_sys_path_info
 #include "libtransmission/torrent-files.h"
 #include "libtransmission/torrent-magnet.h"
 #include "libtransmission/torrent-metainfo.h"
@@ -1546,6 +1547,26 @@ private:
 
     // see found_file_path()
     mutable std::map<tr_file_index_t, std::string> found_paths_;
+
+    /**
+     * Results of preprobe_files_for_init(): every candidate path for every
+     * file, stat()ed once *before* init() takes the session lock, while the
+     * torrent is still private. init() and everything it calls
+     * (load_checked_pieces, refresh_current_dir, has_any_local_data,
+     * is_new_torrent_a_seed) then resolve files from here instead of the
+     * disk. Cleared at the end of init(); afterwards find_file() is live.
+     *
+     * Why: at launch the mac app adds every torrent from the main thread,
+     * so these probes ran on the GUI thread *under the lock*; on a stalled
+     * volume they froze the app for the whole startup. The probes still
+     * cost what they cost, but nothing else waits on them any more.
+     */
+    mutable std::optional<std::map<std::string, std::optional<tr_sys_path_info>, std::less<>>> init_probe_cache_;
+
+public:
+    void preprobe_files_for_init(tr_ctor const& ctor);
+
+private:
     std::deque<PrefetchKey> prefetch_order_;
     std::set<PrefetchKey> prefetch_in_flight_;
 

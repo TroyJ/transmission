@@ -40,6 +40,7 @@
 #include "libtransmission/torrent-ctor.h"
 #include "libtransmission/torrent-magnet.h"
 #include "libtransmission/torrent-metainfo.h"
+#include "libtransmission/api-compat.h"
 #include "libtransmission/torrent.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-strbuf.h"
@@ -1153,6 +1154,8 @@ void tr_torrent::init(tr_ctor const& ctor)
         set_local_error_if_files_disappeared(this, has_any_local_data);
     }
 
+    init_probe_cache_.reset(); // from here on, find_file() asks the disk
+
     // Recover from the bug reported at https://github.com/transmission/transmission/issues/6899
     if (is_done() && date_done_ == time_t{})
     {
@@ -1218,6 +1221,7 @@ tr_torrent* tr_torrentNew(tr_ctor* ctor, tr_torrent** setme_duplicate_of)
 
     auto* const tor = new tr_torrent{ std::move(metainfo) };
     tor->verify_done_callback_ = ctor->steal_verify_done_callback();
+    tor->preprobe_files_for_init(*ctor); // the disk, before the lock
     tor->init(*ctor);
     return tor;
 }
@@ -1413,7 +1417,99 @@ std::optional<tr_torrent_files::FoundFile> tr_torrent::find_file(tr_file_index_t
 
     auto paths = std::array<std::string_view, 4>{};
     auto const n_paths = buildSearchPathArray(this, std::data(paths));
+
+    if (init_probe_cache_)
+    {
+        // during init(): answer from the pre-lock probe, stat only on a miss
+        auto const cached_stat = [this](std::string_view path)
+        {
+            auto& cache = *init_probe_cache_;
+            if (auto const iter = cache.find(path); iter != std::end(cache))
+            {
+                return iter->second;
+            }
+            auto const info = tr_sys_path_get_info(path);
+            cache.emplace(std::string{ path }, info);
+            return info;
+        };
+        return files().find(file_index, std::data(paths), n_paths, cached_stat);
+    }
+
     return files().find(file_index, std::data(paths), n_paths);
+}
+
+void tr_torrent::preprobe_files_for_init(tr_ctor const& ctor)
+{
+    // No lock: the torrent is not registered yet and nobody else can see it.
+    session = ctor.session();
+    if (!has_metainfo())
+    {
+        return; // no files to look for
+    }
+
+    // Every base directory init() could end up searching: the ctor's, the
+    // session's, and the ones the resume file will set. Read the resume file
+    // directly for the latter -- it lives on the config volume and is small.
+    auto bases = std::vector<std::string>{};
+    auto const add_base = [&bases](std::string_view dir)
+    {
+        if (!std::empty(dir) && std::find(std::begin(bases), std::end(bases), dir) == std::end(bases))
+        {
+            bases.emplace_back(dir);
+        }
+    };
+    add_base(ctor.download_dir(TR_FORCE));
+    add_base(ctor.download_dir(TR_FALLBACK));
+    if (tr_sessionIsIncompleteDirEnabled(session))
+    {
+        add_base(ctor.incomplete_dir());
+        add_base(session->incompleteDir());
+    }
+    if (auto benc = std::vector<char>{}; tr_file_read(resume_file(), benc))
+    {
+        auto serde = tr_variant_serde::benc();
+        if (auto otop = serde.inplace().parse(benc); otop)
+        {
+            libtransmission::api_compat::convert_incoming_data(*otop);
+            if (auto const* const map = otop->get_if<tr_variant::Map>(); map != nullptr)
+            {
+                if (auto const sv = map->value_if<std::string_view>(TR_KEY_destination); sv)
+                {
+                    add_base(*sv);
+                }
+                if (auto const sv = map->value_if<std::string_view>(TR_KEY_incomplete_dir); sv)
+                {
+                    add_base(*sv);
+                }
+            }
+        }
+    }
+
+    auto cache = std::map<std::string, std::optional<tr_sys_path_info>, std::less<>>{};
+    auto filename = tr_pathbuf{};
+    for (tr_file_index_t i = 0, n = file_count(); i < n; ++i)
+    {
+        auto const& subpath = file_subpath(i);
+        for (auto const& base : bases)
+        {
+            filename.assign(base, '/', subpath);
+            auto const info = tr_sys_path_get_info(filename);
+            cache.emplace(std::string{ filename.sv() }, info);
+            if (info)
+            {
+                break; // find() stops at the first hit, in this same order
+            }
+            filename.assign(base, '/', subpath, tr_torrent_files::PartialFileSuffix);
+            auto const part_info = tr_sys_path_get_info(filename);
+            cache.emplace(std::string{ filename.sv() }, part_info);
+            if (part_info)
+            {
+                break;
+            }
+        }
+    }
+
+    init_probe_cache_ = std::move(cache);
 }
 
 std::optional<std::string_view> tr_torrent::found_file_path(tr_file_index_t const file_index) const
@@ -1450,11 +1546,15 @@ void tr_torrent::forget_found_paths() const noexcept
 
 bool tr_torrent::has_any_local_data() const
 {
-    using namespace location_helpers;
-
-    auto paths = std::array<std::string_view, 4>{};
-    auto const n_paths = buildSearchPathArray(this, std::data(paths));
-    return files().has_any_local_data(std::data(paths), n_paths);
+    // via find_file() so that init()'s probe cache is honoured
+    for (tr_file_index_t i = 0, n = file_count(); i < n; ++i)
+    {
+        if (find_file(i))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 void tr_torrentSetDownloadDir(tr_torrent* tor, char const* path)

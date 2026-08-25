@@ -120,6 +120,19 @@ std::optional<tr_torrent_files::FoundFile> tr_torrent_files::find(
     std::string_view const* paths,
     size_t n_paths) const
 {
+    static auto const RealStat = StatFunc{ [](std::string_view p)
+                                           {
+                                               return tr_sys_path_get_info(p);
+                                           } };
+    return find(file_index, paths, n_paths, RealStat);
+}
+
+std::optional<tr_torrent_files::FoundFile> tr_torrent_files::find(
+    tr_file_index_t file_index,
+    std::string_view const* paths,
+    size_t n_paths,
+    StatFunc const& stat_func) const
+{
     auto filename = tr_pathbuf{};
     auto const& subpath = path(file_index);
 
@@ -128,13 +141,13 @@ std::optional<tr_torrent_files::FoundFile> tr_torrent_files::find(
         auto const base = paths[path_idx];
 
         filename.assign(base, '/', subpath);
-        if (auto const info = tr_sys_path_get_info(filename); info)
+        if (auto const info = stat_func(filename.sv()); info)
         {
             return FoundFile{ *info, std::move(filename), std::size(base) };
         }
 
         filename.assign(base, '/', subpath, PartialFileSuffix);
-        if (auto const info = tr_sys_path_get_info(filename); info)
+        if (auto const info = stat_func(filename.sv()); info)
         {
             return FoundFile{ *info, std::move(filename), std::size(base) };
         }

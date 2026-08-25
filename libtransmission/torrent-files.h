@@ -120,6 +120,8 @@ public:
     void remove(std::string_view parent_in, std::string_view tmpdir_prefix, FileFunc const& func, tr_error* error = nullptr)
         const;
 
+    using StatFunc = std::function<std::optional<tr_sys_path_info>(std::string_view path)>;
+
     struct FoundFile : public tr_sys_path_info
     {
     public:
@@ -154,6 +156,13 @@ public:
     };
 
     [[nodiscard]] std::optional<FoundFile> find(tr_file_index_t file, std::string_view const* paths, size_t n_paths) const;
+
+    /** As above, but every stat() goes through `stat_func` -- e.g. a cache. */
+    [[nodiscard]] std::optional<FoundFile> find(
+        tr_file_index_t file,
+        std::string_view const* paths,
+        size_t n_paths,
+        StatFunc const& stat_func) const;
     [[nodiscard]] bool has_any_local_data(std::string_view const* paths, size_t n_paths) const;
     [[nodiscard]] std::string_view primary_mime_type() const;
 
