@@ -65,6 +65,16 @@ static NSString* stringFromTorrentCString(char const* value)
 @property(nonatomic, copy) NSString* errorString;
 @property(nonatomic, copy) NSString* relocationErrorString;
 
+@property(nonatomic, readwrite) BOOL includesInspectorData;
+@property(nonatomic, readwrite, copy) NSArray<NSDictionary*>* peers;
+@property(nonatomic, readwrite, copy) NSArray<NSDictionary*>* webSeeds;
+@property(nonatomic, readwrite, copy) NSData* trackerViews;
+@property(nonatomic, readwrite, copy) NSData* fileHave;
+@property(nonatomic, readwrite, copy) NSData* availability;
+@property(nonatomic, readwrite, copy) NSData* amountFinishedCells;
+@property(nonatomic, readwrite, copy) NSString* dataLocation;
+@property(nonatomic, readwrite) NSUInteger fileCount;
+
 - (instancetype)initWithHashString:(NSString*)hashString
                               stat:(tr_stat)stat
                        errorString:(NSString*)errorString
@@ -142,6 +152,131 @@ static NSString* stringFromTorrentCString(char const* value)
 }
 
 @end
+
+static NSInteger const kInspectorMaxPieceCells = 18 * 18; // PiecesView's kMaxCells
+
+static NSArray<NSDictionary*>* peerDictsForTorrentStruct(tr_torrent* torrentStruct, NSString* name)
+{
+    size_t totalPeers;
+    tr_peer_stat* peers = tr_torrentPeers(torrentStruct, &totalPeers);
+
+    NSMutableArray* peerDicts = [NSMutableArray arrayWithCapacity:totalPeers];
+
+    for (size_t i = 0; i < totalPeers; i++)
+    {
+        tr_peer_stat* peer = &peers[i];
+        NSMutableDictionary* dict = [NSMutableDictionary dictionaryWithCapacity:12];
+
+        dict[@"Name"] = name;
+        dict[@"From"] = @(peer->from);
+        dict[@"IP"] = @(peer->addr);
+        dict[@"Port"] = @(peer->port);
+        dict[@"Progress"] = @(peer->progress);
+        dict[@"Seed"] = @(peer->isSeed);
+        dict[@"Encryption"] = @(peer->isEncrypted);
+        dict[@"uTP"] = @(peer->isUTP);
+        dict[@"Client"] = @(peer->client);
+        dict[@"Flags"] = @(peer->flagStr);
+
+        if (peer->isUploadingTo)
+        {
+            dict[@"UL To Rate"] = @(peer->rateToPeer_KBps);
+        }
+        if (peer->isDownloadingFrom)
+        {
+            dict[@"DL From Rate"] = @(peer->rateToClient_KBps);
+        }
+
+        [peerDicts addObject:dict];
+    }
+
+    tr_torrentPeersFree(peers, totalPeers);
+
+    return peerDicts;
+}
+
+static NSArray<NSDictionary*>* webSeedDictsForTorrentStruct(tr_torrent* torrentStruct, NSString* name)
+{
+    NSUInteger n = tr_torrentWebseedCount(torrentStruct);
+    NSMutableArray* webSeeds = [NSMutableArray arrayWithCapacity:n];
+
+    for (NSUInteger i = 0; i < n; ++i)
+    {
+        auto const webseed = tr_torrentWebseed(torrentStruct, i);
+        NSMutableDictionary* dict = [NSMutableDictionary dictionaryWithCapacity:3];
+
+        dict[@"Name"] = name;
+        dict[@"Address"] = @(webseed.url);
+
+        if (webseed.is_downloading)
+        {
+            dict[@"DL From Rate"] = @(double(webseed.download_bytes_per_second) / 1000);
+        }
+
+        [webSeeds addObject:dict];
+    }
+
+    return webSeeds;
+}
+
+static NSString* dataLocationForTorrentStruct(tr_torrent* torrentStruct, BOOL magnet, BOOL folder, NSString* name)
+{
+    if (magnet)
+    {
+        return nil;
+    }
+
+    if (folder)
+    {
+        NSString* dataLocation = [@(tr_torrentGetCurrentDir(torrentStruct)) stringByAppendingPathComponent:name];
+        return [NSFileManager.defaultManager fileExistsAtPath:dataLocation] ? dataLocation : nil;
+    }
+
+    auto const location = tr_torrentFindFile(torrentStruct, 0);
+    return std::empty(location) ? nil : @(location.c_str());
+}
+
+static void addInspectorData(TorrentMainWindowSnapshot* snapshot, tr_torrent* torrentStruct)
+{
+    snapshot.includesInspectorData = YES;
+    snapshot.peers = peerDictsForTorrentStruct(torrentStruct, snapshot.name);
+    snapshot.webSeeds = webSeedDictsForTorrentStruct(torrentStruct, snapshot.name);
+    snapshot.dataLocation = dataLocationForTorrentStruct(torrentStruct, snapshot.magnet, snapshot.folder, snapshot.name);
+
+    auto const trackerCount = tr_torrentTrackerCount(torrentStruct);
+    NSMutableData* trackerViews = [NSMutableData dataWithLength:trackerCount * sizeof(tr_tracker_view)];
+    auto* views = static_cast<tr_tracker_view*>(trackerViews.mutableBytes);
+    for (size_t i = 0; i < trackerCount; ++i)
+    {
+        views[i] = tr_torrentTracker(torrentStruct, i);
+    }
+    snapshot.trackerViews = trackerViews;
+
+    if (!snapshot.magnet)
+    {
+        auto const fileCount = tr_torrentFileCount(torrentStruct);
+        NSMutableData* fileHave = [NSMutableData dataWithLength:fileCount * sizeof(uint64_t)];
+        auto* have = static_cast<uint64_t*>(fileHave.mutableBytes);
+        for (tr_file_index_t i = 0; i < fileCount; ++i)
+        {
+            have[i] = tr_torrentFile(torrentStruct, i).have;
+        }
+        snapshot.fileHave = fileHave;
+        snapshot.fileCount = fileCount;
+
+        NSInteger const cells = MIN(snapshot.pieceCount, kInspectorMaxPieceCells);
+        if (cells > 0)
+        {
+            NSMutableData* availability = [NSMutableData dataWithLength:cells * sizeof(int8_t)];
+            tr_torrentAvailability(torrentStruct, static_cast<int8_t*>(availability.mutableBytes), static_cast<int>(cells));
+            snapshot.availability = availability;
+
+            NSMutableData* finished = [NSMutableData dataWithLength:cells * sizeof(float)];
+            tr_torrentAmountFinished(torrentStruct, static_cast<float*>(finished.mutableBytes), static_cast<int>(cells));
+            snapshot.amountFinishedCells = finished;
+        }
+    }
+}
 
 static TorrentMainWindowSnapshot* torrentMainWindowSnapshot(tr_torrent* torrentStruct, BOOL includePieces)
 {
@@ -229,6 +364,7 @@ static TorrentMainWindowSnapshot* torrentMainWindowSnapshot(tr_torrent* torrentS
     BOOL _fCachedCanRetryRelocation;
     BOOL _fCachedCanResumeRelocation;
     BOOL _fCachedCanCancelRelocation;
+    TorrentMainWindowSnapshot* _fInspectorSnapshot; // phase 2; nil until sampled
 }
 
 - (NSString*)pendingCommandStatusString;
@@ -485,11 +621,21 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (void)getAvailability:(int8_t*)tab size:(int)size
 {
+    if (NSData* cached = _fInspectorSnapshot.availability; cached != nil && cached.length == size * sizeof(int8_t))
+    {
+        memcpy(tab, cached.bytes, cached.length);
+        return;
+    }
     tr_torrentAvailability(self.fHandle, tab, size);
 }
 
 - (void)getAmountFinished:(float*)tab size:(int)size
 {
+    if (NSData* cached = _fInspectorSnapshot.amountFinishedCells; cached != nil && cached.length == size * sizeof(float))
+    {
+        memcpy(tab, cached.bytes, cached.length);
+        return;
+    }
     tr_torrentAmountFinished(self.fHandle, tab, size);
 }
 
@@ -565,6 +711,18 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     return torrentMainWindowSnapshot(torrentStruct, includePieces);
 }
 
++ (TorrentMainWindowSnapshot*)mainWindowSnapshotForTorrentStruct:(tr_torrent*)torrentStruct
+                                                   includePieces:(BOOL)includePieces
+                                                includeInspector:(BOOL)includeInspector
+{
+    TorrentMainWindowSnapshot* snapshot = torrentMainWindowSnapshot(torrentStruct, includePieces);
+    if (snapshot != nil && includeInspector)
+    {
+        addInspectorData(snapshot, torrentStruct);
+    }
+    return snapshot;
+}
+
 - (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces
 {
     return torrentMainWindowSnapshot(self.fHandle, includePieces);
@@ -598,6 +756,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     if (snapshot.includesPiecePercentData)
     {
         self.mainWindowPiecePercentData = snapshot.piecePercentData;
+    }
+
+    if (snapshot.includesInspectorData)
+    {
+        _fInspectorSnapshot = snapshot;
     }
 
     if (previousName == nil || ![previousName isEqualToString:_fCachedName] || previousMagnet != _fCachedMagnet || previousFolder != _fCachedFolder)
@@ -1035,6 +1198,16 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     }
 }
 
+- (BOOL)hasInspectorSnapshot
+{
+    return _fInspectorSnapshot != nil;
+}
+
+- (void)dropInspectorSnapshot
+{
+    _fInspectorSnapshot = nil;
+}
+
 - (BOOL)hasPendingCommand
 {
     return self.pendingCommand != TorrentPendingCommandNone;
@@ -1109,14 +1282,16 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (NSMutableArray*)allTrackerStats
 {
-    auto const count = tr_torrentTrackerCount(self.fHandle);
+    NSData* cachedViews = _fInspectorSnapshot.trackerViews;
+    auto const count = cachedViews != nil ? cachedViews.length / sizeof(tr_tracker_view) : tr_torrentTrackerCount(self.fHandle);
     auto tier = std::optional<int>{};
 
     NSMutableArray* trackers = [NSMutableArray arrayWithCapacity:count * 2];
 
     for (size_t i = 0; i < count; ++i)
     {
-        auto const tracker = tr_torrentTracker(self.fHandle, i);
+        auto const tracker = cachedViews != nil ? static_cast<tr_tracker_view const*>(cachedViews.bytes)[i] :
+                                                  tr_torrentTracker(self.fHandle, i);
 
         if (!tier || tier != tracker.tier)
         {
@@ -1238,6 +1413,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (NSString*)dataLocation
 {
+    if (_fInspectorSnapshot != nil)
+    {
+        return _fInspectorSnapshot.dataLocation; // a stat() on the data volume, done by the sampler
+    }
+
     if (self.magnet)
     {
         return nil;
@@ -1488,42 +1668,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (NSArray<NSDictionary*>*)peers
 {
-    size_t totalPeers;
-    tr_peer_stat* peers = tr_torrentPeers(self.fHandle, &totalPeers);
-
-    NSMutableArray* peerDicts = [NSMutableArray arrayWithCapacity:totalPeers];
-
-    for (size_t i = 0; i < totalPeers; i++)
+    if (_fInspectorSnapshot != nil)
     {
-        tr_peer_stat* peer = &peers[i];
-        NSMutableDictionary* dict = [NSMutableDictionary dictionaryWithCapacity:12];
-
-        dict[@"Name"] = self.name;
-        dict[@"From"] = @(peer->from);
-        dict[@"IP"] = @(peer->addr);
-        dict[@"Port"] = @(peer->port);
-        dict[@"Progress"] = @(peer->progress);
-        dict[@"Seed"] = @(peer->isSeed);
-        dict[@"Encryption"] = @(peer->isEncrypted);
-        dict[@"uTP"] = @(peer->isUTP);
-        dict[@"Client"] = @(peer->client);
-        dict[@"Flags"] = @(peer->flagStr);
-
-        if (peer->isUploadingTo)
-        {
-            dict[@"UL To Rate"] = @(peer->rateToPeer_KBps);
-        }
-        if (peer->isDownloadingFrom)
-        {
-            dict[@"DL From Rate"] = @(peer->rateToClient_KBps);
-        }
-
-        [peerDicts addObject:dict];
+        return _fInspectorSnapshot.peers ?: @[];
     }
-
-    tr_torrentPeersFree(peers, totalPeers);
-
-    return peerDicts;
+    return peerDictsForTorrentStruct(self.fHandle, self.name);
 }
 
 - (NSUInteger)webSeedCount
@@ -1533,26 +1682,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
 - (NSArray<NSDictionary*>*)webSeeds
 {
-    NSUInteger n = tr_torrentWebseedCount(self.fHandle);
-    NSMutableArray* webSeeds = [NSMutableArray arrayWithCapacity:n];
-
-    for (NSUInteger i = 0; i < n; ++i)
+    if (_fInspectorSnapshot != nil)
     {
-        auto const webseed = tr_torrentWebseed(self.fHandle, i);
-        NSMutableDictionary* dict = [NSMutableDictionary dictionaryWithCapacity:3];
-
-        dict[@"Name"] = self.name;
-        dict[@"Address"] = @(webseed.url);
-
-        if (webseed.is_downloading)
-        {
-            dict[@"DL From Rate"] = @(double(webseed.download_bytes_per_second) / 1000);
-        }
-
-        [webSeeds addObject:dict];
+        return _fInspectorSnapshot.webSeeds ?: @[];
     }
-
-    return webSeeds;
+    return webSeedDictsForTorrentStruct(self.fHandle, self.name);
 }
 
 - (NSString*)progressString
@@ -2117,9 +2251,13 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
 
     uint64_t have = 0;
     NSIndexSet* indexSet = node.indexes;
+    NSData* cachedHave = _fInspectorSnapshot.fileHave;
+    auto const* cached = cachedHave != nil ? static_cast<uint64_t const*>(cachedHave.bytes) : nullptr;
+    auto const cachedCount = cachedHave != nil ? cachedHave.length / sizeof(uint64_t) : 0U;
     for (NSInteger index = indexSet.firstIndex; index != NSNotFound; index = [indexSet indexGreaterThanIndex:index])
     {
-        have += tr_torrentFile(self.fHandle, index).have;
+        have += cached != nullptr && static_cast<NSUInteger>(index) < cachedCount ? cached[index] :
+                                                                                    tr_torrentFile(self.fHandle, index).have;
     }
 
     return (CGFloat)have / node.size;

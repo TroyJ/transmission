@@ -49,6 +49,9 @@ typedef NS_ENUM(NSUInteger, AddType) { //
 - (void)openPasteboard;
 
 @property(nonatomic, readonly) tr_session* sessionHandle;
+/// Session stats as of the last background sample (phase 2: the stats window reads these, not the session).
+@property(nonatomic, readonly) tr_session_stats cachedSessionStats;
+@property(nonatomic, readonly) tr_session_stats cachedCumulativeStats;
 
 - (IBAction)createFile:(id)sender;
 

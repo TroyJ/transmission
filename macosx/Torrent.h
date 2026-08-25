@@ -30,6 +30,18 @@
 @property(nonatomic, readonly) NSData* piecePercentData;
 @property(nonatomic, readonly) BOOL includesPiecePercentData;
 
+/// Phase 2: what the inspector needs, sampled under the lock for the selected
+/// torrents while the inspector is visible. All nil/NO when not included.
+@property(nonatomic, readonly) BOOL includesInspectorData;
+@property(nonatomic, readonly, copy) NSArray<NSDictionary*>* peers;
+@property(nonatomic, readonly, copy) NSArray<NSDictionary*>* webSeeds;
+@property(nonatomic, readonly, copy) NSData* trackerViews; ///< tr_tracker_view[]
+@property(nonatomic, readonly, copy) NSData* fileHave; ///< uint64_t[fileCount]
+@property(nonatomic, readonly, copy) NSData* availability; ///< int8_t[min(pieceCount, 18*18)]
+@property(nonatomic, readonly, copy) NSData* amountFinishedCells; ///< float[min(pieceCount, 18*18)]
+@property(nonatomic, readonly, copy) NSString* dataLocation; ///< nil when no data on disk
+@property(nonatomic, readonly) NSUInteger fileCount;
+
 - (instancetype)init NS_UNAVAILABLE;
 
 @end
@@ -103,6 +115,13 @@ typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
 
 - (void)update;
 + (TorrentMainWindowSnapshot*)mainWindowSnapshotForTorrentStruct:(tr_torrent*)torrentStruct includePieces:(BOOL)includePieces;
++ (TorrentMainWindowSnapshot*)mainWindowSnapshotForTorrentStruct:(tr_torrent*)torrentStruct
+                                                   includePieces:(BOOL)includePieces
+                                                includeInspector:(BOOL)includeInspector;
+/// Phase 2: YES while the inspector getters (peers, trackers, file progress,
+/// availability, data location) can answer from a sampled cache.
+@property(nonatomic, readonly) BOOL hasInspectorSnapshot;
+- (void)dropInspectorSnapshot;
 - (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces;
 - (void)applyMainWindowSnapshot:(TorrentMainWindowSnapshot*)snapshot;
 

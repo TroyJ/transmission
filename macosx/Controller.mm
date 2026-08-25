@@ -3063,6 +3063,31 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }];
 }
 
+- (NSSet<NSString*>*)inspectorTorrentHashes
+{
+    if (self.fInfoController == nil || !self.fInfoController.window.visible)
+    {
+        return [NSSet set];
+    }
+
+    NSMutableSet<NSString*>* hashes = [NSMutableSet set];
+    for (Torrent* torrent in self.fInfoController.torrents)
+    {
+        [hashes addObject:torrent.hashString];
+    }
+    return hashes;
+}
+
+- (tr_session_stats)cachedSessionStats
+{
+    return self.fMainWindowCachedSessionStats;
+}
+
+- (tr_session_stats)cachedCumulativeStats
+{
+    return self.fMainWindowCachedCumulativeStats;
+}
+
 - (void)requestMainWindowSample
 {
     if (self.fMainWindowSamplingSuspended || self.fQuitting || self.fLib == nullptr)
@@ -3092,6 +3117,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     self.fMainWindowSampleInFlight = YES;
 
     NSSet<NSString*>* pieceTorrentHashes = [self.fMainWindowPendingPieceTorrentHashes copy] ?: [NSSet set];
+    // Phase 2: the inspector's peers/trackers/file-progress/availability/data
+    // location are sampled here, under the same lock hold, for the torrents
+    // it is showing. Its getters then answer from the cache.
+    NSSet<NSString*>* inspectorTorrentHashes = [self inspectorTorrentHashes];
     tr_session* session = self.fLib;
 
     dispatch_async(self.fMainWindowSampleQueue, ^{
@@ -3118,8 +3147,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             {
                 NSString* hashString = @(tr_torrentView(torrentStruct).hash_string);
                 BOOL const includePieces = [pieceTorrentHashes containsObject:hashString];
+                BOOL const includeInspector = [inspectorTorrentHashes containsObject:hashString];
                 TorrentMainWindowSnapshot* snapshot = [Torrent mainWindowSnapshotForTorrentStruct:torrentStruct
-                                                                                    includePieces:includePieces];
+                                                                                    includePieces:includePieces
+                                                                                 includeInspector:includeInspector];
                 if (snapshot == nil)
                 {
                     continue;
@@ -3187,12 +3218,21 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     if (sample.generation >= self.fMainWindowSampleRequestedGeneration && sample.generation > self.fMainWindowSampleAppliedGeneration)
     {
+        BOOL anyInspectorData = NO;
         for (TorrentMainWindowSnapshot* snapshot in sample.torrentSnapshots)
         {
             Torrent* torrent = self.fTorrentHashes[snapshot.hashString];
             if (torrent != nil)
             {
                 [torrent applyMainWindowSnapshot:snapshot];
+                if (snapshot.includesInspectorData)
+                {
+                    anyInspectorData = YES;
+                }
+                else if (torrent.hasInspectorSnapshot)
+                {
+                    [torrent dropInspectorSnapshot]; // no longer shown in the inspector: back to live reads
+                }
             }
         }
 
@@ -3212,6 +3252,13 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         [self refreshMainWindowFromCachedState];
         [self applyFilter];
         [self.fWindow.toolbar validateVisibleItems];
+
+        // Phase 2: the inspector redraws from the same sample, so it no
+        // longer needs its own main-thread reads to stay live.
+        if (anyInspectorData && self.fInfoController.window.visible)
+        {
+            [self.fInfoController updateInfoStats];
+        }
     }
 
     self.fMainWindowSampleInFlight = NO;

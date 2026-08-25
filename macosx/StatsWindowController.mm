@@ -136,8 +136,11 @@ tr_session* fLib = NULL;
 
 - (void)updateStats
 {
-    auto const statsAll = tr_sessionGetCumulativeStats(fLib);
-    auto const statsSession = tr_sessionGetStats(fLib);
+    // Phase 2: served from the background sampler's cache; no session lock
+    // on the main thread for a 1 s refresh.
+    Controller* controller = (Controller*)NSApp.delegate;
+    auto const statsAll = controller.cachedCumulativeStats;
+    auto const statsSession = controller.cachedSessionStats;
 
     NSByteCountFormatter* byteFormatter = [[NSByteCountFormatter alloc] init];
     byteFormatter.allowedUnits = NSByteCountFormatterUseBytes;

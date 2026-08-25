@@ -197,6 +197,11 @@ typedef NS_ENUM(NSUInteger, TabTag) {
     }
 }
 
+- (NSArray<Torrent*>*)torrents
+{
+    return self.fTorrents ?: @[];
+}
+
 - (void)setInfoForTorrents:(NSArray<Torrent*>*)torrents
 {
     if ([self.fTorrents isEqualToArray:torrents])
