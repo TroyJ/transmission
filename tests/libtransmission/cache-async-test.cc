@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <libtransmission/transmission.h>
@@ -351,6 +353,53 @@ TEST_F(CacheAsyncTest, removingATorrentWithDataDoesNotWaitForTheDisk)
     EXPECT_TRUE(tr_sys_path_exists(path.c_str()));
     session_->cache->set_write_paused(false);
     EXPECT_TRUE(waitFor([&path]() { return !tr_sys_path_exists(path.c_str()); }, 5000));
+}
+
+TEST_F(CacheAsyncTest, shutdownGivesUpOnAStalledDiskAndForgetsTheUnwrittenBlocks)
+{
+    // What quit does when the disk never answers: wait a bounded time, then
+    // record which blocks did not land so the resume file does not claim them.
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    session_->cache->set_write_paused(true);
+    static auto constexpr NumBlocks = tr_block_index_t{ 4 };
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            for (tr_block_index_t block = 0; block < NumBlocks; ++block)
+            {
+                session_->cache->write_block(tor->id(), block, make_block(tor, block));
+                tor->on_block_received(block); // marks it had, as the peer path does
+            }
+            EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+        });
+    ASSERT_LE(NumBlocks, tor->block_span_for_piece(0).end);
+    for (tr_block_index_t block = 0; block < NumBlocks; ++block)
+    {
+        EXPECT_TRUE(tor->has_block(block));
+    }
+
+    // drain_for() is a bounded wait; a paused worker is a disk that never answers.
+    auto drained = true;
+    in_session_thread(session_, [this, &drained]() { drained = session_->cache->drain_for(std::chrono::milliseconds{ 100 }); });
+    EXPECT_FALSE(drained);
+
+    auto abandoned = std::vector<std::pair<tr_torrent_id_t, tr_block_index_t>>{};
+    in_session_thread(session_, [this, &abandoned]() { abandoned = session_->cache->abandon_pending(); });
+    EXPECT_EQ(NumBlocks, std::size(abandoned));
+    EXPECT_EQ(0U, session_->cache->pending_write_bytes());
+
+    for (auto const& [tor_id, block] : abandoned)
+    {
+        EXPECT_EQ(tor->id(), tor_id);
+        tor->forget_unwritten_block(block);
+    }
+    for (tr_block_index_t block = 0; block < NumBlocks; ++block)
+    {
+        EXPECT_FALSE(tor->has_block(block)) << "block " << block << " never reached the disk";
+    }
 }
 
 } // namespace libtransmission::test

@@ -150,6 +150,9 @@ struct tr_completion
 
     void set_blocks(tr_bitfield blocks);
 
+    // the block was never written after all (shutdown gave up on the disk)
+    void remove_block(tr_block_index_t block);
+
     void invalidate_size_when_done()
     {
         size_when_done_.reset();
@@ -170,8 +173,6 @@ private:
     {
         return count_has_bytes_in_span(block_info_->byte_span_for_piece(piece));
     }
-
-    void remove_block(tr_block_index_t block);
 
     PieceIsWantedFunc piece_is_wanted_;
     tr_block_info const* block_info_;

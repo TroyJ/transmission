@@ -203,6 +203,35 @@ void Cache::close_fd_async(tr_sys_file_t const fd)
     write_worker_.add(std::move(job));
 }
 
+bool Cache::drain_for(std::chrono::milliseconds const timeout)
+{
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Wait, -1, 0U, write_worker_.pending_bytes(), "cache-drain-for" };
+    return write_worker_.drain_for(timeout);
+}
+
+std::vector<std::pair<tr_torrent_id_t, tr_block_index_t>> Cache::abandon_pending()
+{
+    auto out = std::vector<std::pair<tr_torrent_id_t, tr_block_index_t>>{};
+
+    for (auto const& block : blocks_)
+    {
+        out.emplace_back(block.key);
+    }
+    blocks_.clear();
+
+    for (auto const& [job_id, blocks] : in_flight_)
+    {
+        for (auto const& block : blocks)
+        {
+            out.emplace_back(block.key);
+        }
+    }
+    in_flight_.clear();
+
+    write_worker_.abandon();
+    return out;
+}
+
 void Cache::drain()
 {
     auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Wait, -1, 0U, write_worker_.pending_bytes(), "cache-drain" };
@@ -244,7 +273,10 @@ Cache::~Cache()
     // Blocks already handed off must reach the disk before we go away. The
     // worker's own destructor drains too, but doing it here keeps the ordering
     // explicit and lets the in-flight bookkeeping unwind first.
-    write_worker_.drain();
+    if (!write_worker_.is_abandoned())
+    {
+        write_worker_.drain();
+    }
 }
 
 // ---

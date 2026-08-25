@@ -814,6 +814,11 @@ public:
 
     void flush_torrent_files(tr_torrent_id_t tor_id) const noexcept;
     void close_torrent_files(tr_torrent_id_t tor_id) noexcept;
+
+    // How long quit waits for a stalled disk before giving up on the queued
+    // writes (see closeImplPart1). Within tr_sessionClose()'s 15 s default.
+    static constexpr auto ShutdownDiskGrace = std::chrono::milliseconds{ 8000 };
+    void abandon_unwritten_blocks();
     void close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept;
 
     /**

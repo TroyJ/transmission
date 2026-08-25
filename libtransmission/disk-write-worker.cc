@@ -108,22 +108,24 @@ int tr_disk_write_worker::run_job(Job& job)
     return err;
 }
 
-void tr_disk_write_worker::thread_func()
+void tr_disk_write_worker::thread_func(std::shared_ptr<State> const state)
 {
+    auto& st = *state;
+
     for (;;)
     {
         auto job = Job{};
 
         {
-            auto lock = std::unique_lock{ mutex_ };
-            cv_.wait(lock, [this]() { return stopping_ || (!paused_ && !std::empty(todo_)); });
-            if (stopping_ && std::empty(todo_))
+            auto lock = std::unique_lock{ st.mutex };
+            st.cv.wait(lock, [&st]() { return st.stopping || (!st.paused && !std::empty(st.todo)); });
+            if (st.stopping && std::empty(st.todo))
             {
                 return;
             }
-            job = std::move(todo_.front());
-            todo_.pop_front();
-            running_job_ = true;
+            job = std::move(st.todo.front());
+            st.todo.pop_front();
+            st.running_job = true;
         }
 
         auto const job_bytes = std::size(job.data);
@@ -135,30 +137,40 @@ void tr_disk_write_worker::thread_func()
         }
 
         {
-            auto const lock = std::scoped_lock{ mutex_ };
-            pending_bytes_ -= job_bytes;
-            running_job_ = false;
+            auto const lock = std::scoped_lock{ st.mutex };
+            st.pending_bytes -= job_bytes;
+            st.running_job = false;
         }
-        drained_cv_.notify_all();
+        st.drained_cv.notify_all();
     }
 }
 
 void tr_disk_write_worker::set_paused(bool const paused)
 {
     {
-        auto const lock = std::scoped_lock{ mutex_ };
-        paused_ = paused;
+        auto const lock = std::scoped_lock{ state_->mutex };
+        state_->paused = paused;
     }
 
-    cv_.notify_all();
+    state_->cv.notify_all();
 }
 
 void tr_disk_write_worker::add(Job&& job)
 {
-    {
-        auto const lock = std::scoped_lock{ mutex_ };
+    auto& st = *state_;
 
-        if (stopping_)
+    {
+        auto const lock = std::scoped_lock{ st.mutex };
+
+        if (st.abandoned)
+        {
+            // Shutdown gave up on the disk. The caller has already recorded
+            // that these bytes never landed; the descriptors are deliberately
+            // not closed, since close() is what may be stuck.
+            return;
+        }
+
+        if (st.stopping)
         {
             // Shutting down: do not silently drop the data on the floor.
             // Write it here, on the caller's thread, so nothing is lost.
@@ -171,58 +183,112 @@ void tr_disk_write_worker::add(Job&& job)
             return;
         }
 
-        pending_bytes_ += std::size(job.data);
-        todo_.emplace_back(std::move(job));
+        st.pending_bytes += std::size(job.data);
+        st.todo.emplace_back(std::move(job));
 
         if (!thread_.joinable())
         {
-            thread_ = std::thread{ &tr_disk_write_worker::thread_func, this };
+            thread_ = std::thread{ &tr_disk_write_worker::thread_func, state_ };
         }
     }
 
-    cv_.notify_one();
+    st.cv.notify_one();
 }
 
 size_t tr_disk_write_worker::pending_bytes() const noexcept
 {
-    auto const lock = std::scoped_lock{ mutex_ };
-    return pending_bytes_;
+    auto const lock = std::scoped_lock{ state_->mutex };
+    return state_->pending_bytes;
 }
 
 size_t tr_disk_write_worker::pending_jobs() const noexcept
 {
-    auto const lock = std::scoped_lock{ mutex_ };
-    return std::size(todo_) + (running_job_ ? 1U : 0U);
+    auto const lock = std::scoped_lock{ state_->mutex };
+    return std::size(state_->todo) + (state_->running_job ? 1U : 0U);
+}
+
+bool tr_disk_write_worker::is_abandoned() const noexcept
+{
+    auto const lock = std::scoped_lock{ state_->mutex };
+    return state_->abandoned;
 }
 
 void tr_disk_write_worker::drain()
 {
-    TR_ASSERT(std::this_thread::get_id() != thread_.get_id());
-
     {
-        auto const lock = std::scoped_lock{ mutex_ };
-        if (paused_)
+        auto const lock = std::scoped_lock{ state_->mutex };
+        if (state_->paused)
         {
-            paused_ = false; // a drain outranks a test's pause; never deadlock here
+            state_->paused = false; // an unbounded drain outranks a test's pause; never deadlock here
         }
     }
-    cv_.notify_all();
+    state_->cv.notify_all();
 
-    auto lock = std::unique_lock{ mutex_ };
-    drained_cv_.wait(lock, [this]() { return std::empty(todo_) && !running_job_; });
+    static_cast<void>(drain_for(std::chrono::milliseconds::max()));
+}
+
+bool tr_disk_write_worker::drain_for(std::chrono::milliseconds const timeout)
+{
+    // Deliberately does not un-pause: a bounded wait cannot deadlock, and a
+    // paused worker is how tests model a disk that never answers.
+    TR_ASSERT(std::this_thread::get_id() != thread_.get_id());
+    auto& st = *state_;
+
+    auto lock = std::unique_lock{ st.mutex };
+    auto const done = [&st]()
+    {
+        return std::empty(st.todo) && !st.running_job;
+    };
+    if (timeout == std::chrono::milliseconds::max())
+    {
+        st.drained_cv.wait(lock, done);
+        return true;
+    }
+    return st.drained_cv.wait_for(lock, timeout, done);
+}
+
+size_t tr_disk_write_worker::abandon()
+{
+    auto& st = *state_;
+    auto n_dropped = size_t{};
+
+    {
+        auto const lock = std::scoped_lock{ st.mutex };
+        n_dropped = std::size(st.todo);
+        st.todo.clear();
+        st.pending_bytes = 0U;
+        st.abandoned = true;
+        st.stopping = true;
+    }
+    st.cv.notify_all();
+
+    // A thread mid-syscall cannot be joined. It holds the state by
+    // shared_ptr, so letting it go is safe; it will finish its one write
+    // (or not -- the process is exiting) and return.
+    if (thread_.joinable())
+    {
+        thread_.detach();
+    }
+
+    return n_dropped;
 }
 
 tr_disk_write_worker::~tr_disk_write_worker()
 {
+    auto& st = *state_;
+
     // Everything queued still gets written. Dropping it would lose downloaded
     // data that the cache has already reported as safely handed off.
     {
-        auto lock = std::unique_lock{ mutex_ };
-        drained_cv_.wait(lock, [this]() { return std::empty(todo_) && !running_job_; });
-        stopping_ = true;
+        auto lock = std::unique_lock{ st.mutex };
+        if (!st.abandoned)
+        {
+            st.drained_cv.wait(lock, [&st]() { return std::empty(st.todo) && !st.running_job; });
+        }
+        st.stopping = true;
     }
 
-    cv_.notify_all();
+    st.cv.notify_all();
 
     if (thread_.joinable())
     {

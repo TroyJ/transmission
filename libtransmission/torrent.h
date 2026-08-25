@@ -612,6 +612,10 @@ struct tr_torrent
 
     [[nodiscard]] bool has_any_local_data() const;
 
+    // shutdown gave up on the disk before this block was written; see
+    // Cache::abandon_pending()
+    void forget_unwritten_block(tr_block_index_t block);
+
     /// METAINFO - TRACKERS
 
     [[nodiscard]] constexpr auto const& announce_list() const noexcept
@@ -1275,7 +1279,11 @@ private:
 
     [[nodiscard]] constexpr auto seconds_downloading(time_t now) const noexcept
     {
-        auto n_secs = seconds_downloading_before_current_start_;
+        // No torrent has been downloading for longer than it has existed.
+        // Resume files written by the bug fixed in start() (see there) carry
+        // an epoch-based value; bounding here fixes the display and, since
+        // stop_now() persists this getter, heals the file on the next stop.
+        auto n_secs = std::min(seconds_downloading_before_current_start_, now - date_added_);
 
         if (is_running())
         {

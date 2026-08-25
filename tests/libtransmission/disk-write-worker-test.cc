@@ -5,6 +5,8 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -244,4 +246,29 @@ TEST_F(DiskWriteWorkerTest, runJobOpensByPathCreatingParentsAndClosesWhenDone)
     EXPECT_TRUE(tr_sys_file_read_at(fd, std::data(buf), std::size(Payload), 4U, &n_read));
     tr_sys_file_close(fd);
     EXPECT_EQ(Payload, std::string_view(std::data(buf), n_read));
+}
+
+TEST_F(DiskWriteWorkerTest, abandonDropsTheQueueAndTheDestructorDoesNotWait)
+{
+    auto worker = std::make_unique<tr_disk_write_worker>();
+    worker->set_paused(true);
+
+    auto job = tr_disk_write_worker::Job{};
+    job.data.assign(16U, uint8_t{ 1 });
+    job.chunks.push_back({ TR_BAD_SYS_FILE, 0U, 16U });
+    worker->add(std::move(job));
+    EXPECT_EQ(1U, worker->pending_jobs());
+
+    EXPECT_FALSE(worker->drain_for(std::chrono::milliseconds{ 50 })) << "nothing can drain while paused... ";
+
+    EXPECT_EQ(1U, worker->abandon());
+    EXPECT_TRUE(worker->is_abandoned());
+    EXPECT_EQ(0U, worker->pending_bytes());
+
+    // ...and after abandon, new jobs are discarded and teardown is immediate.
+    auto dropped = tr_disk_write_worker::Job{};
+    dropped.chunks.push_back({ TR_BAD_SYS_FILE, 0U, 0U });
+    worker->add(std::move(dropped));
+    EXPECT_EQ(0U, worker->pending_jobs());
+    worker.reset();
 }

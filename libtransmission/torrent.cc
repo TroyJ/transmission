@@ -748,6 +748,14 @@ void tr_torrent::start(bool bypass_queue, std::optional<bool> has_any_local_data
     }
 
     is_running_ = true;
+    // start_in_session_thread() sets the real start time, but a stop can land
+    // before it runs (the auto-pause for missing data does exactly that), and
+    // seconds_downloading() would then count from the epoch and persist it:
+    // "Downloading Time: 20690 days" was seen in the field.
+    if (date_started_ == time_t{})
+    {
+        date_started_ = tr_time();
+    }
     set_dirty();
     session->run_in_session_thread([this]() { start_in_session_thread(); });
 }
@@ -2379,6 +2387,12 @@ void tr_torrent::recheck_completeness()
     }
 }
 
+void tr_torrent::forget_unwritten_block(tr_block_index_t const block)
+{
+    completion_.remove_block(block);
+    set_dirty();
+}
+
 void tr_torrent::on_done_and_flushed(bool const recent_change)
 {
     using namespace completeness_helpers;
@@ -3544,7 +3558,7 @@ time_t tr_torrent::ResumeHelper::seconds_downloading(time_t now) const noexcept
 
 void tr_torrent::ResumeHelper::load_seconds_downloading_before_current_start(time_t when) noexcept
 {
-    tor_.seconds_downloading_before_current_start_ = when;
+    tor_.seconds_downloading_before_current_start_ = when; // bounded on read; see seconds_downloading()
 }
 
 // ---

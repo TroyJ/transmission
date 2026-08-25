@@ -9,11 +9,13 @@
 #error only libtransmission should #include this header.
 #endif
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -97,6 +99,21 @@ public:
      */
     void drain();
 
+    /** drain(), but gives up after `timeout`. @return true if drained. */
+    [[nodiscard]] bool drain_for(std::chrono::milliseconds timeout);
+
+    /**
+     * Stop waiting for the disk. Queued jobs are dropped; a job already
+     * inside a syscall is left to the (detached) thread, which keeps the
+     * worker's state alive for as long as it needs it. After this, add()
+     * discards jobs. Only for shutdown, after the caller has recorded which
+     * blocks did not make it -- see Cache::abandon_pending().
+     * @return the number of jobs dropped
+     */
+    size_t abandon();
+
+    [[nodiscard]] bool is_abandoned() const noexcept;
+
     /** Runs the job's writes. Exposed for testing. Closes the job's fds. */
     [[nodiscard]] static int run_job(Job& job);
 
@@ -110,15 +127,23 @@ public:
     void set_paused(bool paused);
 
 private:
-    void thread_func();
+    // Shared with the thread so that abandon() can detach it: a thread stuck
+    // in a stalled pwrite() cannot be joined, and must not outlive its state.
+    struct State
+    {
+        mutable std::mutex mutex;
+        std::condition_variable cv;
+        std::condition_variable drained_cv;
+        std::deque<Job> todo;
+        size_t pending_bytes = 0U;
+        bool running_job = false;
+        bool paused = false;
+        bool stopping = false;
+        bool abandoned = false;
+    };
 
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::condition_variable drained_cv_;
-    std::deque<Job> todo_;
+    static void thread_func(std::shared_ptr<State> state);
+
+    std::shared_ptr<State> state_ = std::make_shared<State>();
     std::thread thread_;
-    size_t pending_bytes_ = 0U;
-    bool running_job_ = false;
-    bool paused_ = false;
-    bool stopping_ = false;
 };

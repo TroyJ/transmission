@@ -9,6 +9,7 @@
 #error only libtransmission should #include this header.
 #endif
 
+#include <chrono>
 #include <cstddef> // for size_t
 #include <cstdint> // for intX_t, uintX_t
 #include <functional>
@@ -67,6 +68,21 @@ public:
      * per file or per torrent rather than per block.
      */
     void drain();
+
+    /** drain(), but gives up after `timeout`. @return true if drained. */
+    [[nodiscard]] bool drain_for(std::chrono::milliseconds timeout);
+
+    /**
+     * Shutdown's last resort: stop waiting for a disk that is not answering.
+     *
+     * Returns every block that was handed to the worker or still sitting in
+     * the cache and has NOT been confirmed written, and forgets them. The
+     * caller marks them as not-had before the resume files are written, so
+     * the next start re-downloads them instead of trusting bytes that never
+     * landed. After this the worker discards new jobs. See
+     * tr_session::closeImplPart1().
+     */
+    [[nodiscard]] std::vector<std::pair<tr_torrent_id_t, tr_block_index_t>> abandon_pending();
 
     /**
      * True when the write worker is far enough behind that we should stop

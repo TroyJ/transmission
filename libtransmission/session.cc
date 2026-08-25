@@ -1410,6 +1410,28 @@ double tr_sessionGetRawSpeed_KBps(tr_session const* session, tr_direction dir)
     return {};
 }
 
+void tr_session::abandon_unwritten_blocks()
+{
+    auto const abandoned = this->cache->abandon_pending();
+    auto n_forgotten = size_t{};
+    for (auto const& [tor_id, block] : abandoned)
+    {
+        if (auto* const tor = torrents_.get(tor_id); tor != nullptr)
+        {
+            tor->forget_unwritten_block(block);
+            ++n_forgotten;
+        }
+    }
+
+    if (n_forgotten != 0U)
+    {
+        tr_logAddWarn(
+            fmt::format(
+                fmt::runtime(_("The disk did not finish writing before shutdown; {count} blocks will be downloaded again")),
+                fmt::arg("count", n_forgotten)));
+    }
+}
+
 void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono::time_point<std::chrono::steady_clock> deadline)
 {
     is_closing_ = true;
@@ -1419,13 +1441,23 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     relocator_.reset();
     verifier_.reset();
 
-    // Everything the cache handed to the write worker has to reach the disk
-    // before anything else is torn down. The old synchronous flush made quit
-    // implicitly safe; an asynchronous one has to say so explicitly.
+    // Everything the cache handed to the write worker should reach the disk
+    // before anything else is torn down -- but a stalled volume can hold a
+    // single write for minutes, and a quit that never returns ends in a
+    // force-quit that loses the queue anyway, with resume files still
+    // claiming the blocks. So: wait a bounded time, then give up honestly.
+    // Blocks that did not land are marked as not-had before the torrents
+    // save their resume files below, and get re-downloaded next start.
     if (this->cache)
     {
         this->cache->flush_all();
-        this->cache->drain();
+        auto const grace = std::min(
+            ShutdownDiskGrace,
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
+        if (!this->cache->drain_for(std::max(grace, std::chrono::milliseconds{ 0 })))
+        {
+            abandon_unwritten_blocks();
+        }
     }
 
     piece_checker_.reset();
@@ -1505,9 +1537,9 @@ void tr_session::closeImplPart2(std::promise<void>* closed_promise, std::chrono:
 
     // close_all() hands its descriptors to the write worker (see
     // tr_open_files::set_close_handler), so wait for them before going further.
-    if (this->cache)
+    if (this->cache && !this->cache->drain_for(ShutdownDiskGrace))
     {
-        this->cache->drain();
+        abandon_unwritten_blocks(); // closes only; nothing to forget, but stop waiting
     }
     tr_utp_close(this);
     this->udp_core_.reset();
