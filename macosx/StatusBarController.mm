@@ -124,6 +124,7 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
                     upload:(CGFloat)ulRate
               sessionStats:(tr_session_stats)sessionStats
            cumulativeStats:(tr_session_stats)cumulativeStats
+                 diskStats:(tr_session_disk_stats)diskStats
              internetState:(InternetStateIndicatorSnapshot*)internetState
 {
     //set rates
@@ -162,9 +163,35 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
                                                   [NSString stringForFileSize:stats.uploadedBytes]];
     }
 
+    // Disk health. A queue builds only when the disk is slower than the
+    // download, so "queued" is the live signal; it is what used to be a
+    // beachball with no explanation. See docs/HANDOVER-disk-stalls-and-2a.md.
+    static uint64_t const DiskQueueNoticeBytes = 8 * 1024 * 1024;
+    NSString* diskToolTip = nil;
+    if (diskStats.pending_write_bytes >= DiskQueueNoticeBytes)
+    {
+        statusString = [statusString stringByAppendingFormat:@"  %@: %@ %@",
+                                                             NSLocalizedString(@"Disk", "status bar -> disk queue"),
+                                                             [NSString stringForFileSize:diskStats.pending_write_bytes],
+                                                             NSLocalizedString(@"queued", "status bar -> disk queue")];
+    }
+    if (diskStats.slow_op_count > 0)
+    {
+        diskToolTip = [NSString
+            stringWithFormat:NSLocalizedString(@"Disk: %@ queued, %llu slow operations, slowest %s took %.1f s", "status bar -> disk tooltip"),
+                             [NSString stringForFileSize:diskStats.pending_write_bytes],
+                             diskStats.slow_op_count,
+                             diskStats.worst_op,
+                             diskStats.worst_op_msec / 1000.0];
+    }
+
     if (![self.fStatusButton.title isEqualToString:statusString])
     {
         self.fStatusButton.title = statusString;
+    }
+    if (diskToolTip != nil ? ![self.fStatusButton.toolTip isEqualToString:diskToolTip] : self.fStatusButton.toolTip != nil)
+    {
+        self.fStatusButton.toolTip = diskToolTip;
     }
 
     self.fInternetStateView.indicatorColor = colorForInternetState(internetState.state);

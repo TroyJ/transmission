@@ -443,6 +443,24 @@ struct tr_session_stats
 /** @brief Get bandwidth use statistics for the current session */
 tr_session_stats tr_sessionGetStats(tr_session const* session);
 
+/**
+ * @brief Disk health, for a GUI to show instead of looking frozen.
+ *
+ * Bytes received but not yet on disk build up only when the disk is slower
+ * than the download; a lock-hold max above a second or so is a bug. The same
+ * numbers are served by RPC `session-stats` as `disk_*`.
+ */
+struct tr_session_disk_stats
+{
+    uint64_t pending_write_bytes; /* queued for the write worker right now */
+    uint64_t lock_hold_max_msec; /* longest session-lock hold so far */
+    uint64_t slow_op_count; /* disk ops that took >= 1 s */
+    uint64_t worst_op_msec; /* the slowest disk op so far... */
+    char const* worst_op; /* ...and what it was: "write", "close", ... (static string) */
+};
+
+tr_session_disk_stats tr_sessionGetDiskStats(tr_session const* session);
+
 /** @brief Get cumulative bandwidth statistics for current and past sessions */
 tr_session_stats tr_sessionGetCumulativeStats(tr_session const* session);
 

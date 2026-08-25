@@ -37,6 +37,7 @@ typedef NS_ENUM(NSUInteger, InternetStateIndicatorState) {
                     upload:(CGFloat)ulRate
               sessionStats:(tr_session_stats)sessionStats
            cumulativeStats:(tr_session_stats)cumulativeStats
+                 diskStats:(tr_session_disk_stats)diskStats
              internetState:(InternetStateIndicatorSnapshot*)internetState;
 
 - (void)updateSpeedFieldsToolTips;

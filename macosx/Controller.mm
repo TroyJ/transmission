@@ -157,6 +157,7 @@ typedef struct
 @property(nonatomic) tr_port_forwarding_state portForwardingState;
 @property(nonatomic) tr_session_stats sessionStats;
 @property(nonatomic) tr_session_stats cumulativeStats;
+@property(nonatomic) tr_session_disk_stats diskStats;
 
 @end
 
@@ -386,6 +387,7 @@ static void removeKeRangerRansomware()
 @property(nonatomic) tr_port_forwarding_state fMainWindowCachedPortForwardingState;
 @property(nonatomic) tr_session_stats fMainWindowCachedSessionStats;
 @property(nonatomic) tr_session_stats fMainWindowCachedCumulativeStats;
+@property(nonatomic) tr_session_disk_stats fMainWindowCachedDiskStats;
 
 @property(nonatomic) StatusBarController* fStatusBar;
 @property(nonatomic) PortChecker* fInternetStatePortChecker;
@@ -730,6 +732,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         _fMainWindowPendingPieceTorrentHashes = [NSSet set];
         _fMainWindowCachedSessionStats = {};
         _fMainWindowCachedCumulativeStats = {};
+        _fMainWindowCachedDiskStats = {};
 
         NSURLSessionConfiguration* configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
         configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
@@ -866,6 +869,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     //you would think this would be called later in this method from updateUI, but it's not reached in awakeFromNib
     //this must be called after showStatusBar:
     [self.fStatusBar updateWithDownload:0.0 upload:0.0 sessionStats:(tr_session_stats) {} cumulativeStats:(tr_session_stats) {}
+        diskStats:(tr_session_disk_stats) {}
         internetState:[self internetStateSnapshotForState:InternetStateIndicatorStateYellow hasActiveTorrents:NO
                                                       now:[NSDate timeIntervalSinceReferenceDate]]];
 
@@ -3023,6 +3027,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             sample.portForwardingState = tr_sessionGetPortForwarding(session);
             sample.sessionStats = tr_sessionGetStats(session);
             sample.cumulativeStats = tr_sessionGetCumulativeStats(session);
+            sample.diskStats = tr_sessionGetDiskStats(session); // lock-free
         }
 
         sample.torrentSnapshots = torrentSnapshots;
@@ -3071,6 +3076,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         self.fMainWindowCachedPortForwardingState = sample.portForwardingState;
         self.fMainWindowCachedSessionStats = sample.sessionStats;
         self.fMainWindowCachedCumulativeStats = sample.cumulativeStats;
+        self.fMainWindowCachedDiskStats = sample.diskStats;
         self.fMainWindowSampleAppliedGeneration = sample.generation;
 
         [self refreshMainWindowFromCachedState];
@@ -3139,6 +3145,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
             [self.fStatusBar updateWithDownload:dlRate upload:ulRate sessionStats:self.fMainWindowCachedSessionStats
                                 cumulativeStats:self.fMainWindowCachedCumulativeStats
+                                      diskStats:self.fMainWindowCachedDiskStats
                                   internetState:internetStateSnapshot];
 
             self.fClearCompletedButton.hidden = !anyCompleted;

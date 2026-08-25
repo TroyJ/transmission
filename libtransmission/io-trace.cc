@@ -306,9 +306,25 @@ bool session_lock_held() noexcept
     return tr_session_lock_depth() > 0U;
 }
 
+// I/O on the config dir -- resume files, .torrent copies, blocklists,
+// dht.dat -- is on the boot volume, is small, and has always been done under
+// the lock. It is not what freezes the app, and it drowns the report. It is
+// still counted; it is just not printed or aborted on.
+[[nodiscard]] bool is_config_dir_io(std::string_view path) noexcept
+{
+    for (auto const needle : { "/Resume/"sv, "/Torrents/"sv, "/blocklists"sv, "/dht.dat"sv, ".resume"sv, ".torrent"sv })
+    {
+        if (path.find(needle) != std::string_view::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void report_locked_io(Op op, std::string_view note)
 {
-    if (!enabled())
+    if (!enabled() || is_config_dir_io(note))
     {
         return; // counted in locked_stats by record(); nothing to print
     }

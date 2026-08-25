@@ -39,6 +39,7 @@
 #include "libtransmission/file.h"
 #include "libtransmission/ip-cache.h"
 #include "libtransmission/interned-string.h"
+#include "libtransmission/io-trace.h"
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
 #include "libtransmission/peer-mgr.h"
@@ -2413,6 +2414,18 @@ void tr_sessionSetCompletenessCallback(tr_session* session, tr_torrent_completen
 tr_session_stats tr_sessionGetStats(tr_session const* session)
 {
     return session->stats().current();
+}
+
+tr_session_disk_stats tr_sessionGetDiskStats(tr_session const* session)
+{
+    auto const snap = tr_io_trace::snapshot();
+    auto out = tr_session_disk_stats{};
+    out.pending_write_bytes = session->cache ? session->cache->pending_write_bytes() : 0U;
+    out.lock_hold_max_msec = snap.lock_hold_max_usec / 1000U;
+    out.slow_op_count = snap.slow_op_count;
+    out.worst_op_msec = snap.worst_op_usec / 1000U;
+    out.worst_op = tr_io_trace::op_name(snap.worst_op);
+    return out;
 }
 
 tr_session_stats tr_sessionGetCumulativeStats(tr_session const* session)
