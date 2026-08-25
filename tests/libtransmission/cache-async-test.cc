@@ -7,12 +7,14 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include <libtransmission/transmission.h>
 
 #include <libtransmission/cache.h>
+#include <libtransmission/file.h>
 #include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/values.h>
@@ -295,6 +297,44 @@ TEST_F(CacheAsyncTest, continuationWaitsForThePendingWritesWithoutBlocking)
     EXPECT_TRUE(waitFor([&fired]() { return fired.load(); }, 5000)) << "the continuation never ran";
 
     in_session_thread(session_, [this]() { session_->cache->drain(); });
+}
+
+TEST_F(CacheAsyncTest, removingATorrentWithDataDoesNotWaitForTheDisk)
+{
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+    auto const tor_id = tor->id();
+
+    // Park a flush on the "disk"...
+    session_->cache->set_write_paused(true);
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            session_->cache->write_block(tor->id(), 0, make_block(tor, 0));
+            EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+        });
+    EXPECT_LT(0U, session_->cache->pending_write_bytes());
+
+    auto const path = std::string{ tor->found_file_path(0).value_or("") };
+    ASSERT_FALSE(std::empty(path));
+
+    // ...and remove the torrent with its data. This used to drain the worker
+    // on the session thread: with the disk stalled, the app stopped here.
+    tr_torrentRemove(tor, true, nullptr, nullptr);
+
+    // The torrent is gone from the session at once, disk or no disk...
+    EXPECT_TRUE(waitFor([this, tor_id]() { return session_->torrents().get(tor_id) == nullptr; }, 5000));
+
+    // ...and the session thread is still answering.
+    auto ran = std::atomic<bool>{ false };
+    session_->run_in_session_thread([&ran]() { ran = true; });
+    EXPECT_TRUE(waitFor([&ran]() { return ran.load(); }, 5000)) << "the session thread is blocked on the disk";
+
+    // The file is only deleted once the disk has caught up.
+    EXPECT_TRUE(tr_sys_path_exists(path.c_str()));
+    session_->cache->set_write_paused(false);
+    EXPECT_TRUE(waitFor([&path]() { return !tr_sys_path_exists(path.c_str()); }, 5000));
 }
 
 } // namespace libtransmission::test

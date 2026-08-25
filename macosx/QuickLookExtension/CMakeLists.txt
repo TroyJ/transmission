@@ -70,6 +70,10 @@ target_sources(${TR_NAME}-mac-qlappex
     PRIVATE
         ${RESOURCES})
 
+# Same reason as the main app (see ../CMakeLists.txt): Homebrew clang-tidy
+# cannot build the Foundation module for Objective-C++ sources.
+set_target_properties(${TR_NAME}-mac-qlappex PROPERTIES CXX_CLANG_TIDY "" OBJCXX_CLANG_TIDY "")
+
 set_target_properties(
     ${TR_NAME}-mac-qlappex
     PROPERTIES

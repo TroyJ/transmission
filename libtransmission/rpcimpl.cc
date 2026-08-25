@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2779,40 +2780,49 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
     return error_none;
 }
 
-[[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> freeSpace(
-    tr_session* /*session*/,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& args_out)
+void freeSpace(tr_session* session, tr_variant::Map const& args_in, struct tr_rpc_idle_data* idle_data)
 {
     using namespace JsonRpc;
 
     auto const path = args_in.value_if<std::string_view>(TR_KEY_path);
     if (!path)
     {
-        return { Error::INVALID_PARAMS, "directory path argument is missing"s };
+        tr_rpc_idle_done(idle_data, Error::INVALID_PARAMS, "directory path argument is missing"sv);
+        return;
     }
 
     if (tr_sys_path_is_relative(*path))
     {
-        return { Error::PATH_NOT_ABSOLUTE, "directory path is not absolute"s };
+        tr_rpc_idle_done(idle_data, Error::PATH_NOT_ABSOLUTE, "directory path is not absolute"sv);
+        return;
     }
 
-    // get the free space
-    auto const old_errno = errno;
-    auto error = tr_error{};
-    auto const capacity = tr_sys_path_get_capacity(*path, &error);
-    errno = old_errno;
+    // statfs() blocks for as long as the volume is stalled -- 5.3 s measured
+    // on an exFAT/FSKit disk -- so it runs on a throwaway thread and the reply
+    // is posted back to the session thread. Nothing here holds the lock
+    // meanwhile.
+    std::thread(
+        [session, idle_data, path = std::string{ *path }]()
+        {
+            auto error = tr_error{};
+            auto const capacity = tr_sys_path_get_capacity(path, &error);
+            auto const errmsg = error ? std::string{ error.message() } : std::string{};
 
-    // response
-    args_out.try_emplace(TR_KEY_path, *path);
-    args_out.try_emplace(TR_KEY_size_bytes, capacity ? capacity->free : -1);
-    args_out.try_emplace(TR_KEY_total_size, capacity ? capacity->total : -1);
-
-    if (error)
-    {
-        return { Error::SYSTEM_ERROR, tr_strerror(error.code()) };
-    }
-    return { Error::SUCCESS, {} };
+            session->run_in_session_thread(
+                [idle_data, path, capacity, errmsg]()
+                {
+                    idle_data->args_out.try_emplace(TR_KEY_path, path);
+                    idle_data->args_out.try_emplace(TR_KEY_size_bytes, capacity ? capacity->free : -1);
+                    idle_data->args_out.try_emplace(TR_KEY_total_size, capacity ? capacity->total : -1);
+                    if (!std::empty(errmsg))
+                    {
+                        tr_rpc_idle_done(idle_data, Error::SYSTEM_ERROR, errmsg);
+                        return;
+                    }
+                    tr_rpc_idle_done(idle_data, Error::SUCCESS, {});
+                });
+        })
+        .detach();
 }
 
 // ---
@@ -2831,7 +2841,6 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 using SyncHandler = std::pair<JsonRpc::Error::Code, std::string> (*)(tr_session*, tr_variant::Map const&, tr_variant::Map&);
 
 auto const sync_handlers = small::max_size_map<tr_quark, std::pair<SyncHandler, bool /*has_side_effects*/>, 20U>{ {
-    { TR_KEY_free_space, { freeSpace, false } },
     { TR_KEY_group_get, { groupGet, false } },
     { TR_KEY_group_set, { groupSet, true } },
     { TR_KEY_queue_move_bottom, { queueMoveBottom, true } },
@@ -2855,7 +2864,8 @@ auto const sync_handlers = small::max_size_map<tr_quark, std::pair<SyncHandler, 
 
 using AsyncHandler = void (*)(tr_session*, tr_variant::Map const&, tr_rpc_idle_data*);
 
-auto const async_handlers = small::max_size_map<tr_quark, std::pair<AsyncHandler, bool /*has_side_effects*/>, 4U>{ {
+auto const async_handlers = small::max_size_map<tr_quark, std::pair<AsyncHandler, bool /*has_side_effects*/>, 5U>{ {
+    { TR_KEY_free_space, { freeSpace, false } },
     { TR_KEY_blocklist_update, { blocklistUpdate, true } },
     { TR_KEY_port_test, { portTest, false } },
     { TR_KEY_torrent_add, { torrentAdd, true } },

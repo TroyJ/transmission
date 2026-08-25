@@ -827,8 +827,6 @@ void tr_torrentRemoveInSessionThread(tr_torrent* tor, bool delete_flag, tr_fileF
 
     if (delete_flag && tor->has_metainfo())
     {
-        // ensure the files are all closed and idle before moving
-        tor->session->close_torrent_files(tor->id());
         tor->session->verify_remove(tor);
         tor->session->relocate_remove(tor);
 
@@ -837,23 +835,15 @@ void tr_torrentRemoveInSessionThread(tr_torrent* tor, bool delete_flag, tr_fileF
             delete_func = start_stop_helpers::removeTorrentFile;
         }
 
-        auto const delete_func_wrapper = [&delete_func, delete_user_data](char const* filename)
-        {
-            delete_func(filename, delete_user_data, nullptr);
-        };
-
-        auto error = tr_error{};
+        /* The files are deleted on the disk thread once the torrent's queued
+         * writes and closes have landed. Nothing here waits for the disk:
+         * removing a torrent used to drain the write worker under the lock,
+         * which on a stalled volume meant the whole app waited. */
         tor->forget_found_paths();
-        tor->files().remove(tor->current_dir(), tor->name(), delete_func_wrapper, &error);
-        if (error)
-        {
-            tr_logAddWarnTor(
-                tor,
-                fmt::format(
-                    fmt::runtime(_("Couldn't remove all torrent files: {error} ({error_code})")),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-        }
+        tor->session->remove_torrent_files_async(
+            *tor,
+            [delete_func, delete_user_data](char const* filename) { delete_func(filename, delete_user_data, nullptr); },
+            std::string{ tor->name() });
     }
 
     tor->session->relocate_remove(tor);
@@ -1230,49 +1220,17 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
 {
     TR_ASSERT(session->am_in_session_thread());
 
-    auto ok = true;
-    if (move_from_old_path)
-    {
-        if (setme_state != nullptr)
-        {
-            *setme_state = TR_LOC_MOVING;
-        }
+    // Moving data is the relocation worker's job (see set_location()); this
+    // path only ever retargets a torrent whose files are not being moved. The
+    // old synchronous rename-or-copy branch, which also drained the write
+    // worker under the lock, had no remaining callers and is gone.
+    TR_ASSERT(!move_from_old_path);
 
-        // ensure the files are all closed and idle before moving
-        session->close_torrent_files(id());
-        session->verify_remove(this);
-
-        auto error = tr_error{};
-        ok = files().move(current_dir(), path, name(), &error);
-        if (error)
-        {
-            this->error().set_local_error(
-                fmt::format(
-                    fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
-                    fmt::arg("old_path", current_dir()),
-                    fmt::arg("path", path),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-            tr_torrentStop(this);
-        }
-    }
-
-    // tell the torrent where the files are
-    if (ok)
-    {
-        set_download_dir(path);
-
-        if (move_from_old_path)
-        {
-            incomplete_dir_.clear();
-            current_dir_ = download_dir();
-            forget_found_paths();
-        }
-    }
+    set_download_dir(path);
 
     if (setme_state != nullptr)
     {
-        *setme_state = ok ? TR_LOC_DONE : TR_LOC_ERROR;
+        *setme_state = TR_LOC_DONE;
     }
 }
 
@@ -2107,20 +2065,36 @@ bool tr_torrent::RelocateMediator::on_verified_location_ready()
                 return;
             }
 
-            session->close_torrent_files(tor->id());
-            tor->set_download_dir(snapshot.target_root);
-            tor->incomplete_dir_ = snapshot.source_root != snapshot.target_root ? tr_interned_string{ snapshot.source_root } :
-                                                                                  tr_interned_string{};
-            tor->refresh_current_dir();
-            tor->set_relocation_state(
-                TR_RELOC_DELETING_SOURCE,
-                tor->relocation_bytes_total_,
-                tor->relocation_bytes_total_,
-                0U,
-                {});
-            tor->save_resume_file();
-            session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
-            ready_promise.set_value(true);
+            /* The switch to the new location waits for the torrent's queued
+             * writes and closes -- but as a continuation, so the session
+             * thread is free meanwhile. The relocation worker (our caller)
+             * is the one that waits, on its own thread, which is fine. */
+            session->close_torrent_files_async(
+                torrent_id,
+                [session, torrent_id, snapshot, &ready_promise]()
+                {
+                    auto* const tor = session->torrents().get(torrent_id);
+                    if (tor == nullptr || tor->is_deleting_)
+                    {
+                        ready_promise.set_value(false);
+                        return;
+                    }
+
+                    tor->set_download_dir(snapshot.target_root);
+                    tor->incomplete_dir_ = snapshot.source_root != snapshot.target_root ?
+                        tr_interned_string{ snapshot.source_root } :
+                        tr_interned_string{};
+                    tor->refresh_current_dir();
+                    tor->set_relocation_state(
+                        TR_RELOC_DELETING_SOURCE,
+                        tor->relocation_bytes_total_,
+                        tor->relocation_bytes_total_,
+                        0U,
+                        {});
+                    tor->save_resume_file();
+                    session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
+                    ready_promise.set_value(true);
+                });
         });
 
     ready_future.wait();

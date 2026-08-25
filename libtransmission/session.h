@@ -836,6 +836,19 @@ public:
      */
     void close_torrent_files_async(tr_torrent_id_t tor_id, std::function<void()> on_closed);
 
+    /**
+     * Deletes a torrent's data without waiting for the disk.
+     *
+     * Flushes and closes are queued as usual; the deletion itself runs on the
+     * write worker once they have landed, so the torrent can be freed right
+     * away and neither the session thread nor the lock waits on a stalled
+     * volume. Takes copies of everything it needs: the torrent may be gone.
+     */
+    void remove_torrent_files_async(
+        tr_torrent const& tor,
+        std::function<void(char const* filename)> delete_func,
+        std::string log_name);
+
     // announce ip
 
     [[nodiscard]] constexpr std::string const& announceIP() const noexcept

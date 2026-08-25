@@ -2343,6 +2343,36 @@ void tr_session::close_torrent_files_async(tr_torrent_id_t const tor_id, std::fu
     this->cache->run_after_pending_writes(std::move(on_closed));
 }
 
+void tr_session::remove_torrent_files_async(
+    tr_torrent const& tor,
+    std::function<void(char const* filename)> delete_func,
+    std::string log_name)
+{
+    auto const tor_id = tor.id();
+    this->cache->flush_torrent(tor_id);
+    openFiles().close_torrent(tor_id);
+
+    this->cache->run_after_pending_writes_on_worker(
+        [files = tor.files(),
+         dir = std::string{ tor.current_dir().sv() },
+         name = std::string{ tor.name() },
+         delete_func = std::move(delete_func),
+         log_name = std::move(log_name)]()
+        {
+            auto error = tr_error{};
+            files.remove(dir, name, delete_func, &error);
+            if (error)
+            {
+                tr_logAddWarn(
+                    fmt::format(
+                        fmt::runtime(_("Couldn't remove all torrent files: {error} ({error_code})")),
+                        fmt::arg("error", error.message()),
+                        fmt::arg("error_code", error.code())),
+                    log_name);
+            }
+        });
+}
+
 void tr_session::close_torrent_file_async(tr_torrent const& tor, tr_file_index_t file_num, std::function<void()> on_closed)
 {
     this->cache->flush_file(tor, file_num); // queued, not written here

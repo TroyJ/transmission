@@ -179,6 +179,16 @@ void Cache::run_after_pending_writes(std::function<void()> on_session_thread)
     write_worker_.add(std::move(job));
 }
 
+void Cache::run_after_pending_writes_on_worker(std::function<void()> on_worker_thread)
+{
+    auto job = tr_disk_write_worker::Job{};
+    job.on_done = [cb = std::move(on_worker_thread)](int /*err*/)
+    {
+        cb();
+    };
+    write_worker_.add(std::move(job));
+}
+
 void Cache::close_fd_async(tr_sys_file_t const fd)
 {
     if (fd == TR_BAD_SYS_FILE)

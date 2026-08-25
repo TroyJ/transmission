@@ -103,6 +103,14 @@ public:
     void run_after_pending_writes(std::function<void()> on_session_thread);
 
     /**
+     * Like run_after_pending_writes(), but `on_worker_thread` runs on the
+     * write worker itself. For work that is disk I/O in its own right -- e.g.
+     * deleting a removed torrent's files -- and so belongs on the disk thread,
+     * not the session thread. Must not touch session or torrent state.
+     */
+    void run_after_pending_writes_on_worker(std::function<void()> on_worker_thread);
+
+    /**
      * Closes a descriptor on the write worker instead of here.
      *
      * Installed as tr_open_files' close handler. The worker's FIFO ordering

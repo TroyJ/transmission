@@ -638,6 +638,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         tr_variantDictAddBool(&settings, TR_KEY_torrent_complete_verify_enabled, [_fDefaults boolForKey:@"VerifyDataOnCompletion"]);
         tr_variantDictAddBool(&settings, TR_KEY_lpd_enabled, [_fDefaults boolForKey:@"LocalPeerDiscoveryGlobal"]);
         tr_variantDictAddInt(&settings, TR_KEY_message_level, TR_LOG_DEBUG);
+        // Write-cache size. The flush-policy benchmark (scripts/cachebench.py,
+        // docs/HANDOVER-disk-stalls-and-2a.md §2.3) puts the knee at 32 MiB for
+        // sequential-by-default; libtransmission's own default is 4 MiB. Set
+        // via RPC it did not survive a restart, since these settings come from
+        // the mac prefs -- so it lives here now.
+        tr_variantDictAddInt(&settings, TR_KEY_cache_size_mib, [_fDefaults integerForKey:@"CacheSizeMiB"]);
         tr_variantDictAddInt(&settings, TR_KEY_peer_limit_global, [_fDefaults integerForKey:@"PeersTotal"]);
         tr_variantDictAddInt(&settings, TR_KEY_peer_limit_per_torrent, [_fDefaults integerForKey:@"PeersTorrent"]);
 
