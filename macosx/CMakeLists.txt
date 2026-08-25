@@ -190,6 +190,8 @@ target_sources(${TR_NAME}-mac
         TorrentCellRevealButton.mm
         TorrentGroup.h
         TorrentGroup.mm
+        TorrentTableColumns.h
+        TorrentTableColumns.mm
         TorrentTableView.h
         TorrentTableView.mm
         TrackerCell.h

@@ -27,6 +27,7 @@
 #import "Torrent.h"
 #import "TorrentGroup.h"
 #import "TorrentTableView.h"
+#import "TorrentTableColumns.h"
 #import "CreatorWindowController.h"
 #import "StatsWindowController.h"
 #import "InfoWindowController.h"
@@ -823,7 +824,10 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     //set table size
     BOOL const small = [self.fDefaults boolForKey:@"SmallView"];
-    self.fTableView.rowHeight = small ? kRowHeightSmall : kRowHeightRegular;
+    self.fTableView.rowHeight = small || [TorrentTableColumns isEnabled] ? kRowHeightSmall : kRowHeightRegular;
+    [self installTableViewModeMenuItem];
+    [TorrentTableColumns applyToTableView:self.fTableView enabled:[TorrentTableColumns isEnabled]];
+    [self syncTableModeSortIndicator];
     self.fTableView.usesAutomaticRowHeights = NO;
     self.fTableView.floatsGroupRows = YES;
     //self.fTableView.usesAlternatingRowBackgroundColors = !small;
@@ -3802,6 +3806,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     [self.fDefaults setObject:sortType forKey:@"Sort"];
 
     [self sortTorrentsAndIncludeQueueOrder:YES];
+    [self syncTableModeSortIndicator];
 }
 
 - (void)setSortByGroup:(id)sender
@@ -4886,9 +4891,9 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             NSUInteger i = 0;
             for (Torrent* torrent in self.fTorrents)
             {
-                torrent.queuePosition = i++;
-                [torrent update];
+                torrent.queuePosition = i++; // one lock take each; the refresh is a single sample, not one per torrent
             }
+            [self requestMainWindowSample];
 
             //do the drag animation here so that the dragged torrents are the ones that are animated as moving, and not the torrents around them
             [self.fTableView beginUpdates];
@@ -5065,6 +5070,76 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }
 
     return NO;
+}
+
+// qB-style table mode (fork feature, additive; see plans/qb-style-table-view.md)
+
+- (void)installTableViewModeMenuItem
+{
+    for (NSMenuItem* top in NSApp.mainMenu.itemArray)
+    {
+        NSInteger const idx = [top.submenu indexOfItemWithTarget:self andAction:@selector(toggleSmallView:)];
+        if (idx != -1)
+        {
+            NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:NSLocalizedString(@"Table View", "View menu -> table mode")
+                                                          action:@selector(toggleTableView:)
+                                                   keyEquivalent:@""];
+            item.target = self;
+            [top.submenu insertItem:item atIndex:idx + 1];
+            return;
+        }
+    }
+}
+
+- (void)toggleTableView:(id)sender
+{
+    BOOL const enable = ![TorrentTableColumns isEnabled];
+    [self.fDefaults setBool:enable forKey:kTorrentTableViewModeDefaultsKey];
+
+    [TorrentTableColumns applyToTableView:self.fTableView enabled:enable];
+    self.fTableView.rowHeight = enable || [self.fDefaults boolForKey:@"SmallView"] ? kRowHeightSmall : kRowHeightRegular;
+
+    [self.fTableView beginUpdates];
+    [self.fTableView
+        noteHeightOfRowsWithIndexesChanged:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, self.fTableView.numberOfRows)]];
+    [self.fTableView endUpdates];
+
+    [self syncTableModeSortIndicator];
+    [self.fTableView reloadData];
+    [self updateForAutoSize];
+}
+
+- (void)setSortType:(NSString*)sortType reverse:(BOOL)reverse
+{
+    if (sortType == nil)
+    {
+        return;
+    }
+    [self.fDefaults setObject:sortType forKey:@"Sort"];
+    [self.fDefaults setBool:reverse forKey:@"SortReverse"];
+    [self sortTorrentsAndIncludeQueueOrder:YES];
+}
+
+- (void)syncTableModeSortIndicator
+{
+    if (![TorrentTableColumns isEnabled])
+    {
+        return;
+    }
+    NSString* sortType = [self.fDefaults stringForKey:@"Sort"];
+    NSString* columnIdentifier = [TorrentTableColumns columnIdentifierForSortType:sortType];
+    NSTableColumn* column = columnIdentifier != nil ? [self.fTableView tableColumnWithIdentifier:columnIdentifier] : nil;
+    if (column != nil && column.sortDescriptorPrototype != nil)
+    {
+        BOOL const asc = ![self.fDefaults boolForKey:@"SortReverse"];
+        // set without re-entering sortDescriptorsDidChange's sort (same values → no change in defaults)
+        self.fTableView.sortDescriptors = @[ [NSSortDescriptor sortDescriptorWithKey:column.sortDescriptorPrototype.key
+                                                                           ascending:asc] ];
+    }
+    else
+    {
+        self.fTableView.sortDescriptors = @[];
+    }
 }
 
 - (void)toggleSmallView:(id)sender
@@ -5726,6 +5801,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
         menuItem.state = checked ? NSControlStateValueOn : NSControlStateValueOff;
         return canUseTable && self.fTableView.numberOfSelectedRows > 0;
+    }
+
+    if (action == @selector(toggleTableView:))
+    {
+        menuItem.state = [TorrentTableColumns isEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+        return YES;
     }
 
     if (action == @selector(toggleSmallView:))

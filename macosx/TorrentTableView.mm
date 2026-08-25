@@ -5,6 +5,7 @@
 #import "CocoaCompatibility.h"
 
 #import "TorrentTableView.h"
+#import "TorrentTableColumns.h"
 #import "Controller.h"
 #import "FileListNode.h"
 #import "InfoOptionsViewController.h"
@@ -159,12 +160,29 @@ static NSTimeInterval const kToggleProgressSeconds = 0.175;
             }
         }];
 
-        [self reloadDataForRowIndexes:visibleIndexSet columnIndexes:[NSIndexSet indexSetWithIndex:0]];
+        [self reloadDataForRowIndexes:visibleIndexSet columnIndexes:self.reloadColumnIndexes];
     }
     else
     {
-        [self reloadDataForRowIndexes:[NSIndexSet indexSetWithIndexesInRange:range] columnIndexes:[NSIndexSet indexSetWithIndex:0]];
+        [self reloadDataForRowIndexes:[NSIndexSet indexSetWithIndexesInRange:range] columnIndexes:self.reloadColumnIndexes];
     }
+}
+
+- (NSIndexSet*)reloadColumnIndexes
+{
+    // classic mode has one column; table mode refreshes every column of a visible row
+    return [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, MAX(self.numberOfColumns, 1))];
+}
+
+- (void)outlineView:(NSOutlineView*)outlineView sortDescriptorsDidChange:(NSArray<NSSortDescriptor*>*)oldDescriptors
+{
+    // header click in table mode: the descriptor key is a Controller SortType
+    NSSortDescriptor* descriptor = self.sortDescriptors.firstObject;
+    if (descriptor == nil)
+    {
+        return;
+    }
+    [(id)NSApp.delegate setSortType:descriptor.key reverse:!descriptor.ascending];
 }
 
 - (void)reloadDataForRowIndexes:(NSIndexSet*)rowIndexes columnIndexes:(NSIndexSet*)columnIndexes
@@ -172,7 +190,7 @@ static NSTimeInterval const kToggleProgressSeconds = 0.175;
     [super reloadDataForRowIndexes:rowIndexes columnIndexes:columnIndexes];
 
     //redraw fControlButton
-    BOOL minimal = [self.fDefaults boolForKey:@"SmallView"];
+    BOOL minimal = [self.fDefaults boolForKey:@"SmallView"] || [TorrentTableColumns isEnabled];
     [rowIndexes enumerateIndexesUsingBlock:^(NSUInteger row, BOOL*) {
         id rowItem = [self itemAtRow:row];
         if (![rowItem isKindOfClass:[TorrentGroup class]])
@@ -241,10 +259,41 @@ static NSTimeInterval const kToggleProgressSeconds = 0.175;
 
 - (NSView*)outlineView:(NSOutlineView*)outlineView viewForTableColumn:(NSTableColumn*)tableColumn item:(id)item
 {
+    // qB-style table mode: every column but the xib's outline column is a plain
+    // text cell fed from the same cached getters the classic row uses.
+    if (tableColumn != nil && ![tableColumn.identifier isEqualToString:kTorrentTableOutlineColumnIdentifier])
+    {
+        if (![item isKindOfClass:[Torrent class]])
+        {
+            return nil; // group rows draw in the outline column only
+        }
+        NSTableCellView* cell = [outlineView makeViewWithIdentifier:@"TableModeTextCell" owner:self];
+        if (cell == nil)
+        {
+            cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, tableColumn.width, self.rowHeight)];
+            cell.identifier = @"TableModeTextCell";
+            NSTextField* field = [NSTextField labelWithString:@""];
+            field.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+            field.lineBreakMode = NSLineBreakByTruncatingTail;
+            field.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell addSubview:field];
+            cell.textField = field;
+            [NSLayoutConstraint activateConstraints:@[
+                [field.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:4],
+                [field.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-4],
+                [field.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+            ]];
+        }
+        cell.textField.stringValue = [TorrentTableColumns stringForColumnIdentifier:tableColumn.identifier torrent:item] ?: @"";
+        cell.textField.alignment = [TorrentTableColumns alignmentForColumnIdentifier:tableColumn.identifier];
+        cell.objectValue = item;
+        return cell;
+    }
+
     if ([item isKindOfClass:[Torrent class]])
     {
         Torrent* torrent = (Torrent*)item;
-        BOOL const minimal = [self.fDefaults boolForKey:@"SmallView"];
+        BOOL const minimal = [self.fDefaults boolForKey:@"SmallView"] || [TorrentTableColumns isEnabled];
         BOOL const error = torrent.anyErrorOrWarning;
 
         TorrentCell* torrentCell;
