@@ -522,14 +522,20 @@ void onStartQueue(tr_session* /*session*/, tr_torrent* /*tor*/, void* /*vself*/)
     });
 }
 
+// These callbacks run on the session thread with the lock held, so the
+// snapshot and the data location (a path-cache hit at completion time) are
+// taken here; the main thread then applies them without a lock, a stat(), or
+// an xattr write of its own (1a review findings F1/F2).
 void onIdleLimitHit(tr_session* /*session*/, tr_torrent* tor, void* vself)
 {
     auto* const controller = (__bridge Controller*)(vself);
     auto const hashstr = @(tr_torrentView(tor).hash_string);
+    TorrentMainWindowSnapshot* snapshot = [Torrent mainWindowSnapshotForTorrentStruct:tor includePieces:NO];
+    NSString* location = [Torrent dataLocationForTorrentStruct:tor];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         auto* const torrent = [controller torrentForHash:hashstr];
-        [torrent idleLimitHit];
+        [torrent idleLimitHitWithSnapshot:snapshot dataLocation:location];
     });
 }
 
@@ -537,10 +543,12 @@ void onRatioLimitHit(tr_session* /*session*/, tr_torrent* tor, void* vself)
 {
     auto* const controller = (__bridge Controller*)(vself);
     auto const hashstr = @(tr_torrentView(tor).hash_string);
+    TorrentMainWindowSnapshot* snapshot = [Torrent mainWindowSnapshotForTorrentStruct:tor includePieces:NO];
+    NSString* location = [Torrent dataLocationForTorrentStruct:tor];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         auto* const torrent = [controller torrentForHash:hashstr];
-        [torrent ratioLimitHit];
+        [torrent ratioLimitHitWithSnapshot:snapshot dataLocation:location];
     });
 }
 
@@ -559,10 +567,12 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 {
     auto* const controller = (__bridge Controller*)(vself);
     auto const hashstr = @(tr_torrentView(tor).hash_string);
+    TorrentMainWindowSnapshot* snapshot = [Torrent mainWindowSnapshotForTorrentStruct:tor includePieces:NO];
+    NSString* location = [Torrent dataLocationForTorrentStruct:tor];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         auto* const torrent = [controller torrentForHash:hashstr];
-        [torrent completenessChange:status wasRunning:wasRunning];
+        [torrent completenessChange:status wasRunning:wasRunning snapshot:snapshot dataLocation:location];
     });
 }
 
@@ -3216,13 +3226,17 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         return;
     }
 
-    if (sample.generation >= self.fMainWindowSampleRequestedGeneration && sample.generation > self.fMainWindowSampleAppliedGeneration)
+    // Monotonic only: a sample older than the newest *request* is still newer
+    // than anything applied. Requiring >= requested dropped every sample once
+    // sampling latency exceeded the 1 s tick -- exactly the stall regime --
+    // and froze the window instead of letting it lag.
+    if (sample.generation > self.fMainWindowSampleAppliedGeneration)
     {
         BOOL anyInspectorData = NO;
         for (TorrentMainWindowSnapshot* snapshot in sample.torrentSnapshots)
         {
             Torrent* torrent = self.fTorrentHashes[snapshot.hashString];
-            if (torrent != nil)
+            if (torrent != nil && torrent.torrentId == snapshot.torrentId)
             {
                 [torrent applyMainWindowSnapshot:snapshot];
                 if (snapshot.includesInspectorData)
@@ -3538,7 +3552,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
         NSString* title = NSLocalizedString(@"Download Complete", "notification title");
         NSString* body = torrent.name;
-        NSString* location = torrent.dataLocation;
+        NSString* location = notification.userInfo[@"Location"]; // resolved on the session thread; no stat() here
         NSMutableDictionary* userInfo = [NSMutableDictionary dictionaryWithObject:torrent.hashString forKey:@"Hash"];
         if (location)
         {
@@ -3561,8 +3575,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         }
 
         //bounce download stack
-        [NSDistributedNotificationCenter.defaultCenter postNotificationName:@"com.apple.DownloadFileFinished"
-                                                                     object:torrent.dataLocation];
+        [NSDistributedNotificationCenter.defaultCenter postNotificationName:@"com.apple.DownloadFileFinished" object:location];
     }
 
     [self refreshMainWindowReadUI];
@@ -3591,7 +3604,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     NSString* title = NSLocalizedString(@"Seeding Complete", "notification title");
     NSString* body = torrent.name;
-    NSString* location = torrent.dataLocation;
+    NSString* location = notification.userInfo[@"Location"]; // resolved on the session thread; no stat() here
     NSMutableDictionary* userInfo = [NSMutableDictionary dictionaryWithObject:torrent.hashString forKey:@"Hash"];
     if (location)
     {

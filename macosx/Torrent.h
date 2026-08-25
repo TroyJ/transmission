@@ -12,6 +12,7 @@
 @interface TorrentMainWindowSnapshot : NSObject
 
 @property(nonatomic, readonly, copy) NSString* hashString;
+@property(nonatomic, readonly) int torrentId; ///< so a re-added torrent with the same hash never receives a stale snapshot
 @property(nonatomic, readonly) tr_stat stat;
 @property(nonatomic, readonly, copy) NSString* name;
 @property(nonatomic, getter=isMagnet, readonly) BOOL magnet;
@@ -94,6 +95,8 @@ typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
                                   lib:(tr_session*)lib
                              snapshot:(TorrentMainWindowSnapshot*)snapshot;
 + (void)updateTimeMachineExcludeForStruct:(tr_torrent*)torrentStruct;
+/// Where the data is, resolved from the live struct (session thread / command queue); nil when nothing is on disk.
++ (NSString*)dataLocationForTorrentStruct:(tr_torrent*)torrentStruct;
 - (instancetype)initWithMagnetAddress:(NSString*)address location:(NSString*)location lib:(tr_session*)lib;
 - (void)setResumeStatusForTorrent:(Torrent*)torrent withHistory:(NSDictionary*)history forcePause:(BOOL)pause;
 
@@ -132,10 +135,13 @@ typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
 - (void)stopTransfer;
 - (void)sleep;
 - (void)wakeUp;
-- (void)idleLimitHit;
-- (void)ratioLimitHit;
+- (void)idleLimitHitWithSnapshot:(TorrentMainWindowSnapshot*)snapshot dataLocation:(NSString*)dataLocation;
+- (void)ratioLimitHitWithSnapshot:(TorrentMainWindowSnapshot*)snapshot dataLocation:(NSString*)dataLocation;
 - (void)metadataRetrieved;
-- (void)completenessChange:(tr_completeness)status wasRunning:(BOOL)wasRunning;
+- (void)completenessChange:(tr_completeness)status
+                wasRunning:(BOOL)wasRunning
+                  snapshot:(TorrentMainWindowSnapshot*)snapshot
+              dataLocation:(NSString*)dataLocation;
 
 @property(nonatomic) NSUInteger queuePosition;
 

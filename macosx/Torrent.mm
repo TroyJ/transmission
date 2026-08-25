@@ -65,6 +65,7 @@ static NSString* stringFromTorrentCString(char const* value)
 @property(nonatomic, copy) NSString* errorString;
 @property(nonatomic, copy) NSString* relocationErrorString;
 
+@property(nonatomic, readwrite) int torrentId;
 @property(nonatomic, readwrite) BOOL includesInspectorData;
 @property(nonatomic, readwrite, copy) NSArray<NSDictionary*>* peers;
 @property(nonatomic, readwrite, copy) NSArray<NSDictionary*>* webSeeds;
@@ -284,6 +285,7 @@ static TorrentMainWindowSnapshot* torrentMainWindowSnapshot(tr_torrent* torrentS
     {
         return nil;
     }
+    auto const torrentId = tr_torrentId(torrentStruct);
 
     tr_stat stat = *tr_torrentStat(torrentStruct);
     auto const view = tr_torrentView(torrentStruct);
@@ -323,24 +325,29 @@ static TorrentMainWindowSnapshot* torrentMainWindowSnapshot(tr_torrent* torrentS
         piecePercentData = mutablePiecePercentData;
     }
 
-    return [[TorrentMainWindowSnapshot alloc] initWithHashString:hashString stat:stat errorString:errorString
-                                           relocationErrorString:relocationErrorString
-                                                            name:name
-                                                          magnet:magnet
-                                                          folder:folder
-                                                            size:size
-                                                       pieceSize:pieceSize
-                                                      pieceCount:pieceCount
-                                                  privateTorrent:privateTorrent
-                                                        priority:priority
-                                                 allTrackersFlat:allTrackers
-                                                  trackerSortKey:bestTrackerSortKey
-                                               canManualAnnounce:tr_torrentCanManualUpdate(torrentStruct)
-                                              canRetryRelocation:tr_torrentCanRetryRelocation(torrentStruct)
-                                             canResumeRelocation:tr_torrentCanResumeRelocation(torrentStruct)
-                                             canCancelRelocation:tr_torrentCanCancelRelocation(torrentStruct)
-                                                piecePercentData:piecePercentData
-                                        includesPiecePercentData:includePieces];
+    TorrentMainWindowSnapshot* built = [[TorrentMainWindowSnapshot alloc]
+              initWithHashString:hashString
+                            stat:stat
+                     errorString:errorString
+           relocationErrorString:relocationErrorString
+                            name:name
+                          magnet:magnet
+                          folder:folder
+                            size:size
+                       pieceSize:pieceSize
+                      pieceCount:pieceCount
+                  privateTorrent:privateTorrent
+                        priority:priority
+                 allTrackersFlat:allTrackers
+                  trackerSortKey:bestTrackerSortKey
+               canManualAnnounce:tr_torrentCanManualUpdate(torrentStruct)
+              canRetryRelocation:tr_torrentCanRetryRelocation(torrentStruct)
+             canResumeRelocation:tr_torrentCanResumeRelocation(torrentStruct)
+             canCancelRelocation:tr_torrentCanCancelRelocation(torrentStruct)
+                piecePercentData:piecePercentData
+        includesPiecePercentData:includePieces];
+    built.torrentId = torrentId;
+    return built;
 }
 
 @interface Torrent ()
@@ -721,6 +728,12 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
         addInspectorData(snapshot, torrentStruct);
     }
     return snapshot;
+}
+
++ (NSString*)dataLocationForTorrentStruct:(tr_torrent*)torrentStruct
+{
+    auto const view = tr_torrentView(torrentStruct);
+    return dataLocationForTorrentStruct(torrentStruct, !tr_torrentHasMetadata(torrentStruct), view.is_folder, @(tr_torrentName(torrentStruct)));
 }
 
 - (TorrentMainWindowSnapshot*)createMainWindowSnapshotIncludingPieces:(BOOL)includePieces
@@ -2769,52 +2782,79 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     }];
 }
 
-- (void)completenessChange:(tr_completeness)status wasRunning:(BOOL)wasRunning
+- (void)completenessChange:(tr_completeness)status
+                wasRunning:(BOOL)wasRunning
+                  snapshot:(TorrentMainWindowSnapshot*)snapshot
+              dataLocation:(NSString*)dataLocation
 {
-    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO]; // don't call update yet to avoid auto-stop
+    // Everything the main thread needs arrived with the callback; nothing here
+    // takes the session lock or touches the data volume.
+    if (snapshot != nil && self.fHandle != nullptr && snapshot.torrentId == self.torrentId)
+    {
+        [self applyMainWindowSnapshot:snapshot];
+    }
+
+    NSMutableDictionary* statusInfo = [@{ @"Status" : @(status), @"WasRunning" : @(wasRunning) } mutableCopy];
+    if (dataLocation != nil)
+    {
+        statusInfo[@"Location"] = dataLocation;
+    }
 
     switch (status)
     {
     case TR_SEED:
     case TR_PARTIAL_SEED:
         {
-            NSDictionary* statusInfo = @{@"Status" : @(status), @"WasRunning" : @(wasRunning)};
             [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentFinishedDownloading" object:self userInfo:statusInfo];
 
-            //quarantine the finished data
-            NSString* dataLocation = [self.currentDirectory stringByAppendingPathComponent:self.name];
-            NSURL* dataLocationUrl = [NSURL fileURLWithPath:dataLocation];
-            NSDictionary* quarantineProperties = @{
-                (NSString*)kLSQuarantineTypeKey : (NSString*)kLSQuarantineTypeOtherDownload
-            };
-            NSError* error = nil;
-            if (![dataLocationUrl setResourceValue:quarantineProperties forKey:NSURLQuarantinePropertiesKey error:&error])
-            {
-                NSLog(@"Failed to quarantine %@: %@", dataLocation, error.description);
-            }
+            //quarantine the finished data -- an xattr write on the data volume, off the main thread
+            NSString* quarantinePath = [self.currentDirectory stringByAppendingPathComponent:self.name];
+            dispatch_async(timeMachineExcludeQueue, ^{
+                NSURL* dataLocationUrl = [NSURL fileURLWithPath:quarantinePath];
+                NSDictionary* quarantineProperties = @{
+                    (NSString*)kLSQuarantineTypeKey : (NSString*)kLSQuarantineTypeOtherDownload
+                };
+                NSError* error = nil;
+                if (![dataLocationUrl setResourceValue:quarantineProperties forKey:NSURLQuarantinePropertiesKey error:&error])
+                {
+                    NSLog(@"Failed to quarantine %@: %@", quarantinePath, error.description);
+                }
+            });
             break;
         }
     case TR_LEECH:
-        [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentRestartedDownloading" object:self];
+        [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentRestartedDownloading" object:self userInfo:statusInfo];
         break;
     }
 
-    [self update];
-    [self updateTimeMachineExclude];
+    if (dataLocation != nil)
+    {
+        BOOL const exclude = status == TR_LEECH; // mirrors updateTimeMachineExclude without the stat()
+        dispatch_async(timeMachineExcludeQueue, ^{
+            CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:dataLocation], exclude, false);
+        });
+    }
 }
 
-- (void)ratioLimitHit
+- (void)ratioLimitHitWithSnapshot:(TorrentMainWindowSnapshot*)snapshot dataLocation:(NSString*)dataLocation
 {
-    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO];
-
-    [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentFinishedSeeding" object:self];
+    [self limitHitWithSnapshot:snapshot dataLocation:dataLocation];
 }
 
-- (void)idleLimitHit
+- (void)limitHitWithSnapshot:(TorrentMainWindowSnapshot*)snapshot dataLocation:(NSString*)dataLocation
 {
-    [self refreshMainWindowCachedStateIncludingPieces:NO postActivityNotification:NO];
+    if (snapshot != nil && self.fHandle != nullptr && snapshot.torrentId == self.torrentId)
+    {
+        [self applyMainWindowSnapshot:snapshot];
+    }
 
-    [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentFinishedSeeding" object:self];
+    NSDictionary* userInfo = dataLocation != nil ? @{ @"Location" : dataLocation } : @{};
+    [NSNotificationCenter.defaultCenter postNotificationName:@"TorrentFinishedSeeding" object:self userInfo:userInfo];
+}
+
+- (void)idleLimitHitWithSnapshot:(TorrentMainWindowSnapshot*)snapshot dataLocation:(NSString*)dataLocation
+{
+    [self limitHitWithSnapshot:snapshot dataLocation:dataLocation];
 }
 
 - (void)metadataRetrieved
