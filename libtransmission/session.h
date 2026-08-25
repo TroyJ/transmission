@@ -1153,6 +1153,11 @@ public:
     void run_disk_task(std::function<void()> task);
     [[nodiscard]] bool relocate_add(std::unique_ptr<tr_relocate_worker::Mediator> mediator, tr_priority_t priority);
     void relocate_remove(tr_torrent const* tor);
+
+    // Delete staged copies + journals of relocations whose torrent no longer
+    // exists. Called once after the torrents are loaded; the disk walk runs
+    // off the session thread.
+    void sweep_stale_relocations();
     [[nodiscard]] bool relocate_cancel(tr_torrent const* tor);
     void checkpoint_relocations_for_shutdown();
 

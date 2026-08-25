@@ -1595,6 +1595,8 @@ void session_load_torrents(tr_session* session, tr_ctor* ctor, std::promise<size
                 fmt::arg("count", n_torrents)));
     }
 
+    session->sweep_stale_relocations();
+
     loaded_promise->set_value(n_torrents);
 }
 } // namespace load_torrents_helpers
@@ -2174,6 +2176,62 @@ void tr_session::verify_add(tr_torrent* const tor)
 bool tr_session::relocate_add(std::unique_ptr<tr_relocate_worker::Mediator> mediator, tr_priority_t const priority)
 {
     return relocator_ ? relocator_->add(std::move(mediator), priority) : false;
+}
+
+void tr_session::sweep_stale_relocations()
+{
+    auto const dir = tr_pathbuf{ configDir(), "/relocations"sv };
+    auto const handle = tr_sys_dir_open(dir);
+    if (handle == TR_BAD_SYS_DIR)
+    {
+        return;
+    }
+
+    static auto constexpr Suffix = ".relocation.json"sv;
+    auto stale = std::vector<std::pair<std::string /*journal*/, std::string /*hash*/>>{};
+    while (char const* const name = tr_sys_dir_read_name(handle))
+    {
+        auto const name_sv = std::string_view{ name };
+        if (!tr_strv_ends_with(name_sv, Suffix))
+        {
+            continue;
+        }
+        auto const hash_str = name_sv.substr(0, std::size(name_sv) - std::size(Suffix));
+        auto const hash = tr_sha1_from_string(hash_str);
+        if (!hash || torrents().get(*hash) != nullptr)
+        {
+            continue; // malformed, or the torrent is still here and owns its journal
+        }
+        stale.emplace_back(std::string{ tr_pathbuf{ dir, '/', name_sv }.sv() }, std::string{ hash_str });
+    }
+    tr_sys_dir_close(handle);
+
+    for (auto const& [journal_file, hash_str] : stale)
+    {
+        auto const roots = tr_relocate_worker::read_journal_roots(journal_file);
+        auto const root = !roots || std::empty(roots->target_root) ? std::string{} :
+            std::empty(roots->name)                                ? roots->target_root :
+                                      std::string{ tr_pathbuf{ roots->target_root, '/', roots->name }.sv() };
+        run_disk_task(
+            [journal_file, hash_str, root]()
+            {
+                if (!std::empty(root) && !tr_sys_path_exists(root))
+                {
+                    // volume not mounted right now; keep the journal so a later
+                    // launch can still find and delete the staged copies
+                    return;
+                }
+
+                auto const n_removed = tr_relocate_worker::discard_orphaned_temp_files(root, hash_str);
+                tr_sys_path_remove(journal_file, nullptr);
+                tr_logAddInfo(
+                    fmt::format(
+                        "Discarded stale relocation for removed torrent {}: {} staged file(s) deleted under '{}'",
+                        hash_str,
+                        n_removed,
+                        root));
+            });
+    }
 }
 
 void tr_session::relocate_remove(tr_torrent const* const tor)

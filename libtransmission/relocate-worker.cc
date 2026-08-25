@@ -156,6 +156,7 @@ auto constexpr VerifyRelocatedDataByDefault = false;
 struct Journal
 {
     tr_torrent_relocation_state phase = TR_RELOC_COPYING;
+    std::string name;
     uint64_t bytes_total = {};
     uint64_t bytes_copied = {};
     tr_file_index_t file_index = {};
@@ -218,6 +219,10 @@ struct Journal
     {
         journal.target_root = std::string{ *value };
     }
+    if (auto const value = map->value_if<std::string_view>(tr_quark_new("name"sv)); value)
+    {
+        journal.name = std::string{ *value };
+    }
     if (auto const value = map->value_if<std::string_view>(tr_quark_new("previous_download_dir"sv)); value)
     {
         journal.previous_download_dir = std::string{ *value };
@@ -253,6 +258,7 @@ struct Journal
     out.try_emplace(tr_quark_new("file_offset"sv), static_cast<int64_t>(journal.file_offset));
     out.try_emplace(tr_quark_new("source_root"sv), journal.source_root);
     out.try_emplace(tr_quark_new("target_root"sv), journal.target_root);
+    out.try_emplace(tr_quark_new("name"sv), journal.name);
     out.try_emplace(tr_quark_new("previous_download_dir"sv), journal.previous_download_dir);
     out.try_emplace(tr_quark_new("previous_incomplete_dir"sv), journal.previous_incomplete_dir);
     out.try_emplace(tr_quark_new("updated_at"sv), static_cast<int64_t>(tr_time()));
@@ -271,6 +277,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
 {
     auto journal = Journal{};
     journal.bytes_total = snapshot.metainfo.total_size();
+    journal.name = snapshot.name;
     journal.source_root = snapshot.source_root;
     journal.target_root = snapshot.target_root;
     journal.previous_download_dir = snapshot.previous_download_dir;
@@ -287,6 +294,10 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         if (std::empty(journal.target_root))
         {
             journal.target_root = snapshot.target_root;
+        }
+        if (std::empty(journal.name))
+        {
+            journal.name = snapshot.name;
         }
         if (std::empty(journal.previous_download_dir))
         {
@@ -1081,6 +1092,106 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     return !error || !*error;
 }
 } // namespace
+
+void tr_relocate_worker::discard_staged_files(Snapshot const& snapshot)
+{
+    for (tr_file_index_t i = 0, n = snapshot.metainfo.file_count(); i < n; ++i)
+    {
+        tr_sys_path_remove(temp_path(snapshot, i), nullptr);
+    }
+
+    remove_journal(snapshot);
+}
+
+namespace
+{
+size_t discard_orphans_walk(std::string_view const dir, std::string_view const suffix, size_t const depth)
+{
+    static auto constexpr MaxDepth = size_t{ 32 };
+    if (depth > MaxDepth)
+    {
+        return 0U;
+    }
+
+    auto const handle = tr_sys_dir_open(dir);
+    if (handle == TR_BAD_SYS_DIR)
+    {
+        return 0U;
+    }
+
+    auto n_removed = size_t{};
+    auto subdirs = std::vector<std::string>{};
+    while (char const* const name = tr_sys_dir_read_name(handle))
+    {
+        auto const name_sv = std::string_view{ name };
+        if (name_sv == "."sv || name_sv == ".."sv)
+        {
+            continue;
+        }
+
+        auto const path = tr_pathbuf{ dir, '/', name_sv };
+        auto const info = tr_sys_path_get_info(path, TR_SYS_PATH_NO_FOLLOW);
+        if (!info)
+        {
+            continue;
+        }
+
+        if (info->isFolder())
+        {
+            subdirs.emplace_back(path.sv());
+        }
+        else if (info->isFile() && tr_strv_ends_with(name_sv, suffix) && tr_sys_path_remove(path, nullptr))
+        {
+            ++n_removed;
+        }
+    }
+    tr_sys_dir_close(handle);
+
+    for (auto const& subdir : subdirs)
+    {
+        n_removed += discard_orphans_walk(subdir, suffix, depth + 1U);
+    }
+
+    return n_removed;
+}
+} // namespace
+
+size_t tr_relocate_worker::discard_orphaned_temp_files(std::string_view const root, std::string_view const info_hash_string)
+{
+    if (std::empty(root) || std::empty(info_hash_string))
+    {
+        return 0U;
+    }
+
+    auto const suffix = fmt::format(".trreloc.{}.tmp", info_hash_string);
+    return discard_orphans_walk(root, suffix, 0U);
+}
+
+std::optional<tr_relocate_worker::JournalRoots> tr_relocate_worker::read_journal_roots(std::string_view const journal_file)
+{
+    auto top = tr_variant_serde::json().parse_file(journal_file);
+    if (!top)
+    {
+        return {};
+    }
+
+    auto const* const map = top->get_if<tr_variant::Map>();
+    if (map == nullptr)
+    {
+        return {};
+    }
+
+    auto roots = JournalRoots{};
+    if (auto const value = map->value_if<std::string_view>(tr_quark_new("target_root"sv)); value)
+    {
+        roots.target_root = std::string{ *value };
+    }
+    if (auto const value = map->value_if<std::string_view>(tr_quark_new("name"sv)); value)
+    {
+        roots.name = std::string{ *value };
+    }
+    return roots;
+}
 
 int tr_relocate_worker::Node::compare(Node const& that) const noexcept
 {

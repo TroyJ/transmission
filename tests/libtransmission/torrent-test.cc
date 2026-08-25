@@ -12,8 +12,11 @@
 #include <optional>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include <libtransmission/cache.h>
 #include <libtransmission/file.h>
+#include <libtransmission/relocate-worker.h>
 #include <libtransmission/torrent-ctor.h>
 #include <libtransmission/tr-strbuf.h>
 #include <libtransmission/session.h>
@@ -454,6 +457,76 @@ TEST_F(SeedProbeTest, corruptPieceZeroTriggersFullVerify)
     EXPECT_FALSE(tor->has_all());
 
     tr_torrentRemove(tor, true, nullptr, nullptr);
+}
+
+// Removing a torrent whose relocation failed must delete the staged
+// `.trreloc.<hash>.tmp` copies and the journal instead of orphaning them.
+TEST_F(TorrentTest, removingTorrentDiscardsRelocationLeftovers)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    EXPECT_NE(nullptr, tor);
+
+    auto const target_root = tr_pathbuf{ sandboxDir(), "/reloc-target"sv };
+    auto const staged_dir = tr_pathbuf{ target_root, "/files-filled-with-zeroes"sv };
+    tr_sys_dir_create(staged_dir, TR_SYS_DIR_CREATE_PARENTS, 0700);
+    auto const staged = tr_pathbuf{ staged_dir, "/1048576.trreloc."sv, tor->info_hash_string(), ".tmp"sv };
+    createFileWithContents(staged, "partial");
+    EXPECT_TRUE(tr_sys_path_exists(staged));
+
+    auto const journal_file = tor->relocation_journal_file();
+    auto journal_dir = tr_pathbuf{ journal_file };
+    journal_dir.popdir();
+    tr_sys_dir_create(journal_dir, TR_SYS_DIR_CREATE_PARENTS, 0700);
+    createFileWithContents(
+        journal_file,
+        fmt::format(
+            R"({{"phase":"failed","bytes_total":1053184,"bytes_copied":7,"target_root":"{}","error":"boom"}})",
+            target_root.sv()));
+    EXPECT_TRUE(tr_sys_path_exists(journal_file));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+    EXPECT_TRUE(waitFor([&]() { return !tr_sys_path_exists(staged) && !tr_sys_path_exists(journal_file); }, 5000));
+}
+
+// A journal left behind by a torrent that no longer exists is swept at
+// startup: its staged copies are deleted (bounded to target_root/name when
+// the journal records the name) and the journal is removed.
+TEST_F(TorrentTest, staleRelocationJournalIsSweptAtStartup)
+{
+    static auto constexpr Hash = "0123456789abcdef0123456789abcdef01234567"sv;
+    auto const target_root = tr_pathbuf{ sandboxDir(), "/stale-target"sv };
+    auto const torrent_dir = tr_pathbuf{ target_root, "/gone"sv };
+    auto const sub_dir = tr_pathbuf{ torrent_dir, "/sub"sv };
+    tr_sys_dir_create(sub_dir, TR_SYS_DIR_CREATE_PARENTS, 0700);
+    auto const staged_a = tr_pathbuf{ torrent_dir, "/a.bin.trreloc."sv, Hash, ".tmp"sv };
+    auto const staged_b = tr_pathbuf{ sub_dir, "/b.bin.trreloc."sv, Hash, ".tmp"sv };
+    auto const other_hash = tr_pathbuf{ torrent_dir, "/c.bin.trreloc.ffffffffffffffffffffffffffffffffffffffff.tmp"sv };
+    auto const keep = tr_pathbuf{ torrent_dir, "/keep.bin"sv };
+    for (auto const& path : { staged_a, staged_b, other_hash, keep })
+    {
+        createFileWithContents(path, "x");
+    }
+
+    auto const journal_dir = tr_pathbuf{ tr_sessionGetConfigDir(session_), "/relocations"sv };
+    tr_sys_dir_create(journal_dir, TR_SYS_DIR_CREATE_PARENTS, 0700);
+    auto const journal_file = tr_pathbuf{ journal_dir, '/', Hash, ".relocation.json"sv };
+    createFileWithContents(
+        journal_file,
+        fmt::format(R"({{"phase":"failed","target_root":"{}","name":"gone"}})", target_root.sv()));
+
+    auto done = std::atomic<bool>{ false };
+    session_->run_in_session_thread(
+        [&]()
+        {
+            session_->sweep_stale_relocations();
+            done = true;
+        });
+    EXPECT_TRUE(waitFor([&done]() { return done.load(); }, 5000));
+    EXPECT_TRUE(waitFor(
+        [&]() { return !tr_sys_path_exists(staged_a) && !tr_sys_path_exists(staged_b) && !tr_sys_path_exists(journal_file); },
+        5000));
+    EXPECT_TRUE(tr_sys_path_exists(other_hash)) << "only this journal's hash is swept";
+    EXPECT_TRUE(tr_sys_path_exists(keep));
 }
 
 } // namespace libtransmission::test

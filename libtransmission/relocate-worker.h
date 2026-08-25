@@ -16,6 +16,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -75,6 +78,24 @@ public:
     void remove(tr_sha1_digest_t const& info_hash);
     bool cancel(tr_sha1_digest_t const& info_hash);
     void prepare_shutdown();
+
+    // Delete the staged `.trreloc.<hash>.tmp` copies and the journal for a
+    // relocation that will never be resumed (e.g. the torrent is being removed).
+    // Must not be called while the relocation is queued or running.
+    static void discard_staged_files(Snapshot const& snapshot);
+
+    // For journals whose torrent no longer exists we have no metainfo, so walk
+    // `root` and delete every `*.trreloc.<info_hash_string>.tmp` under it.
+    // Returns the number of files removed. Safe to call from any thread.
+    static size_t discard_orphaned_temp_files(std::string_view root, std::string_view info_hash_string);
+
+    // The little the sweep needs from a journal whose torrent is gone.
+    struct JournalRoots
+    {
+        std::string target_root;
+        std::string name; // empty for journals written before `name` was recorded
+    };
+    [[nodiscard]] static std::optional<JournalRoots> read_journal_roots(std::string_view journal_file);
 
 private:
     struct Node

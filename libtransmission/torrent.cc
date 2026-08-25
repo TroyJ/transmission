@@ -893,6 +893,7 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
     }
 
     tor->session->relocate_remove(tor);
+    tor->discard_relocation_leftovers();
     tor->set_dirty(!tor->is_deleting_);
     tor->stop_now();
 
@@ -2161,6 +2162,25 @@ bool tr_torrent::can_cancel_relocation() const noexcept
 {
     return relocation_state() == TR_RELOC_QUEUED || relocation_state() == TR_RELOC_COPYING ||
         relocation_state() == TR_RELOC_VERIFYING;
+}
+
+void tr_torrent::discard_relocation_leftovers()
+{
+    auto const journal_file = relocation_journal_file();
+    if (!tr_sys_path_exists(journal_file))
+    {
+        return;
+    }
+
+    auto const journal = load_relocation_journal_state(journal_file);
+    if (journal && has_metainfo())
+    {
+        auto const& target_root = !std::empty(journal->target_root) ? journal->target_root : std::string{ download_dir() };
+        auto const mediator = RelocateMediator{ this, target_root, nullptr, {} };
+        tr_relocate_worker::discard_staged_files(mediator.snapshot());
+    }
+
+    tr_sys_path_remove(journal_file, nullptr);
 }
 
 void tr_torrent::retry_relocation()

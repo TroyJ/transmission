@@ -237,6 +237,10 @@ struct tr_torrent
 
     void save_resume_file();
     [[nodiscard]] std::string relocation_journal_file() const;
+
+    // Delete the staged copies and journal of a relocation that will never
+    // resume. Used when the torrent is removed.
+    void discard_relocation_leftovers();
     void set_relocation_state(
         tr_torrent_relocation_state state,
         uint64_t bytes_copied,
