@@ -1,6 +1,8 @@
 set(MAC_QL_BUNDLE_NAME QuickLookPlugin)
 
 add_library(${TR_NAME}-mac-ql MODULE)
+# Objective-C++: skip Homebrew clang-tidy (see ../CMakeLists.txt).
+set_target_properties(${TR_NAME}-mac-ql PROPERTIES CXX_CLANG_TIDY "" OBJCXX_CLANG_TIDY "")
 
 target_sources(${TR_NAME}-mac-ql
     PRIVATE

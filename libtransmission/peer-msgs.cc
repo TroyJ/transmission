@@ -415,6 +415,24 @@ public:
         }
     }
 
+    size_t cancel_all_block_requests() override
+    {
+        // request_timeouts_ carries one entry per request we sent (a block may
+        // repeat if it was re-requested); cancel_block_request() clears the
+        // active bit, so a duplicate entry is skipped by the test below.
+        auto n_cancelled = size_t{};
+        for (auto const& [block, timeout] : request_timeouts_)
+        {
+            if (active_requests.test(block))
+            {
+                cancel_block_request(block);
+                ++n_cancelled;
+            }
+        }
+        request_timeouts_.clear();
+        return n_cancelled;
+    }
+
     void set_choke(bool peer_is_choked) override
     {
         auto const now = tr_time();
@@ -586,6 +604,7 @@ private:
     void maybe_send_block_requests();
 
     void check_request_timeout(time_t now);
+    void maybe_cancel_requests_for_disk_backlog();
 
     [[nodiscard]] constexpr auto client_reqq() const noexcept
     {
@@ -1876,6 +1895,7 @@ void tr_peerMsgsImpl::pulse()
     auto const now_msec = tr_time_msec();
 
     check_request_timeout(now_sec);
+    maybe_cancel_requests_for_disk_backlog();
     update_desired_request_count();
     maybe_send_block_requests();
     maybe_send_metadata_requests(now_sec);
@@ -1919,6 +1939,25 @@ void tr_peerMsgsImpl::maybe_send_block_requests()
     if (auto const requests = tr_peerMgrGetNextRequests(&tor_, this, n_wanted); !std::empty(requests))
     {
         request_blocks(std::data(requests), std::size(requests));
+    }
+}
+
+void tr_peerMsgsImpl::maybe_cancel_requests_for_disk_backlog()
+{
+    // The soft cap (tr_peerMgrGetNextRequests) stops us asking for more once
+    // the write worker is MaxInFlightBytes behind, but peers keep delivering
+    // whatever we asked for before that. Past CancelRequestsBytes we take those
+    // back too. The two thresholds give hysteresis: nothing is re-requested
+    // until the queue is back under the soft cap.
+    if (active_req_count(TR_CLIENT_TO_PEER) == 0U || !tor_.session->is_disk_write_overwhelmed())
+    {
+        return;
+    }
+
+    if (auto const n = cancel_all_block_requests(); n != 0U)
+    {
+        tor_.session->cache->note_backlog_cancels(n);
+        logdbg(this, fmt::format("disk write queue is overwhelmed; cancelled {} outstanding block requests", n));
     }
 }
 

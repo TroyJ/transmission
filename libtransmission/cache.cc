@@ -247,6 +247,11 @@ bool Cache::is_write_backlogged() const noexcept
     return write_worker_.pending_bytes() >= MaxInFlightBytes;
 }
 
+bool Cache::is_write_overwhelmed() const noexcept
+{
+    return write_worker_.pending_bytes() >= CancelRequestsBytes;
+}
+
 int Cache::set_limit(Memory const max_size)
 {
     max_blocks_ = get_max_blocks(max_size);

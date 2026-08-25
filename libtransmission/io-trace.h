@@ -105,6 +105,9 @@ struct Snapshot
  */
 [[nodiscard]] std::uint64_t locked_count(Op op) noexcept;
 
+/** How many times `op` has run, on any thread, locked or not. Always on. */
+[[nodiscard]] std::uint64_t count(Op op) noexcept;
+
 [[nodiscard]] inline bool enabled() noexcept
 {
     return detail::trace_enabled;

@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <thread>
 #include <vector>
 
 #include <fmt/chrono.h>
@@ -1271,29 +1272,74 @@ size_t buildSearchPathArray(tr_torrent const* tor, std::string_view* paths)
 
 void tr_torrent::set_location(std::string_view location, bool move_from_old_path, int volatile* setme_state)
 {
-    auto const should_move_existing_data = move_from_old_path && has_any_local_data();
+    using namespace location_helpers;
 
     if (setme_state != nullptr)
     {
         *setme_state = TR_LOC_MOVING;
     }
 
-    if (should_move_existing_data)
+    if (!move_from_old_path)
     {
-        if (session->am_in_session_thread())
-        {
-            queue_relocation_in_session_thread(location, setme_state, std::nullopt);
-        }
-        else
-        {
-            session->run_in_session_thread([this, loc = std::string(location), setme_state]()
-                                           { queue_relocation_in_session_thread(loc, setme_state, std::nullopt); });
-        }
+        session->run_in_session_thread([this, loc = std::string(location), setme_state]()
+                                       { set_location_in_session_thread(loc, false, setme_state); });
         return;
     }
 
-    session->run_in_session_thread([this, loc = std::string(location), setme_state]()
-                                   { set_location_in_session_thread(loc, false, setme_state); });
+    // Whether there is anything to move is a stat() per file on the *source*
+    // volume -- which is stalled in exactly the situation a user reaches for
+    // "move". This is called under the session lock (RPC, GUI), so the probe
+    // runs on a throwaway thread against a snapshot of the file list and only
+    // the decision is posted back. Seen live: 0.7 s under the lock on an SD
+    // card. The torrent is looked up by id again in case it was removed.
+    auto search_paths = std::array<std::string_view, 4>{};
+    auto const n_paths = buildSearchPathArray(this, std::data(search_paths));
+    auto dirs = std::vector<std::string>{};
+    dirs.reserve(n_paths);
+    for (size_t i = 0; i < n_paths; ++i)
+    {
+        dirs.emplace_back(search_paths[i]);
+    }
+
+    std::thread(
+        [session = this->session,
+         id = this->id(),
+         files = this->files(),
+         dirs = std::move(dirs),
+         loc = std::string(location),
+         setme_state]()
+        {
+            auto paths = std::vector<std::string_view>{ std::begin(dirs), std::end(dirs) };
+            auto has_data = false;
+            for (tr_file_index_t i = 0, n = files.file_count(); i < n && !has_data; ++i)
+            {
+                has_data = files.find(i, std::data(paths), std::size(paths)).has_value();
+            }
+
+            session->run_in_session_thread(
+                [session, id, loc, setme_state, has_data]()
+                {
+                    auto* const tor = session->torrents().get(id);
+                    if (tor == nullptr)
+                    {
+                        if (setme_state != nullptr)
+                        {
+                            *setme_state = TR_LOC_ERROR;
+                        }
+                        return;
+                    }
+
+                    if (has_data)
+                    {
+                        tor->queue_relocation_in_session_thread(loc, setme_state, std::nullopt);
+                    }
+                    else
+                    {
+                        tor->set_location_in_session_thread(loc, false, setme_state);
+                    }
+                });
+        })
+        .detach();
 }
 
 void tr_torrent::queue_relocation_in_session_thread(
@@ -2880,7 +2926,7 @@ void tr_torrent::on_piece_completed(tr_piece_index_t const piece)
     // is completed to let other programs read the written data
     if (is_sequential_download())
     {
-        session->flush_torrent_files(id());
+        session->flush_torrent_files_soon(id());
     }
 
     // if this piece completes any file, invoke the fileCompleted func for it

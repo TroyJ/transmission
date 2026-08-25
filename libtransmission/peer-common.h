@@ -238,6 +238,13 @@ struct tr_peer
     {
     }
 
+    // Cancel every block request still outstanding to this peer.
+    // Returns the number of requests cancelled.
+    virtual size_t cancel_all_block_requests()
+    {
+        return 0U;
+    }
+
     virtual void ban() = 0;
 
     tr_session* const session;

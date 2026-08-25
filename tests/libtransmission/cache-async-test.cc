@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h> // fcntl(F_GETFD)
+
 #include <libtransmission/transmission.h>
 
 #include <libtransmission/cache.h>
@@ -20,6 +22,7 @@
 #include <libtransmission/open-files.h>
 #include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
+#include <libtransmission/tr-strbuf.h>
 #include <libtransmission/values.h>
 
 #include "gtest/gtest.h"
@@ -212,6 +215,48 @@ TEST_F(CacheAsyncTest, backpressureIsReportedWhenTheWorkerFallsBehind)
     EXPECT_FALSE(session_->cache->is_write_backlogged());
 }
 
+TEST_F(CacheAsyncTest, outstandingRequestsAreCancelledOnlyPastTheHardCap)
+{
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    session_->cache->set_write_paused(true);
+
+    auto const block_size = tor->block_size(0);
+    auto const soft_blocks = static_cast<tr_block_index_t>(Cache::MaxInFlightBytes / block_size + 1U);
+    auto const hard_blocks = static_cast<tr_block_index_t>(Cache::CancelRequestsBytes / block_size + 1U);
+    ASSERT_LT(hard_blocks, tor->block_count());
+
+    auto write_upto = [this, tor](tr_block_index_t begin, tr_block_index_t end)
+    {
+        in_session_thread(
+            session_,
+            [this, tor, begin, end]()
+            {
+                for (tr_block_index_t block = begin; block < end; ++block)
+                {
+                    session_->cache->write_block(tor->id(), block, make_block(tor, block));
+                }
+                EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+            });
+    };
+
+    // Between the two caps: stop asking, but let what was asked for land.
+    write_upto(0U, soft_blocks);
+    EXPECT_TRUE(session_->is_disk_write_backlogged());
+    EXPECT_FALSE(session_->is_disk_write_overwhelmed()) << "the soft cap alone must not cancel requests";
+
+    // Past the hard cap: take the outstanding requests back too.
+    write_upto(soft_blocks, hard_blocks);
+    EXPECT_TRUE(session_->is_disk_write_overwhelmed());
+
+    session_->cache->set_write_paused(false);
+    in_session_thread(session_, [this]() { session_->cache->drain(); });
+
+    EXPECT_FALSE(session_->is_disk_write_overwhelmed());
+    EXPECT_FALSE(session_->is_disk_write_backlogged());
+}
+
 TEST_F(CacheAsyncTest, aZeroSizedCacheStillWritesOffThread)
 {
     // cache-size-mb=0 means "hold nothing back", not "write on the session
@@ -400,6 +445,67 @@ TEST_F(CacheAsyncTest, shutdownGivesUpOnAStalledDiskAndForgetsTheUnwrittenBlocks
     {
         EXPECT_FALSE(tor->has_block(block)) << "block " << block << " never reached the disk";
     }
+}
+
+TEST_F(CacheAsyncTest, sequentialFlushesAreCoalescedNotPerPiece)
+{
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    session_->cache->set_write_paused(true);
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            session_->cache->write_block(tor->id(), 0U, make_block(tor, 0U));
+            session_->flush_torrent_files_soon(tor->id());
+            session_->flush_torrent_files_soon(tor->id()); // a second piece in the same window
+        });
+
+    // Nothing reaches the worker synchronously...
+    EXPECT_EQ(0U, session_->cache->pending_write_bytes());
+
+    // ...but it does within the coalescing window.
+    EXPECT_TRUE(waitFor([this]() { return session_->cache->pending_write_bytes() > 0U; }, 3000));
+
+    session_->cache->set_write_paused(false);
+    in_session_thread(session_, [this]() { session_->cache->drain(); });
+}
+
+TEST_F(CacheAsyncTest, shutdownDoesNotCloseDataFilesSynchronouslyOnAStalledDisk)
+{
+    // Seen live on an SD card: the 8 s grace fired, then quit hung another
+    // 30 s and ended in SIGKILL, because the fd pool was closed *after* the
+    // cache (and its worker, which takes the closes) had been destroyed --
+    // so every close() ran inline on the stalled volume. Once shutdown has
+    // given up on the disk, the descriptors must be left to the process exit.
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    auto const path = tr_pathbuf{ tor->current_dir(), '/', tor->file_subpath(0U) };
+    auto const fd = session_->openFiles()
+                        .get(tor->id(), 0U, true, path, tr_open_files::Preallocation::None, tor->file_size(0U));
+    ASSERT_TRUE(fd.has_value());
+    ASSERT_NE(-1, fcntl(*fd, F_GETFD));
+
+    session_->cache->set_write_paused(true);
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            session_->cache->write_block(tor->id(), 0U, make_block(tor, 0U));
+            tor->on_block_received(0U);
+            EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+        });
+
+    auto const began = std::chrono::steady_clock::now();
+    tr_sessionClose(session_);
+    auto const took = std::chrono::steady_clock::now() - began;
+    session_ = tr_sessionInit(sandboxDir(), true, *settings()); // TearDown closes whatever is here
+
+    EXPECT_LT(took, tr_session::ShutdownDiskGrace * 2) << "shutdown waited on something other than the bounded grace";
+    EXPECT_NE(-1, fcntl(*fd, F_GETFD)) << "the data file was closed after the worker was abandoned";
+    static_cast<void>(tr_sys_file_close(*fd));
 }
 
 } // namespace libtransmission::test

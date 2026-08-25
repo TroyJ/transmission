@@ -1461,6 +1461,7 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     }
 
     piece_checker_.reset();
+    flush_soon_timer_.reset();
     save_timer_.reset();
     queue_timer_.reset();
     now_timer_.reset();
@@ -1505,6 +1506,19 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     // down soon. This leaves the `event=stopped` going but refuses any
     // new tasks.
     this->web_->startShutdown(10s);
+
+    // Close the data files while the cache's worker is still hooked up to take
+    // the close() calls (tr_open_files::set_close_handler). Doing this after
+    // cache.reset() -- as closeImplPart2 used to -- unhooks the handler first,
+    // so every close() ran synchronously on the session thread, and on a
+    // stalled volume that is the syscall that never returns: quit hung 30 s
+    // past the 8 s grace and ended in SIGKILL. If the worker was abandoned
+    // above, the descriptors are deliberately leaked to the process exit.
+    openFiles().close_all();
+    if (this->cache && !this->cache->is_write_abandoned() && !this->cache->drain_for(ShutdownDiskGrace))
+    {
+        abandon_unwritten_blocks(); // closes only; nothing to forget, but stop waiting
+    }
     this->cache.reset();
 
     // recycle the now-unused save_timer_ here to wait for UDP shutdown
@@ -1533,14 +1547,7 @@ void tr_session::closeImplPart2(std::promise<void>* closed_promise, std::chrono:
 
     stats().save();
     peer_mgr_.reset();
-    openFiles().close_all();
-
-    // close_all() hands its descriptors to the write worker (see
-    // tr_open_files::set_close_handler), so wait for them before going further.
-    if (this->cache && !this->cache->drain_for(ShutdownDiskGrace))
-    {
-        abandon_unwritten_blocks(); // closes only; nothing to forget, but stop waiting
-    }
+    // (the data files were closed in closeImplPart1, while the worker could still take them)
     tr_utp_close(this);
     this->udp_core_.reset();
 
@@ -2312,6 +2319,36 @@ void tr_session::flush_torrent_files(tr_torrent_id_t const tor_id) const noexcep
     this->cache->flush_torrent(tor_id);
 }
 
+void tr_session::flush_torrent_files_soon(tr_torrent_id_t const tor_id)
+{
+    TR_ASSERT(am_in_session_thread());
+
+    flush_soon_ids_.insert(tor_id);
+
+    if (!flush_soon_timer_)
+    {
+        flush_soon_timer_ = timerMaker().create(
+            [this]()
+            {
+                auto const ids = std::exchange(flush_soon_ids_, {});
+                for (auto const id : ids)
+                {
+                    if (this->cache && torrents_.get(id) != nullptr)
+                    {
+                        this->cache->flush_torrent(id);
+                    }
+                }
+            });
+        flush_soon_timer_->set_repeating(false);
+        flush_soon_timer_->set_interval(SequentialFlushInterval);
+    }
+
+    if (std::size(flush_soon_ids_) == 1U)
+    {
+        flush_soon_timer_->start(); // the first request since the last flush arms it; the rest ride along
+    }
+}
+
 int64_t tr_session::download_dir_free_space() const
 {
     static auto constexpr MaxAgeSec = int64_t{ 5 };
@@ -2346,6 +2383,11 @@ int64_t tr_session::download_dir_free_space() const
 bool tr_session::is_disk_write_backlogged() const noexcept
 {
     return this->cache->is_write_backlogged();
+}
+
+bool tr_session::is_disk_write_overwhelmed() const noexcept
+{
+    return this->cache->is_write_overwhelmed();
 }
 
 void tr_session::close_torrent_files(tr_torrent_id_t const tor_id) noexcept

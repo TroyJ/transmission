@@ -14,6 +14,7 @@
 #include <libtransmission/block-info.h>
 #include <libtransmission/cache.h> // tr_cacheWriteBlock()
 #include <libtransmission/file.h> // tr_sys_path_*()
+#include <libtransmission/io-trace.h>
 #include <libtransmission/quark.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/torrent-files.h>
@@ -249,6 +250,34 @@ TEST_F(MoveTest, setLocationWithoutLocalDataUpdatesDownloadDirWithoutRelocation)
     EXPECT_TRUE(std::empty(tr_torrentFindFile(tor, 0)));
 
     tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(MoveTest, setLocationWithMoveProbesForLocalDataOffTheSessionLock)
+{
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/target-probe"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    blockingTorrentVerify(tor);
+    tor->forget_found_paths(); // so the probe has to stat()
+
+    // The RPC handler calls set_location() under the session lock; the
+    // has-any-local-data probe must not stat() the source volume there.
+    auto const path_ops_under_lock_before = tr_io_trace::locked_count(tr_io_trace::Op::Path);
+    auto state = -1;
+    {
+        auto const lock = session_->unique_lock();
+        tr_torrentSetLocation(tor, target_dir, true, &state);
+    }
+    EXPECT_TRUE(waitFor([&state]() { return state == TR_LOC_DONE; }, MaxWaitMsec));
+    EXPECT_TRUE(waitForRelocationToFinish(tor, MaxWaitMsec));
+    EXPECT_EQ(path_ops_under_lock_before, tr_io_trace::locked_count(tr_io_trace::Op::Path));
+
+    EXPECT_EQ(std::string_view{ target_dir }, tor->download_dir().sv());
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(0, tr_torrentStat(tor)->leftUntilDone);
+
+    tr_torrentRemove(tor, true, nullptr, nullptr);
 }
 
 TEST_F(MoveTest, relocationControlPredicates)

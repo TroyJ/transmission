@@ -9,6 +9,7 @@
 #error only libtransmission should #include this header.
 #endif
 
+#include <atomic>
 #include <chrono>
 #include <cstddef> // for size_t
 #include <cstdint> // for intX_t, uintX_t
@@ -94,6 +95,33 @@ public:
      */
     [[nodiscard]] bool is_write_backlogged() const noexcept;
 
+    /**
+     * True when the worker is so far behind that the blocks peers are already
+     * sending -- the ones requested before is_write_backlogged() flipped --
+     * should be cancelled outright. The soft cap only stops *new* requests;
+     * every connected peer can still deliver what it was asked for, and on a
+     * stalled volume that was seen to pile 413 MB behind a 32 MiB ceiling.
+     * See tr_peerMsgs::cancel_all_block_requests().
+     */
+    [[nodiscard]] bool is_write_overwhelmed() const noexcept;
+
+    /** Block requests cancelled because the worker was overwhelmed (see is_write_overwhelmed()). */
+    [[nodiscard]] size_t backlog_cancel_count() const noexcept
+    {
+        return backlog_cancels_.load(std::memory_order_relaxed);
+    }
+
+    void note_backlog_cancels(size_t n) noexcept
+    {
+        backlog_cancels_.fetch_add(n, std::memory_order_relaxed);
+    }
+
+    /** True once shutdown has given up on the worker (see abandon_pending()). */
+    [[nodiscard]] bool is_write_abandoned() const noexcept
+    {
+        return write_worker_.is_abandoned();
+    }
+
     [[nodiscard]] size_t pending_write_bytes() const noexcept
     {
         return write_worker_.pending_bytes();
@@ -106,6 +134,9 @@ public:
 
     /** Ceiling on bytes handed to the worker but not yet on disk. */
     static constexpr size_t MaxInFlightBytes = 32U * 1024U * 1024U;
+
+    /** Past this, outstanding peer requests are cancelled, not just withheld. */
+    static constexpr size_t CancelRequestsBytes = MaxInFlightBytes * 2U;
 
     /**
      * Runs `on_session_thread` once everything currently queued has been
@@ -196,6 +227,7 @@ private:
     tr_torrents const& torrents_;
 
     tr_disk_write_worker write_worker_;
+    std::atomic<size_t> backlog_cancels_ = 0U;
 
     // Blocks handed to the worker, keyed by job. Kept until the write commits
     // so that peer requests and hash checks still see them (a block that has

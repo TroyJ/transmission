@@ -459,6 +459,12 @@ void record(
     }
 }
 
+std::uint64_t count(Op const op) noexcept
+{
+    auto const idx = static_cast<std::size_t>(op);
+    return idx < NumOps ? stats[idx].count.load(std::memory_order_relaxed) : 0U;
+}
+
 std::uint64_t locked_count(Op const op) noexcept
 {
     auto const idx = static_cast<std::size_t>(op);

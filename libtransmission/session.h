@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <set>
 #include <utility> // for std::pair
 #include <vector>
 
@@ -812,7 +813,25 @@ public:
      */
     [[nodiscard]] bool is_disk_write_backlogged() const noexcept;
 
+    /**
+     * True when the write worker is so far behind that peers' outstanding
+     * requests should be cancelled. See Cache::is_write_overwhelmed().
+     */
+    [[nodiscard]] bool is_disk_write_overwhelmed() const noexcept;
+
     void flush_torrent_files(tr_torrent_id_t tor_id) const noexcept;
+
+    /**
+     * Flush a torrent's cached blocks soon, coalesced across pieces.
+     *
+     * Sequential mode flushes so that a player can read the file while it
+     * downloads; doing it per completed piece made every write-worker job a
+     * single piece with its own open/close. One shot per
+     * `SequentialFlushInterval` keeps the file readable to within a second
+     * and lets consecutive pieces share a job.
+     */
+    void flush_torrent_files_soon(tr_torrent_id_t tor_id);
+    static constexpr auto SequentialFlushInterval = std::chrono::milliseconds{ 1000 };
     void close_torrent_files(tr_torrent_id_t tor_id) noexcept;
 
     // How long quit waits for a stalled disk before giving up on the queued
@@ -1549,6 +1568,10 @@ private:
 
     // depends-on: torrents_
     std::unique_ptr<libtransmission::Timer> save_timer_;
+
+    // see flush_torrent_files_soon()
+    std::unique_ptr<libtransmission::Timer> flush_soon_timer_;
+    std::set<tr_torrent_id_t> flush_soon_ids_;
 
     std::unique_ptr<tr_verify_worker> verifier_ = std::make_unique<tr_verify_worker>();
     std::unique_ptr<tr_piece_check_worker> piece_checker_ = std::make_unique<tr_piece_check_worker>();

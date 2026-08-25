@@ -428,9 +428,9 @@ public:
         tr_swarm& swarm_;
     };
 
-    [[nodiscard]] auto unique_lock() const
+    [[nodiscard]] auto unique_lock(char const* file = __builtin_FILE(), int line = __builtin_LINE()) const
     {
-        return tor->unique_lock();
+        return tor->unique_lock(file, line);
     }
 
     tr_swarm(tr_peerMgr* manager_in, tr_torrent* tor_in) noexcept
@@ -1203,9 +1203,9 @@ public:
     tr_peerMgr& operator=(tr_peerMgr&&) = delete;
     tr_peerMgr& operator=(tr_peerMgr const&) = delete;
 
-    [[nodiscard]] auto unique_lock() const
+    [[nodiscard]] auto unique_lock(char const* file = __builtin_FILE(), int line = __builtin_LINE()) const
     {
-        return session->unique_lock();
+        return session->unique_lock(file, line);
     }
 
     ~tr_peerMgr()
