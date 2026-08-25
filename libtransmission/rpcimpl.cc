@@ -30,6 +30,7 @@
 #include "libtransmission/crypto-utils.h"
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
+#include "libtransmission/io-trace.h"
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
 #include "libtransmission/peer-mgr.h"
@@ -2057,6 +2058,16 @@ void add_strings_from_var(std::set<std::string_view>& strings, tr_variant const&
     args_out.try_emplace(TR_KEY_torrent_count, total);
     args_out.try_emplace(TR_KEY_upload_speed, session->piece_speed(TR_UP).base_quantity());
 
+    // Disk health. Always available; see io-trace.h. A GUI can turn "the app
+    // looks frozen" into "the disk has 380 MB queued and its last write took
+    // 11 minutes", and a lock-hold max above a second or so is a bug report.
+    auto const disk = tr_io_trace::snapshot();
+    args_out.try_emplace(TR_KEY_disk_lock_hold_max_msec, static_cast<int64_t>(disk.lock_hold_max_usec / 1000U));
+    args_out.try_emplace(TR_KEY_disk_pending_write_bytes, static_cast<int64_t>(session->cache->pending_write_bytes()));
+    args_out.try_emplace(TR_KEY_disk_slow_op_count, static_cast<int64_t>(disk.slow_op_count));
+    args_out.try_emplace(TR_KEY_disk_worst_op, std::string{ tr_io_trace::op_name(disk.worst_op) });
+    args_out.try_emplace(TR_KEY_disk_worst_op_msec, static_cast<int64_t>(disk.worst_op_usec / 1000U));
+
     return { JsonRpc::Error::SUCCESS, {} };
 }
 
@@ -2286,8 +2297,7 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
     map.try_emplace(
         TR_KEY_download_dir_free_space,
-        [](tr_session const& src) -> tr_variant
-        { return tr_sys_path_get_capacity(src.downloadDir()).value_or(tr_sys_path_capacity{}).free; },
+        [](tr_session const& src) -> tr_variant { return src.download_dir_free_space(); },
         nullptr);
 
     map.try_emplace(

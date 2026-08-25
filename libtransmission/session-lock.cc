@@ -51,11 +51,6 @@ int tr_session_lock_outer_line() noexcept
 
 void tr_session_lock::begin_timing() noexcept
 {
-    if (!tr_io_trace::enabled())
-    {
-        return;
-    }
-
     counted_ = true;
 
     if (depth++ == 0U)
@@ -93,7 +88,7 @@ void tr_session_lock::end_timing() noexcept
     // Only pay for the string when the hold is slow enough to be logged. Every
     // other hold just lands in the histogram, and there are a great many of them.
     auto site = std::string{};
-    if (file_ != nullptr && elapsed_usec >= tr_io_trace::threshold_usec())
+    if (tr_io_trace::enabled() && file_ != nullptr && elapsed_usec >= tr_io_trace::threshold_usec())
     {
         auto const* const sep = std::strrchr(file_, '/');
         site = fmt::format("{:s}:{:d}", sep != nullptr ? sep + 1 : file_, line_);

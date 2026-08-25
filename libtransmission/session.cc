@@ -17,6 +17,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2276,6 +2277,37 @@ void tr_session::checkpoint_relocations_for_shutdown()
 void tr_session::flush_torrent_files(tr_torrent_id_t const tor_id) const noexcept
 {
     this->cache->flush_torrent(tor_id);
+}
+
+int64_t tr_session::download_dir_free_space() const
+{
+    static auto constexpr MaxAgeSec = int64_t{ 5 };
+
+    auto const probe = free_space_probe_;
+    auto const now_sec = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    auto const stale = now_sec - probe->probed_at_sec.load(std::memory_order_relaxed) >= MaxAgeSec;
+    if (stale && !probe->in_flight.exchange(true, std::memory_order_acq_rel))
+    {
+        // The probe holds the state by shared_ptr, so it is safe to outlive the
+        // session; the statfs() is the only thing that may block, and it does
+        // so on this throwaway thread rather than on the session thread.
+        std::thread(
+            [probe, dir = std::string{ downloadDir() }]()
+            {
+                auto const capacity = tr_sys_path_get_capacity(dir);
+                probe->free_bytes.store(capacity ? capacity->free : -1, std::memory_order_relaxed);
+                auto const done_sec = static_cast<int64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+                probe->probed_at_sec.store(done_sec, std::memory_order_relaxed);
+                probe->in_flight.store(false, std::memory_order_release);
+            })
+            .detach();
+    }
+
+    return probe->free_bytes.load(std::memory_order_relaxed);
 }
 
 bool tr_session::is_disk_write_backlogged() const noexcept

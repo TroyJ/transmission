@@ -21,7 +21,8 @@
  * Only the outermost acquisition on a thread is timed -- the mutex is recursive,
  * and nested holds would otherwise each report the remainder of their parent.
  *
- * Timing is off unless `TR_TRACE_IO` is set; see io-trace.h.
+ * Timing is always on (two clock reads per outermost hold); only the logging
+ * needs `TR_TRACE_IO`. See io-trace.h.
  *
  * This header is reachable from the public transmission.h, and so from every
  * Objective-C++ client, so it is deliberately kept to <cstdint> and <mutex>.
@@ -30,8 +31,7 @@
  */
 /**
  * How deeply the calling thread currently holds the session mutex, and the
- * call site of its outermost hold. Only maintained while TR_TRACE_IO is on;
- * both read as "not held" otherwise. Used by io-trace to flag disk I/O done
+ * call site of its outermost hold. Used by io-trace to flag disk I/O done
  * while the lock is held -- the one invariant behind every GUI/RPC freeze.
  */
 [[nodiscard]] std::size_t tr_session_lock_depth() noexcept;

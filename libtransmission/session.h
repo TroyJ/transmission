@@ -638,6 +638,16 @@ public:
         return resume_dir_;
     }
 
+    /**
+     * Free bytes on the download directory's volume, or -1 if not yet known.
+     *
+     * Every `session-get` used to `statfs()` the volume on the session thread,
+     * under the lock -- 5.3 s measured on a stalled FSKit volume, per poll.
+     * This returns the last value a background probe produced and, if that is
+     * more than a few seconds old, starts another probe. It never blocks.
+     */
+    [[nodiscard]] int64_t download_dir_free_space() const;
+
     [[nodiscard]] constexpr auto const& downloadDir() const noexcept
     {
         return settings().download_dir;
@@ -1472,6 +1482,15 @@ private:
 
 public:
     // depends-on: settings_, open_files_, torrents_
+    // see download_dir_free_space()
+    struct FreeSpaceProbe
+    {
+        std::atomic<int64_t> free_bytes{ -1 };
+        std::atomic<bool> in_flight{ false };
+        std::atomic<int64_t> probed_at_sec{ 0 }; // steady-clock seconds
+    };
+    std::shared_ptr<FreeSpaceProbe> free_space_probe_ = std::make_shared<FreeSpaceProbe>();
+
     std::unique_ptr<Cache> cache = std::make_unique<Cache>(*this, torrents_, Memory{ 2U, Memory::Units::MBytes });
 
 private:

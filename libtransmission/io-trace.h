@@ -36,6 +36,11 @@
  *   TR_TRACE_IO_DUMP_SEC=60  log the latency histogram this often; 0 disables
  *   TR_TRACE_IO_LOCKED_BT=3  print a backtrace for the first N I/O calls made
  *                            while the session lock is held, per (op, lock site)
+ *   TR_TRACE_IO_ABORT=1      abort() on the first I/O call made under the lock,
+ *                            for hunting a regression under a debugger or in a
+ *                            test run (known offenders remain -- see
+ *                            docs/HANDOVER-disk-stalls-and-2a.md §9.4 -- so this
+ *                            is a tool, not yet a CI gate)
  *
  * Lock invariant: any disk operation begun while the calling thread holds the
  * session mutex is a freeze waiting for a slow disk, regardless of how long it
@@ -74,6 +79,24 @@ extern bool trace_enabled;
 extern std::uint64_t trace_threshold_usec;
 } // namespace detail
 
+/**
+ * The counters are always maintained, tracing on or off: two clock reads per
+ * disk op and per lock hold, and a few relaxed atomics. `enabled()` only
+ * gates the *output* (per-op log lines, histogram dumps, backtraces). This is
+ * what lets the RPC `session-stats` report disk health on a production
+ * build without anyone having restarted with TR_TRACE_IO.
+ */
+struct Snapshot
+{
+    std::uint64_t lock_hold_max_usec = 0U; // longest session-lock hold so far
+    std::uint64_t slow_op_count = 0U; // disk ops that took >= 1 s
+    std::uint64_t worst_op_usec = 0U; // the slowest disk op so far...
+    Op worst_op = Op::Open; // ...and what it was
+    std::uint64_t pending_write_bytes = 0U; // queued for the write worker right now
+};
+
+[[nodiscard]] Snapshot snapshot() noexcept;
+
 [[nodiscard]] inline bool enabled() noexcept
 {
     return detail::trace_enabled;
@@ -104,7 +127,7 @@ void record(
  */
 void report_locked_io(Op op, std::string_view note);
 
-/** True if the calling thread holds the session mutex (tracing on only). */
+/** True if the calling thread holds the session mutex. */
 [[nodiscard]] bool session_lock_held() noexcept;
 
 /**
@@ -134,23 +157,26 @@ public:
         , size_{ size }
         , enabled_{ enabled() }
     {
-        if (!enabled_)
-        {
-            return;
-        }
+        under_lock_ = session_lock_held();
 
-        // A close() invalidates the fd, so resolve its path while we still can.
-        // Only done for the rare ops; never on the read/write hot path.
-        note_ = op == Op::Close && std::empty(note) ? path_for_fd(fd) : std::string{ note };
-
-        if (session_lock_held())
+        if (enabled_)
         {
-            under_lock_ = true;
-            if (std::empty(note_))
+            // A close() invalidates the fd, so resolve its path while we still can.
+            // Only done for the rare ops; never on the read/write hot path.
+            note_ = op == Op::Close && std::empty(note) ? path_for_fd(fd) : std::string{ note };
+
+            if (under_lock_)
             {
-                note_ = path_for_fd(fd);
+                if (std::empty(note_))
+                {
+                    note_ = path_for_fd(fd);
+                }
+                report_locked_io(op, note_);
             }
-            report_locked_io(op, note_);
+        }
+        else if (under_lock_)
+        {
+            report_locked_io(op, note);
         }
 
         began_ = std::chrono::steady_clock::now();
@@ -158,11 +184,6 @@ public:
 
     ~Scope()
     {
-        if (!enabled_)
-        {
-            return;
-        }
-
         // Recording formats strings, so it can throw. A diagnostic must never
         // be the reason a file operation fails, so swallow it.
         try

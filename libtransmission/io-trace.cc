@@ -62,6 +62,7 @@ auto stats = std::array<OpStats, NumOps>{};
 auto locked_stats = std::array<OpStats, NumOps>{};
 
 auto locked_backtraces_per_site = std::uint64_t{ 3U };
+auto abort_on_locked_io = false;
 
 struct Gauge
 {
@@ -227,6 +228,7 @@ struct Initializer
         }
 
         locked_backtraces_per_site = env_number("TR_TRACE_IO_LOCKED_BT", 3U);
+        abort_on_locked_io = env_is_on("TR_TRACE_IO_ABORT");
 
         dump_interval = std::chrono::seconds{ static_cast<long long>(env_number("TR_TRACE_IO_DUMP_SEC", 60U)) };
         next_dump.store((std::chrono::steady_clock::now() + dump_interval).time_since_epoch().count());
@@ -301,11 +303,16 @@ std::string path_for_fd(int fd)
 
 bool session_lock_held() noexcept
 {
-    return enabled() && tr_session_lock_depth() > 0U;
+    return tr_session_lock_depth() > 0U;
 }
 
 void report_locked_io(Op op, std::string_view note)
 {
+    if (!enabled())
+    {
+        return; // counted in locked_stats by record(); nothing to print
+    }
+
     auto const* const file = tr_session_lock_outer_file();
     auto const line = tr_session_lock_outer_line();
     auto const* const sep = file != nullptr ? std::strrchr(file, '/') : nullptr;
@@ -355,6 +362,11 @@ void report_locked_io(Op op, std::string_view note)
     }
 #endif
     write_line(line_out);
+
+    if (abort_on_locked_io)
+    {
+        std::abort();
+    }
 }
 
 void record(
@@ -395,7 +407,7 @@ void record(
         // retry with the updated `prev`
     }
 
-    if (elapsed_usec >= threshold_usec())
+    if (enabled() && elapsed_usec >= threshold_usec())
     {
         auto where = std::string{ note };
         if (std::empty(where))
@@ -424,16 +436,55 @@ void record(
         }
     }
 
-    maybe_dump(std::chrono::steady_clock::now());
+    if (enabled())
+    {
+        maybe_dump(std::chrono::steady_clock::now());
+    }
+}
+
+Snapshot snapshot() noexcept
+{
+    auto out = Snapshot{};
+    out.lock_hold_max_usec = stats[static_cast<std::size_t>(Op::LockHold)].max_usec.load(std::memory_order_relaxed);
+
+    for (auto op = std::size_t{ 0U }; op < NumOps; ++op)
+    {
+        if (op == static_cast<std::size_t>(Op::LockHold) || op == static_cast<std::size_t>(Op::Wait))
+        {
+            continue; // not disk ops
+        }
+
+        auto const& st = stats[op];
+        if (auto const mx = st.max_usec.load(std::memory_order_relaxed); mx > out.worst_op_usec)
+        {
+            out.worst_op_usec = mx;
+            out.worst_op = static_cast<Op>(op);
+        }
+
+        // buckets hold [2^(i-1), 2^i) usec; 1 s = 2^20 usec is bucket 21
+        for (auto i = std::size_t{ 21U }; i < NumBuckets; ++i)
+        {
+            out.slow_op_count += st.buckets[i].load(std::memory_order_relaxed);
+        }
+    }
+
+    try
+    {
+        auto const lock = std::lock_guard{ gauges_mutex };
+        if (auto const iter = gauges.find("pending-write-bytes"); iter != std::end(gauges))
+        {
+            out.pending_write_bytes = iter->second.last.load(std::memory_order_relaxed);
+        }
+    }
+    catch (...)
+    {
+    }
+
+    return out;
 }
 
 void gauge(std::string_view name, std::uint64_t value) noexcept
 {
-    if (!enabled())
-    {
-        return;
-    }
-
     try
     {
         auto const lock = std::lock_guard{ gauges_mutex };

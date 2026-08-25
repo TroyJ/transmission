@@ -807,7 +807,11 @@ void tr_torrent::stop_now()
     stopped_.emit(this);
     session->announcer_->stopTorrent(this);
 
-    session->close_torrent_files(id());
+    /* Pausing must not wait on the disk: the synchronous close drained the
+     * write worker under the lock, so pausing a torrent during a stall froze
+     * the app for as long as the queue took. Callers that do need the bytes
+     * on disk before acting -- removal, relocation -- still drain themselves. */
+    session->close_torrent_files_async(id(), []() {});
 
     if (!is_deleting_)
     {

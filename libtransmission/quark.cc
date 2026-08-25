@@ -129,6 +129,11 @@ auto constexpr MyStatic = std::array<std::string_view, TR_N_KEYS>{
     "details_window_width"sv, // gtk app
     "dht-enabled"sv, // daemon, rpc, tr_session::Settings
     "dht_enabled"sv, // daemon, rpc, tr_session::Settings
+    "disk_lock_hold_max_msec"sv, // rpc
+    "disk_pending_write_bytes"sv, // rpc
+    "disk_slow_op_count"sv, // rpc
+    "disk_worst_op"sv, // rpc
+    "disk_worst_op_msec"sv, // rpc
     "dnd"sv, // .resume
     "done-date"sv, // .resume
     "doneDate"sv, // rpc
