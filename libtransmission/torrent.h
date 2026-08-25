@@ -230,9 +230,9 @@ struct tr_torrent
     // Used to add metainfo to a magnet torrent.
     void set_metainfo(tr_torrent_metainfo tm);
 
-    [[nodiscard]] auto unique_lock() const
+    [[nodiscard]] auto unique_lock(char const* file = __builtin_FILE(), int line = __builtin_LINE()) const
     {
-        return session->unique_lock();
+        return session->unique_lock(file, line);
     }
 
     void save_resume_file();

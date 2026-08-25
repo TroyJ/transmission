@@ -27,6 +27,7 @@ using namespace std::literals;
 using OpenFilesTest = libtransmission::test::SessionTest;
 
 static auto constexpr PreallocateFull = tr_open_files::Preallocation::Full;
+static auto constexpr PreallocateSparse = tr_open_files::Preallocation::Sparse;
 
 TEST_F(OpenFilesTest, getCachedFailsIfNotCached)
 {
@@ -205,3 +206,35 @@ TEST_F(OpenFilesTest, closesLeastRecentlyUsedFile)
     EXPECT_EQ(sorted, results);
     EXPECT_GT(std::count(std::begin(results), std::end(results), true), 0);
 }
+
+#ifdef __APPLE__
+TEST_F(OpenFilesTest, sparsePreallocationDoesNotWriteTheWholeFile)
+{
+    // macOS has no free sparse-preallocation primitive, so tr_sys_file_preallocate()
+    // fails for TR_SYS_FILE_PREALLOC_SPARSE and preallocate_file_sparse() does nothing
+    // at all. It must not fall back to the old seek-and-write (write one byte at
+    // `size - 1`, then ftruncate): that is free only where sparse files are supported,
+    // and on a filesystem without them -- exFAT -- it zero-fills the entire file while
+    // holding the session lock, freezing the GUI and RPC for minutes on a large file.
+    // See docs/disk-stall-investigation.md.
+    static auto constexpr FileSize = uint64_t{ 64U * 1024U * 1024U };
+    auto const filename = tr_pathbuf{ sandboxDir(), "/sparse-prealloc.dat" };
+
+    auto const fd = session_->openFiles().get(0, 0, true, filename, PreallocateSparse, FileSize);
+    EXPECT_TRUE(fd.has_value());
+
+    // the file exists, but nothing was written to it
+    auto info = tr_sys_path_get_info(filename);
+    EXPECT_TRUE(info.has_value());
+    EXPECT_EQ(0U, info->size);
+
+    // ...and it still grows normally when data actually arrives
+    static auto constexpr Contents = "Hello, World!\n"sv;
+    static auto constexpr Offset = uint64_t{ 1024U * 1024U };
+    EXPECT_TRUE(tr_sys_file_write_at(*fd, std::data(Contents), std::size(Contents), Offset, nullptr));
+
+    info = tr_sys_path_get_info(filename);
+    EXPECT_TRUE(info.has_value());
+    EXPECT_EQ(Offset + std::size(Contents), info->size);
+}
+#endif

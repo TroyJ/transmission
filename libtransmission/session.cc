@@ -461,9 +461,9 @@ tr_address tr_session::bind_address(tr_address_type type) const noexcept
 
 // ---
 
-std::unique_lock<std::recursive_mutex> tr_sessionLock(tr_session const* const session)
+tr_session_lock tr_sessionLock(tr_session const* const session, char const* const file, int const line)
 {
-    return session->unique_lock();
+    return session->unique_lock(file, line);
 }
 
 // ---

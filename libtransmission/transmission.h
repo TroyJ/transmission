@@ -23,6 +23,7 @@
 #include <stdbool.h> // bool
 #endif
 
+#include "libtransmission/session-lock.h"
 #include "libtransmission/tr-macros.h"
 
 using tr_file_index_t = size_t;
@@ -149,7 +150,7 @@ inline auto constexpr TrHttpServerDefaultBasePath = std::string_view{ TR_DEFAULT
 inline auto constexpr TrHttpServerRpcRelativePath = std::string_view{ "rpc" };
 inline auto constexpr TrHttpServerWebRelativePath = std::string_view{ "web/" };
 
-std::unique_lock<std::recursive_mutex> tr_sessionLock(tr_session const* session);
+tr_session_lock tr_sessionLock(tr_session const* session, char const* file = __builtin_FILE(), int line = __builtin_LINE());
 
 /**
  * Add libtransmission's default settings to the benc dictionary.

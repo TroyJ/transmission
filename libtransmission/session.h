@@ -56,6 +56,7 @@
 #include "libtransmission/rpc-server.h"
 #include "libtransmission/session-alt-speeds.h"
 #include "libtransmission/session-id.h"
+#include "libtransmission/session-lock.h"
 #include "libtransmission/session-thread.h"
 #include "libtransmission/serializer.h"
 #include "libtransmission/stats.h"
@@ -609,9 +610,9 @@ public:
         return torrent_queue_;
     }
 
-    [[nodiscard]] auto unique_lock() const
+    [[nodiscard]] auto unique_lock(char const* file = __builtin_FILE(), int line = __builtin_LINE()) const
     {
-        return std::unique_lock(session_mutex_);
+        return tr_session_lock{ session_mutex_, file, line };
     }
 
     [[nodiscard]] constexpr auto const& settings() const noexcept

@@ -67,6 +67,8 @@ target_sources(${TR_NAME}
         history.h
         inout.cc
         inout.h
+        io-trace.cc
+        io-trace.h
         ip-cache.cc
         ip-cache.h
         log.cc
@@ -119,6 +121,8 @@ target_sources(${TR_NAME}
         session-alt-speeds.h
         session-id.cc
         session-id.h
+        session-lock.cc
+        session-lock.h
         session-thread.cc
         session-thread.h
         session.cc

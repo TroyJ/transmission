@@ -56,6 +56,7 @@
 
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
+#include "libtransmission/io-trace.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-macros.h" // TR_UCLIBC_CHECK_VERSION
 #include "libtransmission/tr-strbuf.h"
@@ -553,6 +554,8 @@ tr_sys_file_t tr_sys_file_open(char const* path, int flags, int permissions, tr_
     TR_ASSERT(path != nullptr);
     TR_ASSERT((flags & (TR_SYS_FILE_READ | TR_SYS_FILE_WRITE)) != 0);
 
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Open, -1, 0U, 0U, std::string_view{ path } };
+
     struct native_map_item
     {
         int symbolic_mask;
@@ -614,6 +617,8 @@ tr_sys_file_t tr_sys_file_open_temp(char* path_template, tr_error* error)
 
 bool tr_sys_file_close(tr_sys_file_t handle, tr_error* error)
 {
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Close, handle, 0U, 0U };
+
     TR_ASSERT(handle != TR_BAD_SYS_FILE);
 
     bool const ret = close(handle) != -1;
@@ -630,6 +635,8 @@ bool tr_sys_file_read(tr_sys_file_t handle, void* buffer, uint64_t size, uint64_
 {
     TR_ASSERT(handle != TR_BAD_SYS_FILE);
     TR_ASSERT(buffer != nullptr || size == 0);
+
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Read, handle, 0U, size };
 
     bool ret = false;
 
@@ -665,6 +672,8 @@ bool tr_sys_file_read_at(
     TR_ASSERT(buffer != nullptr || size == 0);
     /* seek requires signed offset, so it should be in mod range */
     TR_ASSERT(offset < UINT64_MAX / 2);
+
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Read, handle, offset, size };
 
     bool ret = false;
 
@@ -702,6 +711,8 @@ bool tr_sys_file_write(tr_sys_file_t handle, void const* buffer, uint64_t size, 
     TR_ASSERT(handle != TR_BAD_SYS_FILE);
     TR_ASSERT(buffer != nullptr || size == 0);
 
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Write, handle, 0U, size };
+
     bool ret = false;
 
     auto const my_bytes_written = write(handle, buffer, size);
@@ -737,6 +748,8 @@ bool tr_sys_file_write_at(
     /* seek requires signed offset, so it should be in mod range */
     TR_ASSERT(offset < UINT64_MAX / 2);
 
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Write, handle, offset, size };
+
     bool ret = false;
 
 #ifdef HAVE_PWRITE
@@ -771,6 +784,8 @@ bool tr_sys_file_write_at(
 bool tr_sys_file_truncate(tr_sys_file_t handle, uint64_t size, tr_error* error)
 {
     TR_ASSERT(handle != TR_BAD_SYS_FILE);
+
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Truncate, handle, 0U, size };
 
     bool const ret = ftruncate(handle, size) != -1;
 
@@ -856,6 +871,8 @@ bool tr_sys_file_preallocate(tr_sys_file_t handle, uint64_t size, int flags, tr_
     TR_ASSERT(handle != TR_BAD_SYS_FILE);
 
     using prealloc_func = bool (*)(tr_sys_file_t, uint64_t);
+
+    auto const trace = tr_io_trace::Scope{ tr_io_trace::Op::Preallocate, handle, 0U, size };
 
     // these approaches are fast and should be tried first
     auto approaches = std::vector<prealloc_func>{

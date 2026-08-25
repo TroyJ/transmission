@@ -46,28 +46,37 @@ bool preallocate_file_sparse(tr_sys_file_t fd, uint64_t length, tr_error* error)
 
     tr_logAddDebug(fmt::format("Fast preallocation failed: {} ({})", local_error.message(), local_error.code()));
 
-    if (!tr_error_is_enospc(local_error.code()))
+    // A full disk will not get better by being asked a second way.
+    if (tr_error_is_enospc(local_error.code()))
     {
-        static char constexpr Zero = '\0';
-
-        local_error = {};
-
-        /* fallback: the old-style seek-and-write */
-        if (tr_sys_file_write_at(fd, &Zero, 1, length - 1, nullptr, &local_error) &&
-            tr_sys_file_truncate(fd, length, &local_error))
+        if (error != nullptr)
         {
-            return true;
+            *error = std::move(local_error);
         }
 
-        tr_logAddDebug(fmt::format("Fast prellocation fallback failed: {} ({})", local_error.message(), local_error.code()));
+        return false;
     }
 
-    if (error != nullptr)
-    {
-        *error = std::move(local_error);
-    }
-
-    return false;
+    // Deliberately no fallback.
+    //
+    // This used to seek-and-write -- write one byte at `length - 1`, then
+    // ftruncate -- so the file would appear full-size right away. That is free
+    // only on a filesystem with sparse-file support. On one without it, notably
+    // exFAT (the usual choice for a portable drive shared with Windows), it
+    // physically allocates and zero-fills the entire file. That happens here,
+    // inside tr_open_files::get(), on the session thread, under the session
+    // lock, so starting a large file froze the GUI and the RPC server for as
+    // long as the zero-fill took: measured at ~7s per 512 MiB and ~24s per GiB
+    // on an exFAT/FSKit volume, i.e. minutes for a large file.
+    //
+    // Sparse preallocation exists to be free; a fallback that costs a full-file
+    // write defeats its own purpose. When the cheap path is unavailable we do
+    // nothing instead. The file is still created, and still grows as blocks are
+    // written to it -- exactly what happens with preallocation turned off, which
+    // is already a supported configuration.
+    //
+    // See docs/disk-stall-investigation.md.
+    return true;
 }
 
 bool preallocate_file_full(tr_sys_file_t fd, uint64_t length, tr_error* error)
