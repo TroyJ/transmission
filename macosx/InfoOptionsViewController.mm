@@ -239,6 +239,12 @@ static CGFloat const kRelocationButtonSpacing = 6.0;
     }
 
     self.fSet = YES;
+
+    // The relocation phase changes under us as the sampler refreshes the
+    // torrents; setupInfo() only runs when the selection changes, which is
+    // why the action button never appeared for a relocation that started
+    // while the inspector was open (live re-check 2026-08-26).
+    [self updateRelocationActionControls];
 }
 
 - (void)updateOptions
