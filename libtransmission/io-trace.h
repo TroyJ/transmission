@@ -68,9 +68,10 @@ enum class Op : std::uint8_t
     Wait, // the session thread blocking on the write worker (Cache::drain)
     LockHold,
     SessionThreadWait, // how long a queued task waited before the session thread ran it
+    SessionThreadRun, // how long the session thread spent inside one task
 };
 
-inline auto constexpr NumOps = std::size_t{ 10U };
+inline auto constexpr NumOps = std::size_t{ 11U };
 
 namespace detail
 {
@@ -101,6 +102,7 @@ struct Snapshot
      * up here, because everything queued behind it waited. */
     std::uint64_t session_thread_wait_max_usec = 0U;
     std::uint64_t session_thread_stall_count = 0U; // queued tasks that waited >= 1 s
+    std::uint64_t session_thread_run_max_usec = 0U; // longest single session-thread task
 };
 
 [[nodiscard]] Snapshot snapshot() noexcept;
@@ -130,6 +132,36 @@ struct Snapshot
 
 /** Best-effort path for an open descriptor. Empty if it can't be resolved. */
 [[nodiscard]] std::string path_for_fd(int fd);
+
+/**
+ * Slow-disk fake. Makes every matching `tr_sys_file_*` call sleep before it
+ * runs, so a stalled volume -- the thing that turns a wait into a freeze -- can
+ * be reproduced in a unit test instead of on an SD card with a `dd` running.
+ *
+ * `ops` is a bitmask of `1U << static_cast<unsigned>(Op)`; empty means every
+ * disk op. `path_prefix` limits the delay to paths that start with it, so a
+ * test can stall one volume and leave the config dir alone. Passing a zero
+ * delay clears it.
+ *
+ * Also settable for manual runs, read once at startup:
+ *   TR_TEST_SLOW_IO_MS=750 TR_TEST_SLOW_IO_OPS=write,close TR_TEST_SLOW_IO_PATH=/Volumes/Slow
+ */
+void set_injected_delay(std::chrono::milliseconds delay, std::uint32_t ops = 0U, std::string_view path_prefix = {});
+
+/** True if a slow-disk fake is armed; the Scope ctor checks this before doing any work. */
+[[nodiscard]] bool injected_delay_armed() noexcept;
+
+/** Sleeps if `op` on `path` matches the armed fake. Called from Scope. */
+void apply_injected_delay(Op op, std::string_view path);
+
+/**
+ * Session shutdown is the one place a session-thread task is *allowed* to wait:
+ * it gives the write worker a bounded grace (tr_session::ShutdownDiskGrace)
+ * before abandoning it. The session turns timing off when it starts closing so
+ * that deliberate wait does not read as the bug the SessionThreadRun gate
+ * exists to catch, and back on when a session starts.
+ */
+void set_session_thread_timing_enabled(bool enabled) noexcept;
 
 void record(
     Op op,
@@ -199,6 +231,15 @@ public:
                 note_ = path_for_fd(fd);
             }
             report_locked_io(op, note_);
+        }
+
+        if (injected_delay_armed())
+        {
+            if (std::empty(note_))
+            {
+                note_ = path_for_fd(fd);
+            }
+            apply_injected_delay(op, note_);
         }
 
         began_ = std::chrono::steady_clock::now();

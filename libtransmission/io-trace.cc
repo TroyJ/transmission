@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #ifndef _WIN32
 #include <cxxabi.h>
@@ -71,6 +72,41 @@ struct Gauge
 };
 std::mutex gauges_mutex;
 std::map<std::string, Gauge> gauges;
+
+// Slow-disk fake. `injected_delay_usec` is the armed flag: zero means off, and
+// the Scope ctor reads it before doing anything else, so the cost when unarmed
+// is one relaxed load.
+std::atomic<bool> session_thread_timing_enabled{ true };
+
+std::atomic<std::uint64_t> injected_delay_usec{ 0U };
+std::atomic<std::uint32_t> injected_delay_ops{ 0U }; // 0 = every disk op
+std::mutex injected_delay_mutex;
+std::string injected_delay_path_prefix;
+
+[[nodiscard]] std::uint32_t op_mask_from_names(std::string_view names)
+{
+    auto mask = std::uint32_t{ 0U };
+    while (!std::empty(names))
+    {
+        auto const comma = names.find(',');
+        auto const name = names.substr(0U, comma);
+        for (auto op = std::size_t{ 0U }; op < NumOps; ++op)
+        {
+            if (name == op_name(static_cast<Op>(op)))
+            {
+                mask |= 1U << op;
+            }
+        }
+
+        if (comma == std::string_view::npos)
+        {
+            break;
+        }
+        names.remove_prefix(comma + 1U);
+    }
+
+    return mask;
+}
 
 auto dump_interval = std::chrono::seconds{ 0 };
 auto next_dump = std::atomic<std::chrono::steady_clock::rep>{ 0 };
@@ -212,6 +248,18 @@ struct Initializer
 {
     Initializer()
     {
+        // The fake is independent of tracing: a test arms it directly, and a
+        // manual run may want a stalled volume without the log noise.
+        if (auto const slow_msec = env_number("TR_TEST_SLOW_IO_MS", 0U); slow_msec != 0U)
+        {
+            auto const* const ops = std::getenv("TR_TEST_SLOW_IO_OPS");
+            auto const* const path = std::getenv("TR_TEST_SLOW_IO_PATH");
+            set_injected_delay(
+                std::chrono::milliseconds{ static_cast<long long>(slow_msec) },
+                ops != nullptr ? op_mask_from_names(ops) : 0U,
+                path != nullptr ? std::string_view{ path } : std::string_view{});
+        }
+
         detail::trace_enabled = env_is_on("TR_TRACE_IO");
         if (!detail::trace_enabled)
         {
@@ -269,11 +317,69 @@ auto const initializer = Initializer{};
 char const* op_name(Op op) noexcept
 {
     static auto constexpr Names = std::array<char const*, NumOps>{
-        "open", "close", "read", "write", "truncate", "preallocate", "path", "wait", "lock-hold", "session-thread-wait",
+        "open",
+        "close",
+        "read",
+        "write",
+        "truncate",
+        "preallocate",
+        "path",
+        "wait",
+        "lock-hold",
+        "session-thread-wait",
+        "session-thread-run",
     };
 
     auto const idx = static_cast<std::size_t>(op);
     return idx < NumOps ? Names[idx] : "?";
+}
+
+void set_injected_delay(std::chrono::milliseconds const delay, std::uint32_t const ops, std::string_view const path_prefix)
+{
+    {
+        auto const lock = std::lock_guard{ injected_delay_mutex };
+        injected_delay_path_prefix.assign(path_prefix);
+    }
+
+    injected_delay_ops.store(ops, std::memory_order_relaxed);
+    injected_delay_usec.store(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(delay).count()),
+        std::memory_order_relaxed);
+}
+
+void set_session_thread_timing_enabled(bool const enabled) noexcept
+{
+    session_thread_timing_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool injected_delay_armed() noexcept
+{
+    return injected_delay_usec.load(std::memory_order_relaxed) != 0U;
+}
+
+void apply_injected_delay(Op const op, std::string_view const path)
+{
+    auto const usec = injected_delay_usec.load(std::memory_order_relaxed);
+    if (usec == 0U)
+    {
+        return;
+    }
+
+    if (auto const mask = injected_delay_ops.load(std::memory_order_relaxed);
+        mask != 0U && (mask & (1U << static_cast<unsigned>(op))) == 0U)
+    {
+        return;
+    }
+
+    {
+        auto const lock = std::lock_guard{ injected_delay_mutex };
+        if (!std::empty(injected_delay_path_prefix) && path.rfind(injected_delay_path_prefix, 0U) != 0U)
+        {
+            return;
+        }
+    }
+
+    std::this_thread::sleep_for(std::chrono::microseconds{ usec });
 }
 
 std::string path_for_fd(int fd)
@@ -401,6 +507,14 @@ void record(
         return;
     }
 
+    // Shutdown's bounded wait for the write worker is deliberate; see
+    // set_session_thread_timing_enabled().
+    if ((op == Op::SessionThreadRun || op == Op::SessionThreadWait) &&
+        !session_thread_timing_enabled.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+
     if (under_session_lock && !is_config_dir_io(note))
     {
         auto& lst = locked_stats[idx];
@@ -485,10 +599,13 @@ Snapshot snapshot() noexcept
         }
     }
 
+    out.session_thread_run_max_usec = stats[static_cast<std::size_t>(Op::SessionThreadRun)].max_usec.load(
+        std::memory_order_relaxed);
+
     for (auto op = std::size_t{ 0U }; op < NumOps; ++op)
     {
         if (op == static_cast<std::size_t>(Op::LockHold) || op == static_cast<std::size_t>(Op::Wait) ||
-            op == static_cast<std::size_t>(Op::SessionThreadWait))
+            op == static_cast<std::size_t>(Op::SessionThreadWait) || op == static_cast<std::size_t>(Op::SessionThreadRun))
         {
             continue; // not disk ops
         }

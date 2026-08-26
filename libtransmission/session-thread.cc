@@ -295,7 +295,21 @@ private:
                 0U,
                 0U,
                 {});
+
+            // ...and how long the task itself took. A task that blocks -- on a
+            // worker, a condition variable, a slow syscall -- is the freeze;
+            // the test suite gates on this (tests/libtransmission/lock-invariant-gate.cc).
+            auto const began = std::chrono::steady_clock::now();
             func();
+            auto const ran = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - began)
+                                 .count();
+            tr_io_trace::record(
+                tr_io_trace::Op::SessionThreadRun,
+                static_cast<std::uint64_t>(std::max(decltype(ran){ 0 }, ran)),
+                -1,
+                0U,
+                0U,
+                {});
         }
     }
 

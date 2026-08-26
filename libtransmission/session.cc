@@ -1436,6 +1436,11 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
 {
     is_closing_ = true;
 
+    // From here the session thread is allowed to wait: the grace below is the
+    // one deliberate exception to "nothing on the session thread blocks", so
+    // stop timing it and leave the gate to judge the running session only.
+    tr_io_trace::set_session_thread_timing_enabled(false);
+
     // close the low-hanging fruit that can be closed immediately w/o consequences
     utp_timer.reset();
     relocator_.reset();
@@ -2570,6 +2575,7 @@ tr_session::tr_session(std::string_view config_dir, tr_variant const& settings_d
     , queue_timer_{ timer_maker_->create([this]() { on_queue_timer(); }) }
     , save_timer_{ timer_maker_->create([this]() { on_save_timer(); }) }
 {
+    tr_io_trace::set_session_thread_timing_enabled(true); // a previous session's shutdown turned it off
     now_timer_->start_repeating(1s);
     queue_timer_->start_repeating(QueueInterval);
     save_timer_->start_repeating(SaveInterval);

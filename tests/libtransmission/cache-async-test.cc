@@ -19,6 +19,7 @@
 
 #include <libtransmission/cache.h>
 #include <libtransmission/file.h>
+#include <libtransmission/io-trace.h>
 #include <libtransmission/open-files.h>
 #include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
@@ -181,6 +182,59 @@ TEST_F(CacheAsyncTest, writesDoNotBlockTheSessionThreadWhileTheDiskIsStalled)
     EXPECT_TRUE(waitFor([&ran]() { return ran.load(); }, 5000)) << "the session thread is blocked on the disk";
 
     session_->cache->set_write_paused(false);
+    in_session_thread(session_, [this]() { session_->cache->drain(); });
+}
+
+TEST_F(CacheAsyncTest, aStalledVolumeDoesNotReachTheSessionThread)
+{
+    // The unit-test version of the SD card: every write and close under the
+    // download dir sleeps, so the "stalled volume" half of a freeze can be
+    // reproduced without hardware or a human. See
+    // plans/blocking-taxonomy-and-boundary.md item 4.
+    auto* const tor = torrentInitFromFile(TorFilename);
+    ASSERT_NE(nullptr, tor);
+
+    static auto constexpr Delay = std::chrono::milliseconds{ 250 };
+    static auto constexpr NumBlocks = tr_block_index_t{ 8 };
+    auto const ops = (1U << static_cast<unsigned>(tr_io_trace::Op::Write)) |
+        (1U << static_cast<unsigned>(tr_io_trace::Op::Close));
+    tr_io_trace::set_injected_delay(Delay, ops, tr_sessionGetDownloadDir(session_));
+
+    // prove the fake bites, so the rest of the test cannot pass vacuously
+    {
+        auto const probe_path = tr_pathbuf{ tr_sessionGetDownloadDir(session_), "/slow-disk-probe"sv };
+        auto const began_probe = std::chrono::steady_clock::now();
+        auto const fd = tr_sys_file_open(probe_path, TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE | TR_SYS_FILE_TRUNCATE, 0600);
+        ASSERT_NE(TR_BAD_SYS_FILE, fd);
+        EXPECT_TRUE(tr_sys_file_close(fd));
+        auto const probe = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - began_probe);
+        EXPECT_GE(probe.count(), Delay.count()) << "the slow-disk fake did not apply to " << probe_path.sv();
+    }
+
+    in_session_thread(
+        session_,
+        [this, tor]()
+        {
+            for (tr_block_index_t block = 0; block < NumBlocks; ++block)
+            {
+                session_->cache->write_block(tor->id(), block, make_block(tor, block));
+            }
+            EXPECT_EQ(0, session_->cache->flush_torrent(tor->id()));
+        });
+
+    // the worker is now sleeping its way through those writes...
+    EXPECT_LT(0U, session_->cache->pending_write_bytes());
+
+    // ...and the session thread must not be waiting for it
+    auto ran = std::atomic<bool>{ false };
+    auto const began = std::chrono::steady_clock::now();
+    session_->run_in_session_thread([&ran]() { ran = true; });
+    ASSERT_TRUE(waitFor([&ran]() { return ran.load(); }, 5000)) << "the session thread is blocked on the disk";
+    auto const ping = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+    EXPECT_LT(ping.count(), Delay.count()) << "a stalled volume reached the session thread";
+
+    tr_io_trace::set_injected_delay(std::chrono::milliseconds{ 0 });
     in_session_thread(session_, [this]() { session_->cache->drain(); });
 }
 
