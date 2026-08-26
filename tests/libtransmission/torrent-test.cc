@@ -16,6 +16,7 @@
 
 #include <libtransmission/cache.h>
 #include <libtransmission/file.h>
+#include <libtransmission/io-trace.h>
 #include <libtransmission/relocate-worker.h>
 #include <libtransmission/torrent-ctor.h>
 #include <libtransmission/tr-strbuf.h>
@@ -570,6 +571,64 @@ TEST_F(TorrentTest, foundFilePathIsRememberedUntilForgotten)
     // final name is what comes back afterwards.
     tor->forget_found_path(0);
     EXPECT_EQ(*first, tor->found_file_path(0));
+}
+
+// The first read of a file for a peer used to resolve its path with a stat()
+// on the session thread, under the lock -- the 4.07 s hold at peer-io.cc:367
+// measured on the stalled SD card. The probe belongs to the disk task.
+TEST_F(TorrentTest, prefetchForPeerDoesNotStatUnderTheSessionLock)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    tor->forget_found_paths(); // cold: nothing knows where file 0 is yet
+
+    // every stat() under the download dir stalls, but opens and reads do not
+    static auto constexpr Stall = std::chrono::milliseconds{ 400 };
+    tr_io_trace::set_injected_delay(
+        Stall,
+        1U << static_cast<unsigned>(tr_io_trace::Op::Path),
+        tr_sessionGetDownloadDir(session_));
+    auto const locked_paths_before = tr_io_trace::locked_count(tr_io_trace::Op::Path);
+
+    auto buf = std::vector<uint8_t>(tr_block_info::BlockSize, 0xAA);
+    auto result = std::optional<bool>{};
+    auto took = std::chrono::milliseconds{};
+    auto done = std::atomic<bool>{ false };
+    session_->run_in_session_thread(
+        [&]()
+        {
+            auto const began = std::chrono::steady_clock::now();
+            result = tor->read_block_for_peer(tor->block_loc(0), tor->block_size(0), std::data(buf));
+            took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+            done = true;
+        });
+    ASSERT_TRUE(waitFor([&done]() { return done.load(); }, 5000));
+    EXPECT_FALSE(result.has_value()); // deferred to the disk task, as before
+    EXPECT_LT(took, Stall) << "the session thread waited on a stat() of the data volume";
+    EXPECT_EQ(locked_paths_before, tr_io_trace::locked_count(tr_io_trace::Op::Path)) << "a path op ran under the session lock";
+
+    // ...and the disk task still finds the file and serves the block
+    auto served = std::optional<bool>{};
+    EXPECT_TRUE(waitFor(
+        [&]()
+        {
+            done = false;
+            session_->run_in_session_thread(
+                [&]()
+                {
+                    served = tor->read_block_for_peer(tor->block_loc(0), tor->block_size(0), std::data(buf));
+                    done = true;
+                });
+            return waitFor([&done]() { return done.load(); }, 5000) && served.has_value();
+        },
+        5000));
+    EXPECT_EQ(true, served);
+    tr_io_trace::set_injected_delay(std::chrono::milliseconds{ 0 });
+
+    // the resolved path was remembered: the next snapshot needs no probe at all
+    EXPECT_TRUE(tor->found_file_path(0).has_value());
+
+    tr_torrentRemove(tor, true, nullptr, nullptr);
 }
 
 } // namespace libtransmission::test

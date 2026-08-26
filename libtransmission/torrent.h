@@ -1551,7 +1551,12 @@ private:
     // blocks read off-thread for peers, waiting to be served. Bounded; entries
     // are removed when served or evicted FIFO.
     using PrefetchKey = std::pair<uint64_t /*byte*/, uint32_t /*len*/>;
-    void on_block_prefetched(PrefetchKey key, uint64_t generation, std::vector<uint8_t> data, bool readable);
+    void on_block_prefetched(
+        PrefetchKey key,
+        uint64_t generation,
+        std::vector<uint8_t> data,
+        bool readable,
+        std::vector<tr_piece_check_worker::ResolvedPath> const& resolved);
     void queue_seed_probe();
     std::map<PrefetchKey, std::pair<std::vector<uint8_t>, bool /*readable*/>> prefetched_blocks_;
 

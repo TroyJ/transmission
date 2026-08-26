@@ -16,17 +16,39 @@
 #include "libtransmission/file.h"
 #include "libtransmission/piece-check.h"
 
-bool tr_piece_check_worker::read_spans(std::vector<Span> const& spans, std::byte* const buffer)
+bool tr_piece_check_worker::read_spans(
+    std::vector<Span> const& spans,
+    std::byte* const buffer,
+    std::vector<ResolvedPath>* const resolved)
 {
     auto pos = uint64_t{};
     auto readable = true;
     for (auto const& span : spans)
     {
-        if (std::empty(span.path))
+        auto fd = TR_BAD_SYS_FILE;
+        if (!std::empty(span.path))
         {
-            readable = false;
+            fd = tr_sys_file_open(span.path.c_str(), TR_SYS_FILE_READ, 0);
         }
-        else if (auto const fd = tr_sys_file_open(span.path.c_str(), TR_SYS_FILE_READ, 0); fd == TR_BAD_SYS_FILE)
+        else
+        {
+            // unresolved: the open itself is the probe, on this thread, not a
+            // stat under the session lock
+            for (auto const& candidate : span.candidates)
+            {
+                fd = tr_sys_file_open(candidate.c_str(), TR_SYS_FILE_READ, 0);
+                if (fd != TR_BAD_SYS_FILE)
+                {
+                    if (resolved != nullptr)
+                    {
+                        resolved->emplace_back(span.file_index, candidate);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (fd == TR_BAD_SYS_FILE)
         {
             readable = false;
         }

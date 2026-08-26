@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "libtransmission/transmission.h"
@@ -46,10 +47,19 @@ public:
 
     struct Span
     {
-        std::string path; // empty if the file does not exist on disk
+        tr_file_index_t file_index = 0U;
+        std::string path; // empty if not yet resolved (see `candidates`) or the file does not exist
+        // Where the file may be when `path` is empty, in search order. Resolving
+        // a path is a stat on the data volume, which must not happen on the
+        // session thread (that is the 4 s hold at peer-io.cc:367, live on the
+        // SD card 2026-08-26); the reader tries these off the lock instead and
+        // reports which one it opened so the torrent can remember it.
+        std::vector<std::string> candidates;
         uint64_t file_offset = 0U;
         uint64_t length = 0U;
     };
+
+    using ResolvedPath = std::pair<tr_file_index_t, std::string>;
 
     struct CachedBytes
     {
@@ -86,7 +96,11 @@ public:
     // Reads the spans, in order, into `buffer` (which must hold their total
     // length). Short reads leave the tail as-is. Returns false if any file
     // could not be opened.
-    [[nodiscard]] static bool read_spans(std::vector<Span> const& spans, std::byte* buffer);
+    // ...and, if `resolved` is given, which candidate each unresolved span opened.
+    [[nodiscard]] static bool read_spans(
+        std::vector<Span> const& spans,
+        std::byte* buffer,
+        std::vector<ResolvedPath>* resolved = nullptr);
 
 private:
     void thread_func();

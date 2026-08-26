@@ -110,13 +110,20 @@ static CGFloat const kRelocationButtonSpacing = 6.0;
     // The seeding view has a fixed height in the xib and clips its contents, so
     // a button added under the last row is invisible until that height makes
     // room for it. Keep the constraint so it can be grown while the button is up.
+    // The xib also pins the view's bottom to its last row (the peers field), so
+    // growing the height alone is unsatisfiable and Auto Layout breaks the
+    // growth -- which is why the button never showed (live re-check
+    // 2026-08-26). The fixed height already sizes the column; drop the pin.
     for (NSLayoutConstraint* constraint in self.fSeedingView.constraints)
     {
         if (constraint.firstAttribute == NSLayoutAttributeHeight && constraint.secondItem == nil && constraint.firstItem == self.fSeedingView)
         {
             self.fSeedingViewHeightConstraint = constraint;
             self.fSeedingViewBaseHeight = constraint.constant;
-            break;
+        }
+        else if (constraint.firstAttribute == NSLayoutAttributeBottom && constraint.firstItem == self.fSeedingView && constraint.secondItem == self.fPeersConnectField)
+        {
+            constraint.active = NO;
         }
     }
 
