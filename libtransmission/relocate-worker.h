@@ -83,7 +83,27 @@ public:
     // files from there. Otherwise `on_stopped` runs inline.
     void remove(tr_sha1_digest_t const& info_hash, std::function<void()> on_stopped = {});
     bool cancel(tr_sha1_digest_t const& info_hash);
+
+    // Ask the relocate thread to stop at its next chunk boundary (it saves the
+    // journal there, so the relocation resumes on the next start) and refuse
+    // new work. Never waits: on a stalled volume the current chunk can take
+    // minutes, which is exactly what a quit must not inherit. Pair it with
+    // wait_for_idle() and, if that gives up, abandon().
     void prepare_shutdown();
+
+    // Wait up to `timeout` for the relocate thread to finish. Returns true if
+    // it has (or never ran). Must not be called from the relocate thread.
+    [[nodiscard]] bool wait_for_idle(std::chrono::milliseconds timeout);
+
+    // Stop waiting for the relocate thread. It shares the worker's state, so
+    // letting it go is safe: it will notice the stop flag after its current
+    // syscall returns (or not -- the process is exiting), save the journal, and
+    // finish on its own. After this the destructor does not wait either. Only
+    // for shutdown; anything the thread reports afterwards goes to a mediator
+    // whose session may be gone, and the mediator must cope with that.
+    void abandon();
+
+    [[nodiscard]] bool is_abandoned() const noexcept;
 
     // Delete the staged `.trreloc.<hash>.tmp` copies and the journal for a
     // relocation that will never be resumed (e.g. the torrent is being removed).
@@ -128,16 +148,24 @@ private:
         tr_priority_t priority_;
     };
 
-    void relocate_thread_func();
+    // Shared with the relocate thread so that abandon() can let it go: a
+    // thread stuck in a stalled write on the target volume cannot be joined,
+    // and must not outlive what it is working on.
+    struct State
+    {
+        mutable std::mutex mutex;
+        std::set<Node> todo;
+        std::optional<Node> current_node;
+        bool thread_running = false;
+        std::atomic<bool> stop_current = false;
+        std::atomic<bool> cancel_current = false;
+        bool shutdown_requested = false;
+        bool abandoned = false;
+        std::vector<std::function<void()>> stopped_callbacks;
+        std::condition_variable state_cv;
+    };
 
-    std::mutex relocate_mutex_;
-    std::set<Node> todo_;
-    std::optional<Node> current_node_;
-    std::optional<std::thread::id> relocate_thread_id_;
-    std::atomic<bool> stop_current_ = false;
-    std::atomic<bool> cancel_current_ = false;
-    bool shutdown_requested_ = false;
-    std::vector<std::function<void()>> stopped_callbacks_;
-    std::condition_variable stop_current_cv_;
-    std::condition_variable state_cv_;
+    static void relocate_thread_func(std::shared_ptr<State> state);
+
+    std::shared_ptr<State> state_ = std::make_shared<State>();
 };

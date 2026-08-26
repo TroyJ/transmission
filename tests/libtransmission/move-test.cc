@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include <libtransmission/transmission.h>
@@ -371,6 +372,7 @@ struct BlockedRelocateState
     std::atomic<bool> copying = false;
     std::atomic<bool> cancelled = false;
     std::atomic<tr_torrent_relocation_state> last_state = TR_RELOC_NONE;
+    std::atomic<bool> mediator_destroyed = false; // the relocate thread is done with the torrent
     std::mutex mutex;
     std::condition_variable cv;
     bool released = false;
@@ -392,6 +394,11 @@ public:
         : snapshot_{ std::move(snapshot) }
         , state_{ std::move(state) }
     {
+    }
+
+    ~BlockingRelocateMediator() override
+    {
+        state_->mediator_destroyed.store(true);
     }
 
     [[nodiscard]] tr_relocate_worker::Snapshot const& snapshot() const override
@@ -525,6 +532,78 @@ TEST_F(RelocateWorkerTest, removeDoesNotWaitButStillCleansUpAfterTheCopyStops)
     EXPECT_TRUE(waitFor([&cleaned_up]() { return cleaned_up->load(); }, MaxWaitMsec));
 
     tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(RelocateWorkerTest, shutdownGivesUpOnAParkedCopyAndTheDestructorDoesNotWait)
+{
+    // What quit does when the relocate thread is inside a chunk the volume
+    // never finishes: ask, wait a bounded time, then let the thread go.
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/shutdown-target"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    auto worker = std::make_unique<tr_relocate_worker>();
+    auto const state = startBlockedRelocation(*worker, tor, target_dir.sv());
+    ASSERT_NE(nullptr, state);
+
+    auto const began = std::chrono::steady_clock::now();
+    worker->prepare_shutdown(); // asks; never waits
+    EXPECT_FALSE(worker->wait_for_idle(std::chrono::milliseconds{ 100 })); // a bounded wait on a stuck thread gives up
+    worker->abandon();
+    EXPECT_TRUE(worker->is_abandoned());
+    worker.reset(); // ...and the destructor no longer joins it
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+    EXPECT_LT(elapsed.count(), PromptMsec);
+    EXPECT_FALSE(state->mediator_destroyed.load()) << "the relocate thread was still parked";
+
+    // the thread owns its state jointly, so it finishes cleanly once the volume answers
+    state->release();
+    EXPECT_TRUE(waitFor([&state]() { return state->mediator_destroyed.load(); }, MaxWaitMsec));
+
+    // ...and the journal is still there for the next start to resume from
+    EXPECT_TRUE(tr_sys_path_exists(tor->relocation_journal_file()));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(MoveTest, quitWithARelocationStuckOnAStalledVolumeIsBounded)
+{
+    // Live, this was a quit that hung past the restart script's 30 s and ended
+    // in a SIGKILL (docs/gui-clickthrough-validation.md N2). Every write to the
+    // target volume stalls for longer than the shutdown grace, so the relocate
+    // thread is inside one when the session closes.
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    auto const info_hash = tor->info_hash();
+    auto const journal_file = tor->relocation_journal_file();
+    auto const target_dir = tr_pathbuf{ sandboxDir(), "/stalled-target"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    static auto constexpr StallPerWrite = tr_session::ShutdownDiskGrace + std::chrono::seconds{ 4 };
+    tr_io_trace::set_injected_delay(StallPerWrite, 1U << static_cast<unsigned>(tr_io_trace::Op::Write), target_dir.sv());
+
+    tr_torrentSetLocation(tor, target_dir.c_str(), true, nullptr);
+    ASSERT_TRUE(waitForRelocationState(tor, TR_RELOC_COPYING, MaxWaitMsec));
+    std::this_thread::sleep_for(std::chrono::milliseconds{ 250 }); // let the first write begin its stall
+
+    auto const began = std::chrono::steady_clock::now();
+    tr_sessionClose(session_);
+    auto const took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+    tr_io_trace::set_injected_delay(std::chrono::milliseconds{ 0 });
+
+    EXPECT_LT(took, tr_session::ShutdownDiskGrace + std::chrono::seconds{ 3 })
+        << "shutdown waited on the relocate thread past the grace";
+    EXPECT_TRUE(tr_sys_path_exists(journal_file)) << "the journal must survive so the relocation resumes next start";
+
+    // ...and it does: the next session picks the relocation back up
+    session_ = tr_sessionInit(sandboxDir(), true, *settings()); // TearDown closes whatever is here
+    auto* const ctor = tr_ctorNew(session_);
+    tr_sessionLoadTorrents(session_, ctor);
+    tr_ctorFree(ctor);
+    auto* const reloaded = session_->torrents().get(info_hash);
+    ASSERT_NE(nullptr, reloaded);
+    EXPECT_TRUE(waitFor([reloaded]() { return reloaded->relocation_state() != TR_RELOC_NONE; }, MaxWaitMsec));
 }
 
 } // namespace libtransmission::test

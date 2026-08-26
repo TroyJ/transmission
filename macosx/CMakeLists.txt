@@ -33,6 +33,9 @@ add_subdirectory(QuickLookPlugin)
 add_subdirectory(VDKQueue)
 
 add_executable(${TR_NAME}-mac MACOSX_BUNDLE)
+# The app must never hold the engine's mutex (blocking-taxonomy item 3):
+# commands and samples are posted to the session thread instead.
+target_compile_definitions(${TR_NAME}-mac PRIVATE TR_FORBID_SESSION_LOCK)
 
 # Objective-C++ sources can't be analysed by a non-Apple clang-tidy (Homebrew
 # LLVM fails with "could not build module 'Foundation'"), and every commit

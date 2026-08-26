@@ -150,7 +150,25 @@ inline auto constexpr TrHttpServerDefaultBasePath = std::string_view{ TR_DEFAULT
 inline auto constexpr TrHttpServerRpcRelativePath = std::string_view{ "rpc" };
 inline auto constexpr TrHttpServerWebRelativePath = std::string_view{ "web/" };
 
+#ifndef TR_FORBID_SESSION_LOCK
+// Clients that must never hold the engine's mutex (the macOS app, see
+// plans/blocking-taxonomy-and-boundary.md item 3) compile with
+// TR_FORBID_SESSION_LOCK so that a new use fails to build instead of
+// becoming the next multi-second stall. They post work with
+// tr_sessionRunInSessionThread() instead.
 tr_session_lock tr_sessionLock(tr_session const* session, char const* file = __builtin_FILE(), int line = __builtin_LINE());
+#endif
+
+/**
+ * @brief Run `func` on the session thread, after everything queued before it.
+ *
+ * Never waits. This is how a client touches torrents without taking the
+ * session lock: the engine's own thread does the work, so a client thread can
+ * never hold the lock across something slow, and a stalled disk can only ever
+ * be waited on by the worker threads that own it. `func` must not block
+ * either -- disk I/O belongs on the caller's own queue, before or after.
+ */
+void tr_sessionRunInSessionThread(tr_session* session, std::function<void()> func);
 
 /**
  * Add libtransmission's default settings to the benc dictionary.
@@ -248,10 +266,11 @@ void tr_sessionReloadBlocklists(tr_session* session);
 void tr_sessionClose(tr_session* session, size_t timeout_secs = 15);
 
 /**
- * @brief Ask relocation jobs to checkpoint and stop so app shutdown can proceed cleanly.
+ * @brief Ask relocation jobs to stop so app shutdown can proceed cleanly.
  *
- * This blocks until any active relocation copy has stopped at a chunk boundary and
- * queued relocation work has quiesced.
+ * Never waits: the relocate thread saves its journal at the next chunk boundary
+ * and `tr_sessionClose()` gives it a bounded grace (tr_session::ShutdownDiskGrace)
+ * before abandoning it, so a stalled volume cannot hold the quit hostage.
  */
 void tr_sessionCheckpointRelocations(tr_session* session);
 
@@ -454,6 +473,8 @@ struct tr_session_disk_stats
 {
     uint64_t pending_write_bytes; /* queued for the write worker right now */
     uint64_t lock_hold_max_msec; /* longest session-lock hold so far */
+    char const* lock_hold_worst_site; /* "file.cc:line" that took that hold (static string) */
+    uint64_t lock_hold_worst_ops; /* disk ops that began inside it; zero means it was slow for another reason */
     uint64_t slow_op_count; /* disk ops that took >= 1 s */
     uint64_t worst_op_msec; /* the slowest disk op so far... */
     char const* worst_op; /* ...and what it was: "write", "close", ... (static string) */

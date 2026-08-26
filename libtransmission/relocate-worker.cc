@@ -1225,13 +1225,14 @@ int tr_relocate_worker::Node::compare(Node const& that) const noexcept
 
 bool tr_relocate_worker::add(std::unique_ptr<Mediator> mediator, tr_priority_t const priority)
 {
-    auto const lock = std::scoped_lock{ relocate_mutex_ };
+    auto& st = *state_;
+    auto const lock = std::scoped_lock{ st.mutex };
     auto const& snapshot = mediator->snapshot();
 
-    if (shutdown_requested_ || (current_node_ && current_node_->matches(snapshot.info_hash)) ||
+    if (st.shutdown_requested || (st.current_node && st.current_node->matches(snapshot.info_hash)) ||
         std::any_of(
-            std::begin(todo_),
-            std::end(todo_),
+            std::begin(st.todo),
+            std::end(st.todo),
             [&snapshot](auto const& node) { return node.matches(snapshot.info_hash); }))
     {
         return false;
@@ -1249,13 +1250,12 @@ bool tr_relocate_worker::add(std::unique_ptr<Mediator> mediator, tr_priority_t c
     }
 
     mediator->on_relocate_state_changed(TR_RELOC_QUEUED, journal.bytes_copied, journal.bytes_total, 0U, {});
-    todo_.emplace(std::move(mediator), priority);
+    st.todo.emplace(std::move(mediator), priority);
 
-    if (!relocate_thread_id_)
+    if (!st.thread_running)
     {
-        auto thread = std::thread(&tr_relocate_worker::relocate_thread_func, this);
-        relocate_thread_id_ = thread.get_id();
-        thread.detach();
+        st.thread_running = true;
+        std::thread(&tr_relocate_worker::relocate_thread_func, state_).detach();
     }
 
     return true;
@@ -1263,9 +1263,10 @@ bool tr_relocate_worker::add(std::unique_ptr<Mediator> mediator, tr_priority_t c
 
 void tr_relocate_worker::remove(tr_sha1_digest_t const& info_hash, std::function<void()> on_stopped)
 {
-    auto lock = std::unique_lock{ relocate_mutex_ };
+    auto& st = *state_;
+    auto lock = std::unique_lock{ st.mutex };
 
-    if (current_node_ && current_node_->matches(info_hash))
+    if (st.current_node && st.current_node->matches(info_hash))
     {
         /* Ask the relocate thread to stop and hand it the cleanup. Waiting for
          * the ack here would block the caller -- removal runs on the session
@@ -1273,22 +1274,22 @@ void tr_relocate_worker::remove(tr_sha1_digest_t const& info_hash, std::function
          * session waited for as long as the current chunk took. Running the
          * cleanup on the relocate thread keeps the ordering that wait bought:
          * the staged files are deleted only once nothing is copying to them. */
-        stop_current_ = true;
+        st.stop_current = true;
         if (on_stopped)
         {
-            stopped_callbacks_.emplace_back(std::move(on_stopped));
+            st.stopped_callbacks.emplace_back(std::move(on_stopped));
         }
 
         return;
     }
 
     if (auto const iter = std::find_if(
-            std::begin(todo_),
-            std::end(todo_),
+            std::begin(st.todo),
+            std::end(st.todo),
             [&info_hash](auto const& node) { return node.matches(info_hash); });
-        iter != std::end(todo_))
+        iter != std::end(st.todo))
     {
-        todo_.erase(iter);
+        st.todo.erase(iter);
     }
 
     lock.unlock();
@@ -1301,11 +1302,12 @@ void tr_relocate_worker::remove(tr_sha1_digest_t const& info_hash, std::function
 
 bool tr_relocate_worker::cancel(tr_sha1_digest_t const& info_hash)
 {
-    auto lock = std::unique_lock{ relocate_mutex_ };
+    auto& st = *state_;
+    auto lock = std::unique_lock{ st.mutex };
 
-    if (current_node_ && current_node_->matches(info_hash))
+    if (st.current_node && st.current_node->matches(info_hash))
     {
-        auto const journal = load_journal(current_node_->mediator_->snapshot());
+        auto const journal = load_journal(st.current_node->mediator_->snapshot());
         if (!journal || !is_cancelable_state(journal->phase))
         {
             return false;
@@ -1317,25 +1319,25 @@ bool tr_relocate_worker::cancel(tr_sha1_digest_t const& info_hash)
          * called from the session thread, so on a stalled volume the whole
          * session waited for as long as the current chunk took (42 s measured
          * on the SD card, see docs/gui-clickthrough-validation.md D1). */
-        cancel_current_ = true;
-        stop_current_ = true;
-        current_node_->mediator_
+        st.cancel_current = true;
+        st.stop_current = true;
+        st.current_node->mediator_
             ->on_relocate_state_changed(TR_RELOC_CANCELLING, journal->bytes_copied, journal->bytes_total, 0U, {});
         return true;
     }
 
     if (auto const iter = std::find_if(
-            std::begin(todo_),
-            std::end(todo_),
+            std::begin(st.todo),
+            std::end(st.todo),
             [&info_hash](auto const& node) { return node.matches(info_hash); });
-        iter != std::end(todo_))
+        iter != std::end(st.todo))
     {
         auto journal = initial_journal(iter->mediator_->snapshot());
         journal.phase = TR_RELOC_CANCELLED;
         journal.error.clear();
         (void)save_journal(iter->mediator_->snapshot(), journal, nullptr);
         iter->mediator_->on_relocate_state_changed(TR_RELOC_CANCELLED, journal.bytes_copied, journal.bytes_total, 0U, {});
-        todo_.erase(iter);
+        st.todo.erase(iter);
         return true;
     }
 
@@ -1344,60 +1346,88 @@ bool tr_relocate_worker::cancel(tr_sha1_digest_t const& info_hash)
 
 void tr_relocate_worker::prepare_shutdown()
 {
-    auto lock = std::unique_lock{ relocate_mutex_ };
-    shutdown_requested_ = true;
-    stop_current_ = true;
+    auto& st = *state_;
+    auto const lock = std::scoped_lock{ st.mutex };
+    st.shutdown_requested = true;
+    st.stop_current = true;
+    st.todo.clear(); // queued relocations keep their QUEUED journal and are re-queued on the next start
+}
 
-    state_cv_.wait(lock, [this]() { return !current_node_.has_value() && !relocate_thread_id_.has_value(); });
+bool tr_relocate_worker::wait_for_idle(std::chrono::milliseconds const timeout)
+{
+    auto& st = *state_;
+    auto lock = std::unique_lock{ st.mutex };
+    return st.state_cv.wait_for(lock, timeout, [&st]() { return !st.thread_running; });
+}
+
+void tr_relocate_worker::abandon()
+{
+    auto& st = *state_;
+    auto const lock = std::scoped_lock{ st.mutex };
+    st.shutdown_requested = true;
+    st.stop_current = true;
+    st.abandoned = true;
+    st.todo.clear();
+}
+
+bool tr_relocate_worker::is_abandoned() const noexcept
+{
+    auto const& st = *state_;
+    auto const lock = std::scoped_lock{ st.mutex };
+    return st.abandoned;
 }
 
 tr_relocate_worker::~tr_relocate_worker()
 {
-    {
-        auto const lock = std::scoped_lock{ relocate_mutex_ };
-        shutdown_requested_ = true;
-        stop_current_ = true;
-        cancel_current_ = false;
-        todo_.clear();
-    }
+    auto& st = *state_;
+    auto lock = std::unique_lock{ st.mutex };
+    st.shutdown_requested = true;
+    st.stop_current = true;
+    st.cancel_current = false;
+    st.todo.clear();
 
-    while (relocate_thread_id_.has_value())
+    // The thread holds the state by shared_ptr, so once abandoned it can be
+    // left to finish by itself. Otherwise wait for it: it is between chunks
+    // at worst, and the journal it writes on the way out is what lets the
+    // relocation resume next time.
+    if (!st.abandoned)
     {
-        std::this_thread::sleep_for(20ms);
+        st.state_cv.wait(lock, [&st]() { return !st.thread_running; });
     }
 }
 
-void tr_relocate_worker::relocate_thread_func()
+void tr_relocate_worker::relocate_thread_func(std::shared_ptr<State> const state)
 {
+    auto& st = *state;
+
     while (true)
     {
         {
-            auto lock = std::unique_lock{ relocate_mutex_ };
-            if (shutdown_requested_ || todo_.empty())
+            auto lock = std::unique_lock{ st.mutex };
+            if (st.shutdown_requested || st.todo.empty())
             {
-                relocate_thread_id_.reset();
+                st.thread_running = false;
                 lock.unlock();
-                state_cv_.notify_all();
+                st.state_cv.notify_all();
                 break;
             }
 
-            current_node_ = std::move(todo_.extract(std::begin(todo_)).value());
+            st.current_node = std::move(st.todo.extract(std::begin(st.todo)).value());
         }
 
-        auto& mediator = *current_node_->mediator_;
+        auto& mediator = *st.current_node->mediator_;
         auto const snapshot = mediator.snapshot();
         auto journal = initial_journal(snapshot);
         auto error = tr_error{};
-        auto const finish_current = [this]()
+        auto const finish_current = [&st]()
         {
-            auto lock = std::unique_lock{ relocate_mutex_ };
-            current_node_.reset();
-            stop_current_ = false;
-            cancel_current_ = false;
-            auto stopped_callbacks = std::exchange(stopped_callbacks_, {});
+            auto lock = std::unique_lock{ st.mutex };
+            st.current_node.reset();
+            st.stop_current = false;
+            st.cancel_current = false;
+            auto stopped_callbacks = std::exchange(st.stopped_callbacks, {});
             lock.unlock();
-            stop_current_cv_.notify_all();
-            state_cv_.notify_all();
+            st.state_cv.notify_all();
 
             // whoever asked us to stop can now touch this torrent's staged files
             for (auto const& on_stopped : stopped_callbacks)
@@ -1414,9 +1444,9 @@ void tr_relocate_worker::relocate_thread_func()
                 continue;
             }
 
-            if (!delete_source(snapshot, journal, mediator, stop_current_, &error))
+            if (!delete_source(snapshot, journal, mediator, st.stop_current, &error))
             {
-                if (!stop_current_)
+                if (!st.stop_current)
                 {
                     journal.phase = TR_RELOC_ERROR;
                     journal.error = error ? error.message() : "Relocation delete failed"s;
@@ -1436,14 +1466,14 @@ void tr_relocate_worker::relocate_thread_func()
             continue;
         }
 
-        auto ok = copy_files(snapshot, journal, mediator, stop_current_, &error);
+        auto ok = copy_files(snapshot, journal, mediator, st.stop_current, &error);
         if (ok && VerifyRelocatedDataByDefault)
         {
-            ok = verify_files(snapshot, journal, mediator, stop_current_, &error);
+            ok = verify_files(snapshot, journal, mediator, st.stop_current, &error);
         }
         if (ok)
         {
-            ok = rename_temp_files(snapshot, journal, mediator, stop_current_, &error);
+            ok = rename_temp_files(snapshot, journal, mediator, st.stop_current, &error);
         }
         if (ok)
         {
@@ -1451,7 +1481,7 @@ void tr_relocate_worker::relocate_thread_func()
         }
         if (ok)
         {
-            ok = delete_source(snapshot, journal, mediator, stop_current_, &error);
+            ok = delete_source(snapshot, journal, mediator, st.stop_current, &error);
         }
 
         if (ok)
@@ -1460,14 +1490,14 @@ void tr_relocate_worker::relocate_thread_func()
             remove_journal(snapshot);
             mediator.on_relocate_state_changed(TR_RELOC_NONE, journal.bytes_total, journal.bytes_total, 0U, {});
         }
-        else if (cancel_current_)
+        else if (st.cancel_current)
         {
             journal.phase = TR_RELOC_CANCELLED;
             journal.error.clear();
             (void)save_journal(snapshot, journal, nullptr);
             mediator.on_relocate_state_changed(TR_RELOC_CANCELLED, journal.bytes_copied, journal.bytes_total, 0U, {});
         }
-        else if (!stop_current_)
+        else if (!st.stop_current)
         {
             journal.phase = TR_RELOC_ERROR;
             journal.error = error ? error.message() : "Relocation failed"s;

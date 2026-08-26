@@ -841,6 +841,43 @@ public:
     // writes (see closeImplPart1). Within tr_sessionClose()'s 15 s default.
     static constexpr auto ShutdownDiskGrace = std::chrono::milliseconds{ 8000 };
     void abandon_unwritten_blocks();
+
+    // Lets a thread that may outlive the session (an abandoned relocate
+    // thread, see tr_relocate_worker::abandon) post work to it safely: take
+    // the mutex, and post only if `session` is still set. The session clears
+    // it at the very end of shutdown, under the same mutex, so a post that
+    // starts before the clear lands on a live session thread and one that
+    // starts after is a no-op. Holders must not do anything slow under it.
+    struct LiveHandle
+    {
+        std::mutex mutex;
+        tr_session* session = nullptr;
+
+        // Runs `func(session)` on the session thread if the session is still
+        // alive. The pointer is handed over under the mutex so callers never
+        // read it themselves. @return false if the session is gone.
+        template<typename Func>
+        bool post(Func&& func)
+        {
+            auto const lock = std::scoped_lock{ mutex };
+            if (session == nullptr)
+            {
+                return false;
+            }
+            session->run_in_session_thread(std::forward<Func>(func), session);
+            return true;
+        }
+
+        [[nodiscard]] bool is_alive()
+        {
+            auto const lock = std::scoped_lock{ mutex };
+            return session != nullptr;
+        }
+    };
+    [[nodiscard]] std::shared_ptr<LiveHandle> live_handle() const noexcept
+    {
+        return live_handle_;
+    }
     void close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept;
 
     /**
@@ -1579,6 +1616,8 @@ private:
     std::unique_ptr<tr_verify_worker> verifier_ = std::make_unique<tr_verify_worker>();
     std::unique_ptr<tr_piece_check_worker> piece_checker_ = std::make_unique<tr_piece_check_worker>();
     std::unique_ptr<tr_relocate_worker> relocator_ = std::make_unique<tr_relocate_worker>();
+
+    std::shared_ptr<LiveHandle> live_handle_ = std::make_shared<LiveHandle>();
 
 public:
     std::unique_ptr<libtransmission::Timer> utp_timer;

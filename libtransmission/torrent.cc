@@ -903,8 +903,16 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
     /* Build the cleanup while the torrent is still here, then let the relocate
      * worker run it once it has stopped -- it may still be copying this
      * torrent, and on a slow volume waiting for it here would hold the session
-     * lock for as long as the current chunk takes. */
-    tor->session->relocate_remove(tor, tor->make_relocation_leftover_discarder());
+     * lock for as long as the current chunk takes.
+     *
+     * Not at session close, though: there the journal and the staged copy are
+     * exactly what lets the relocation pick up where it left off on the next
+     * start (tr_torrent::init re-queues every active journal). The relocate
+     * worker was already asked to stop in closeImplPart1. */
+    if (!tor->session->isClosing())
+    {
+        tor->session->relocate_remove(tor, tor->make_relocation_leftover_discarder());
+    }
     tor->set_dirty(!tor->is_deleting_);
     tor->stop_now();
 
@@ -2149,7 +2157,7 @@ tr_torrent::RelocateMediator::RelocateMediator(
     std::string_view const target_root,
     int volatile* const setme_state,
     std::optional<bool> const resume_after_relocation)
-    : session_{ tor->session }
+    : session_{ tor->session->live_handle() }
     , torrent_id_{ tor->id() }
     , setme_state_{ setme_state }
 {
@@ -2178,16 +2186,15 @@ void tr_torrent::RelocateMediator::on_relocate_state_changed(
     uint64_t const rate_bps,
     std::string_view const error)
 {
-    session_->run_in_session_thread(
-        [session = session_,
-         torrent_id = torrent_id_,
+    session_->post(
+        [torrent_id = torrent_id_,
          setme_state = setme_state_,
          resume_after_relocation = snapshot_.resume_after_relocation,
          state,
          bytes_copied,
          bytes_total,
          rate_bps,
-         error = std::string{ error }]()
+         error = std::string{ error }](tr_session* const session)
         {
             auto* const tor = session->torrents().get(torrent_id);
             if (tor == nullptr || tor->is_deleting_)
@@ -2212,16 +2219,19 @@ void tr_torrent::RelocateMediator::on_relocate_state_changed(
 
 bool tr_torrent::RelocateMediator::on_verified_location_ready()
 {
-    auto ready_promise = std::promise<bool>{};
-    auto ready_future = ready_promise.get_future();
+    // The answer arrives through a promise that the posted task owns jointly
+    // with us: if the session shuts down first, the task is dropped with its
+    // copy and we stop waiting below instead of hanging the relocate thread.
+    auto const ready_promise = std::make_shared<std::promise<bool>>();
+    auto ready_future = ready_promise->get_future();
 
-    session_->run_in_session_thread(
-        [session = session_, torrent_id = torrent_id_, snapshot = snapshot_, &ready_promise]()
+    auto const posted = session_->post(
+        [torrent_id = torrent_id_, snapshot = snapshot_, ready_promise](tr_session* const session)
         {
             auto* const tor = session->torrents().get(torrent_id);
             if (tor == nullptr || tor->is_deleting_)
             {
-                ready_promise.set_value(false);
+                ready_promise->set_value(false);
                 return;
             }
 
@@ -2231,12 +2241,12 @@ bool tr_torrent::RelocateMediator::on_verified_location_ready()
              * is the one that waits, on its own thread, which is fine. */
             session->close_torrent_files_async(
                 torrent_id,
-                [session, torrent_id, snapshot, &ready_promise]()
+                [session, torrent_id, snapshot, ready_promise]()
                 {
                     auto* const tor = session->torrents().get(torrent_id);
                     if (tor == nullptr || tor->is_deleting_)
                     {
-                        ready_promise.set_value(false);
+                        ready_promise->set_value(false);
                         return;
                     }
 
@@ -2253,21 +2263,30 @@ bool tr_torrent::RelocateMediator::on_verified_location_ready()
                         {});
                     tor->save_resume_file();
                     session->rpcNotify(TR_RPC_TORRENT_CHANGED, tor);
-                    ready_promise.set_value(true);
+                    ready_promise->set_value(true);
                 });
         });
+    if (!posted)
+    {
+        return false;
+    }
 
-    ready_future.wait();
+    while (ready_future.wait_for(std::chrono::milliseconds{ 100 }) != std::future_status::ready)
+    {
+        if (!session_->is_alive())
+        {
+            return false; // the session went away without answering; the journal keeps our place
+        }
+    }
+
     return ready_future.get();
 }
 
 void tr_torrent::RelocateMediator::on_source_deleted()
 {
-    session_->run_in_session_thread(
-        [session = session_,
-         torrent_id = torrent_id_,
-         setme_state = setme_state_,
-         resume_after_relocation = snapshot_.resume_after_relocation]()
+    session_->post(
+        [torrent_id = torrent_id_, setme_state = setme_state_, resume_after_relocation = snapshot_.resume_after_relocation](
+            tr_session* const session)
         {
             auto* const tor = session->torrents().get(torrent_id);
             if (tor == nullptr || tor->is_deleting_)

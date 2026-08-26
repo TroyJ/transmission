@@ -143,6 +143,8 @@ enum // NOLINT(performance-enum-size)
     TR_KEY_dht_enabled_kebab_APICOMPAT,
     TR_KEY_dht_enabled,
     TR_KEY_disk_lock_hold_max_msec,
+    TR_KEY_disk_lock_hold_worst_ops,
+    TR_KEY_disk_lock_hold_worst_site,
     TR_KEY_disk_pending_write_bytes,
     TR_KEY_disk_request_cancels,
     TR_KEY_disk_slow_op_count,

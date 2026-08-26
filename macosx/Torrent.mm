@@ -514,30 +514,51 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     return self;
 }
 
-+ (void)updateTimeMachineExcludeForStruct:(tr_torrent*)torrentStruct
+// Where the data would be, without asking the disk: the current dir already
+// accounts for the incomplete dir, and a single file may still carry ".part".
+// Existence is checked by whoever runs the disk half, on their own queue.
+static NSArray<NSString*>* candidateDataPathsForStruct(tr_torrent* torrentStruct)
 {
-    // Off-main twin of updateTimeMachineExclude (phase 1c): the data path
-    // is a stat() on the data volume and the flag an xattr on it.
-    tr_stat const* stat = tr_torrentStat(torrentStruct);
-    BOOL const exclude = stat->leftUntilDone != 0;
-    NSString* path = nil;
-    if (tr_torrentHasMetadata(torrentStruct))
+    if (!tr_torrentHasMetadata(torrentStruct))
     {
-        if (tr_torrentView(torrentStruct).is_folder)
-        {
-            NSString* dir = @(tr_torrentGetCurrentDir(torrentStruct));
-            NSString* candidate = [dir stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))];
-            path = [NSFileManager.defaultManager fileExistsAtPath:candidate] ? candidate : nil;
-        }
-        else if (auto const location = tr_torrentFindFile(torrentStruct, 0); !std::empty(location))
-        {
-            path = @(location.c_str());
-        }
+        return @[];
     }
-    if (path != nil)
+
+    NSString* dir = @(tr_torrentGetCurrentDir(torrentStruct));
+    if (tr_torrentView(torrentStruct).is_folder)
     {
-        CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:path], exclude, false);
+        return @[ [dir stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))] ];
     }
+
+    NSString* file = [dir stringByAppendingPathComponent:@(tr_torrentFile(torrentStruct, 0).name)];
+    return @[ file, [file stringByAppendingPathExtension:@"part"] ];
+}
+
+static dispatch_block_t timeMachineExcludeDiskWork(NSArray<NSString*>* candidates, BOOL exclude)
+{
+    if (candidates.count == 0)
+    {
+        return nil;
+    }
+    return ^{
+        for (NSString* candidate in candidates)
+        {
+            if ([NSFileManager.defaultManager fileExistsAtPath:candidate])
+            {
+                CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:candidate], exclude, false);
+                return;
+            }
+        }
+    };
+}
+
++ (dispatch_block_t)timeMachineExcludeUpdateForStruct:(tr_torrent*)torrentStruct
+{
+    // Off-main twin of updateTimeMachineExclude (phase 1c). This half runs on
+    // the session thread and only reads the torrent; the returned block does
+    // the stat() and the xattr on the data volume.
+    BOOL const exclude = tr_torrentStat(torrentStruct)->leftUntilDone != 0;
+    return timeMachineExcludeDiskWork(candidateDataPathsForStruct(torrentStruct), exclude);
 }
 
 - (instancetype)initWithMagnetAddress:(NSString*)address location:(NSString*)location lib:(tr_session*)lib
@@ -599,20 +620,16 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     _fHandle = nullptr;
 }
 
-+ (void)removeTorrentStruct:(tr_torrent*)torrentStruct trashFiles:(BOOL)trashFiles
++ (dispatch_block_t)removeTorrentStruct:(tr_torrent*)torrentStruct trashFiles:(BOOL)trashFiles
 {
-    // The off-main twin of closeRemoveTorrent:, for the controller's command
-    // queue: the wrapper has already detached its handle on the main thread.
-    if (auto const location = tr_torrentFindFile(torrentStruct, 0); !std::empty(location))
-    {
-        NSString* dir = @(tr_torrentGetCurrentDir(torrentStruct));
-        NSString* path = tr_torrentView(torrentStruct).is_folder ?
-            [dir stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))] :
-            @(location.c_str());
-        CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:path], false, false);
-    }
-
+    // The off-main twin of closeRemoveTorrent:, run on the session thread: the
+    // wrapper has already detached its handle on the main thread. Trashed data
+    // takes its Time Machine flag with it; kept data has it cleared by the
+    // returned block, on the caller's queue.
+    dispatch_block_t diskWork = trashFiles ? (dispatch_block_t)nil :
+                                             timeMachineExcludeDiskWork(candidateDataPathsForStruct(torrentStruct), NO);
     tr_torrentRemove(torrentStruct, trashFiles, trashDataFile, nullptr);
+    return diskWork;
 }
 
 - (void)changeDownloadFolderBeforeUsing:(NSString*)folder determinationType:(TorrentDeterminationType)determinationType
@@ -1063,35 +1080,19 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     return YES;
 }
 
-- (void)moveTorrentStruct:(tr_torrent*)torrentStruct dataFileTo:(NSString*)folder
+- (dispatch_block_t)moveTorrentStruct:(tr_torrent*)torrentStruct dataFileTo:(NSString*)folder
 {
-    // Off-main twin of moveTorrentDataFileTo: (phase 1b). Errors surface
-    // through the relocation state the sampler picks up, not a modal alert.
-    bool moveFromOldPath = false;
-    if (tr_torrentHasMetadata(torrentStruct))
-    {
-        if (tr_torrentView(torrentStruct).is_folder)
-        {
-            NSString* dataLocation = [@(tr_torrentGetCurrentDir(torrentStruct))
-                stringByAppendingPathComponent:@(tr_torrentName(torrentStruct))];
-            moveFromOldPath = [NSFileManager.defaultManager fileExistsAtPath:dataLocation];
-        }
-        else
-        {
-            moveFromOldPath = !std::empty(tr_torrentFindFile(torrentStruct, 0));
-        }
-    }
-
-    // the exclusion moves with the data; relocation-done re-applies it
-    if (moveFromOldPath)
-    {
-        if (auto const location = tr_torrentFindFile(torrentStruct, 0); !std::empty(location))
-        {
-            CSBackupSetItemExcluded((__bridge CFURLRef)[NSURL fileURLWithPath:@(location.c_str())], false, false);
-        }
-    }
-
-    tr_torrentSetLocation(torrentStruct, folder.UTF8String, moveFromOldPath, nullptr);
+    // Off-main twin of moveTorrentDataFileTo: (phase 1b), run on the session
+    // thread. Whether there is data to move is the engine's question now: with
+    // move_from_old_path set, tr_torrentSetLocation() probes the source volume
+    // on a throwaway thread of its own and only the decision touches the
+    // session thread. Errors surface through the relocation state the sampler
+    // picks up, not a modal alert. The Time Machine flag moves with the data
+    // (relocation-done re-applies it), so the returned block clears it on the
+    // source if the data is there.
+    dispatch_block_t diskWork = timeMachineExcludeDiskWork(candidateDataPathsForStruct(torrentStruct), NO);
+    tr_torrentSetLocation(torrentStruct, folder.UTF8String, true, nullptr);
+    return diskWork;
 }
 
 - (void)moveTorrentDataFileTo:(NSString*)folder
@@ -1147,29 +1148,39 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
     [NSFileManager.defaultManager copyItemAtPath:self.torrentLocation toPath:path error:NULL];
 }
 
-- (BOOL)hasEnoughRemainingDiskSpaceForStruct:(tr_torrent*)torrentStruct
+- (NSDictionary*)remainingDiskSpaceNeedForStruct:(tr_torrent*)torrentStruct
 {
     if (![self.fDefaults boolForKey:@"WarningRemainingSpace"])
     {
-        return YES;
+        return nil;
     }
 
     tr_stat const* stat = tr_torrentStat(torrentStruct);
     if (stat->leftUntilDone == 0)
     {
-        return YES;
+        return nil;
     }
 
-    NSString* downloadFolder = @(tr_torrentGetCurrentDir(torrentStruct));
-    NSDictionary* systemAttributes = [NSFileManager.defaultManager attributesOfFileSystemForPath:downloadFolder error:NULL];
+    return @{
+        @"folder" : @(tr_torrentGetCurrentDir(torrentStruct)),
+        @"leftUntilDone" : @(stat->leftUntilDone),
+        @"leftToAllocate" : @(tr_torrentGetBytesLeftToAllocate(torrentStruct))
+    };
+}
+
++ (BOOL)hasEnoughRemainingDiskSpaceForNeed:(NSDictionary*)need
+{
+    NSDictionary* systemAttributes = [NSFileManager.defaultManager attributesOfFileSystemForPath:need[@"folder"] error:NULL];
     if (systemAttributes == nil)
     {
         return YES;
     }
 
     uint64_t const remainingSpace = ((NSNumber*)systemAttributes[NSFileSystemFreeSize]).unsignedLongLongValue;
+    uint64_t const leftUntilDone = ((NSNumber*)need[@"leftUntilDone"]).unsignedLongLongValue;
+    uint64_t const leftToAllocate = ((NSNumber*)need[@"leftToAllocate"]).unsignedLongLongValue;
     //if the remaining space is greater than the size left, then there is enough space regardless of preallocation
-    return !(remainingSpace < stat->leftUntilDone && remainingSpace < tr_torrentGetBytesLeftToAllocate(torrentStruct));
+    return !(remainingSpace < leftUntilDone && remainingSpace < leftToAllocate);
 }
 
 - (BOOL)alertForRemainingDiskSpace
@@ -1179,7 +1190,8 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
         return YES;
     }
 
-    return [self hasEnoughRemainingDiskSpaceForStruct:self.fHandle] || [self presentRemainingDiskSpaceAlert];
+    NSDictionary* need = [self remainingDiskSpaceNeedForStruct:self.fHandle];
+    return need == nil || [Torrent hasEnoughRemainingDiskSpaceForNeed:need] || [self presentRemainingDiskSpaceAlert];
 }
 
 - (BOOL)presentRemainingDiskSpaceAlert

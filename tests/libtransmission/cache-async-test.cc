@@ -7,9 +7,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -601,6 +603,37 @@ TEST_F(CacheAsyncTest, completionIsWithheldWhenTheVolumeKeptFewerBytesThanWritte
         << "the block past the volume's real end should have been forgotten";
     EXPECT_FALSE(tor->is_done());
     EXPECT_EQ(time_t{}, tr_torrentStat(tor)->doneDate);
+}
+
+TEST_F(CacheAsyncTest, aSlowLockHoldReportsTheDiskOpsThatBeganInsideIt)
+{
+    // A multi-second hold with zero disk ops inside it was slow for some other
+    // reason (allocator, page faults, CPU); one with ops inside names the
+    // I/O. Either way the always-on snapshot must say which, and where the
+    // lock was taken, so a hold can never again go unattributed.
+    auto const before = tr_io_trace::snapshot();
+    auto const hold_for = std::chrono::microseconds{ before.lock_hold_max_usec } + std::chrono::milliseconds{ 50 };
+
+    auto const probe = tr_pathbuf{ session_->configDir(), "/Resume/hold-probe"sv }; // config-dir I/O: allowed under the lock
+    {
+        auto const lock = session_->unique_lock();
+        auto const fd = tr_sys_file_open(probe, TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE, 0600, nullptr);
+        ASSERT_NE(TR_BAD_SYS_FILE, fd);
+        EXPECT_TRUE(tr_sys_file_write(fd, "x", 1U, nullptr, nullptr));
+        EXPECT_TRUE(tr_sys_file_close(fd, nullptr));
+        std::this_thread::sleep_for(hold_for);
+    }
+
+    auto const after = tr_io_trace::snapshot();
+    EXPECT_GT(after.lock_hold_max_usec, before.lock_hold_max_usec);
+    EXPECT_EQ(3U, after.lock_hold_worst_ops) << "open + write + close began inside the hold";
+    EXPECT_NE(nullptr, std::strstr(after.lock_hold_worst_site, "cache-async-test.cc")) << after.lock_hold_worst_site;
+    EXPECT_NE(nullptr, std::strstr(tr_io_trace::worst_hold_site_string(), "cache-async-test.cc:"));
+
+    // ...and the RPC-facing struct carries the same
+    auto const disk = tr_sessionGetDiskStats(session_);
+    EXPECT_EQ(3U, disk.lock_hold_worst_ops);
+    EXPECT_STREQ(tr_io_trace::worst_hold_site_string(), disk.lock_hold_worst_site);
 }
 
 } // namespace libtransmission::test

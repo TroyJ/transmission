@@ -203,7 +203,11 @@ struct tr_torrent
 
     private:
         tr_relocate_worker::Snapshot snapshot_;
-        tr_session* session_ = nullptr;
+        // Not a raw tr_session*: the relocate thread that calls us can be
+        // abandoned at shutdown and outlive the session (see
+        // tr_relocate_worker::abandon), after which every callback here
+        // must be a no-op. The handle makes that a lock + null check.
+        std::shared_ptr<tr_session::LiveHandle> session_;
         tr_torrent_id_t torrent_id_ = {};
         int volatile* setme_state_ = nullptr;
     };

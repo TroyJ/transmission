@@ -59,6 +59,7 @@ void tr_session_lock::begin_timing() noexcept
         timed_ = true;
         outer_file = file_;
         outer_line = line_;
+        tr_io_trace::on_lock_hold_begin();
     }
 }
 
@@ -85,14 +86,7 @@ void tr_session_lock::end_timing() noexcept
     auto const elapsed_nsec = end_nsec > began_nsec_ ? end_nsec - began_nsec_ : 0U;
     auto const elapsed_usec = elapsed_nsec / 1000U;
 
-    // Only pay for the string when the hold is slow enough to be logged. Every
-    // other hold just lands in the histogram, and there are a great many of them.
-    auto site = std::string{};
-    if (tr_io_trace::enabled() && file_ != nullptr && elapsed_usec >= tr_io_trace::threshold_usec())
-    {
-        auto const* const sep = std::strrchr(file_, '/');
-        site = fmt::format("{:s}:{:d}", sep != nullptr ? sep + 1 : file_, line_);
-    }
-
-    tr_io_trace::record(tr_io_trace::Op::LockHold, elapsed_usec, -1, 0U, 0U, site);
+    // The hold lands in the histogram either way; a slow one is also reported
+    // with what happened inside it (disk ops begun, a backtrace at release).
+    tr_io_trace::report_lock_hold(file_, line_, elapsed_usec, tr_io_trace::ops_in_current_hold());
 }

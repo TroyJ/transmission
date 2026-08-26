@@ -34,6 +34,9 @@
  *   TR_TRACE_IO=1            enable tracing
  *   TR_TRACE_IO_MS=100       log individual operations at or above this many ms
  *   TR_TRACE_IO_DUMP_SEC=60  log the latency histogram this often; 0 disables
+ *   TR_TRACE_IO_HOLD_BT=3    print a backtrace at release for the first N slow
+ *                            session-lock holds per lock site, with the number
+ *                            of disk ops that began inside the hold
  *   TR_TRACE_IO_LOCKED_BT=3  print a backtrace for the first N I/O calls made
  *                            while the session lock is held, per (op, lock site)
  *   TR_TRACE_IO_ABORT=1      abort() on the first I/O call made under the lock,
@@ -91,6 +94,13 @@ extern std::uint64_t trace_threshold_usec;
 struct Snapshot
 {
     std::uint64_t lock_hold_max_usec = 0U; // longest session-lock hold so far
+    /* ...where it was taken, and how many disk ops began inside it. A long
+     * hold with zero ops inside was slow for some other reason -- allocator,
+     * page faults, plain CPU -- which is the first thing to know about it.
+     * Always on, so an unattributed hold cannot happen again. */
+    char const* lock_hold_worst_site = ""; // the lock site's source file (static storage)
+    int lock_hold_worst_line = 0;
+    std::uint64_t lock_hold_worst_ops = 0U;
     std::uint64_t slow_op_count = 0U; // disk ops that took >= 1 s
     std::uint64_t worst_op_usec = 0U; // the slowest disk op so far...
     Op worst_op = Op::Open; // ...and what it was
@@ -106,6 +116,9 @@ struct Snapshot
 };
 
 [[nodiscard]] Snapshot snapshot() noexcept;
+
+/** "file.cc:line" of the slowest session-lock hold so far, or "" -- a static buffer, cheap to call. */
+[[nodiscard]] char const* worst_hold_site_string();
 
 /**
  * How many times `op` has run on the data volume while the session lock was
@@ -173,6 +186,17 @@ void record(
     bool under_session_lock = false);
 
 /**
+ * Session-lock hold bookkeeping, driven by tr_session_lock. The outermost hold
+ * on a thread resets a thread-local count of the disk ops begun under it (the
+ * Scope ctor bumps it); on release the hold is recorded with that count and, if
+ * slow and tracing is on, reported with a backtrace of where it was released.
+ */
+void on_lock_hold_begin() noexcept;
+void count_op_under_lock() noexcept;
+[[nodiscard]] std::uint64_t ops_in_current_hold() noexcept;
+void report_lock_hold(char const* file, int line, std::uint64_t elapsed_usec, std::uint64_t ops_inside);
+
+/**
  * Called when an I/O op is about to run while the session lock is held.
  * Logs the op, the lock's call site, and a backtrace (rate-limited per site).
  */
@@ -223,6 +247,8 @@ public:
 
         if (under_lock_)
         {
+            count_op_under_lock();
+
             // Under the lock the path is always resolved, tracing or not: the
             // config-dir allowlist that keeps the locked counters honest (and
             // the test-suite gate quiet) needs it.

@@ -78,7 +78,12 @@ typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
 /// Off-main half of the remaining-disk-space check: statfs on the download
 /// volume, which can stall. YES means "fine to start"; NO means the main
 /// thread should ask via -presentRemainingDiskSpaceAlert.
-- (BOOL)hasEnoughRemainingDiskSpaceForStruct:(tr_torrent*)torrentStruct;
+// Two halves of the free-space check (phase 1b, item 3 of the blocking
+// taxonomy): the first reads the torrent on the session thread and returns
+// nil when no check is needed; the second does the statfs on the caller's
+// own queue. Neither takes the session lock.
+- (NSDictionary*)remainingDiskSpaceNeedForStruct:(tr_torrent*)torrentStruct;
++ (BOOL)hasEnoughRemainingDiskSpaceForNeed:(NSDictionary*)need;
 /// Main-thread half: shows the alert; YES means "download anyway".
 - (BOOL)presentRemainingDiskSpaceAlert;
 /// Both halves, synchronously (kept for the magnet-metadata path).
@@ -94,7 +99,9 @@ typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
                              location:(NSString*)location
                                   lib:(tr_session*)lib
                              snapshot:(TorrentMainWindowSnapshot*)snapshot;
-+ (void)updateTimeMachineExcludeForStruct:(tr_torrent*)torrentStruct;
+// Runs on the session thread; returns the disk half (a stat and an xattr on
+// the data volume) for the caller to run on its own queue, or nil.
++ (dispatch_block_t)timeMachineExcludeUpdateForStruct:(tr_torrent*)torrentStruct;
 /// Where the data is, resolved from the live struct (session thread / command queue); nil when nothing is on disk.
 + (NSString*)dataLocationForTorrentStruct:(tr_torrent*)torrentStruct;
 - (instancetype)initWithMagnetAddress:(NSString*)address location:(NSString*)location lib:(tr_session*)lib;
@@ -104,8 +111,12 @@ typedef NS_ENUM(NSInteger, TorrentPendingCommand) {
 
 - (void)closeRemoveTorrent:(BOOL)trashFiles;
 - (BOOL)canMoveTorrentDataFileTo:(NSString*)folder;
-- (void)moveTorrentStruct:(tr_torrent*)torrentStruct dataFileTo:(NSString*)folder;
-+ (void)removeTorrentStruct:(tr_torrent*)torrentStruct trashFiles:(BOOL)trashFiles;
+// Session-thread half of a move; returns the disk half (clearing the Time
+// Machine flag on the source) for the caller's queue, or nil.
+- (dispatch_block_t)moveTorrentStruct:(tr_torrent*)torrentStruct dataFileTo:(NSString*)folder;
+// Session-thread half of a removal; returns the disk half (clearing the Time
+// Machine flag if the data is kept) for the caller's queue, or nil.
++ (dispatch_block_t)removeTorrentStruct:(tr_torrent*)torrentStruct trashFiles:(BOOL)trashFiles;
 
 - (void)changeDownloadFolderBeforeUsing:(NSString*)folder determinationType:(TorrentDeterminationType)determinationType;
 

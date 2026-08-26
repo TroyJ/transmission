@@ -171,6 +171,8 @@ typedef struct
 @property(nonatomic, copy) NSString* hashString;
 @property(nonatomic) NSInteger groupValue;
 @property(nonatomic) BOOL removeWhenFinishSeeding;
+@property(nonatomic) BOOL active;
+@property(nonatomic) BOOL waitToStart;
 
 @end
 
@@ -370,7 +372,6 @@ static void removeKeRangerRansomware()
 @property(nonatomic) DragOverlayWindow* fOverlayWindow;
 
 @property(nonatomic) NSTimer* fTimer;
-@property(nonatomic) dispatch_queue_t fMainWindowSampleQueue;
 @property(nonatomic) dispatch_queue_t fTorrentHistoryQueue;
 @property(nonatomic) dispatch_queue_t fTorrentCommandQueue; // phase 1b: main-window mutations run here
 @property(nonatomic) BOOL fMainWindowSampleInFlight;
@@ -744,7 +745,6 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         _fTorrents = [[NSMutableArray alloc] init];
         _fDisplayedTorrents = [[NSMutableArray alloc] init];
         _fTorrentHashes = [[NSMutableDictionary alloc] init];
-        _fMainWindowSampleQueue = dispatch_queue_create("org.m0k.transmission.main-window-sampler", DISPATCH_QUEUE_SERIAL);
         _fTorrentHistoryQueue = dispatch_queue_create("org.m0k.transmission.torrent-history", DISPATCH_QUEUE_SERIAL);
         _fTorrentCommandQueue = dispatch_queue_create("org.m0k.transmission.torrent-commands", DISPATCH_QUEUE_SERIAL);
         _fMainWindowPendingPieceTorrentHashes = [NSSet set];
@@ -1344,10 +1344,7 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     // clear the badge
     [self.fBadger updateBadgeWithDownload:0 upload:0];
 
-    dispatch_sync(
-        self.fMainWindowSampleQueue,
-        ^{
-        });
+    // a sample in flight is on the session thread; its result is dropped by fQuitting
     self.fMainWindowSampleInFlight = NO;
 
     // let queued commands (start/stop/remove...) land before the session goes
@@ -2206,8 +2203,9 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     // The wrappers are already out of fTorrents and the table; detach their
     // handles now so nothing on the main thread touches the live objects
-    // again, then remove on the command queue (tr_torrentRemove takes the
-    // session lock; the data deletion itself is already on the write worker).
+    // again, then remove on the session thread (the data deletion itself is
+    // already on the write worker); the Time Machine flag comes off on the
+    // command queue afterwards.
     NSMutableArray<NSNumber*>* ids = [NSMutableArray arrayWithCapacity:torrents.count];
     for (Torrent* torrent in torrents)
     {
@@ -2221,13 +2219,16 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }
 
     tr_session* session = self.fLib;
-    dispatch_async(self.fTorrentCommandQueue, ^{
-        auto const lock = tr_sessionLock(session);
+    dispatch_queue_t diskQueue = self.fTorrentCommandQueue;
+    tr_sessionRunInSessionThread(session, ^{
         for (NSNumber* torrentId in ids)
         {
             if (tr_torrent* torrentStruct = tr_torrentFindFromId(session, torrentId.intValue))
             {
-                [Torrent removeTorrentStruct:torrentStruct trashFiles:deleteData];
+                if (dispatch_block_t diskWork = [Torrent removeTorrentStruct:torrentStruct trashFiles:deleteData])
+                {
+                    dispatch_async(diskQueue, diskWork);
+                }
             }
         }
     });
@@ -2474,11 +2475,15 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
             }
         }
 
-        // Whether there is data to move is a stat() on the source volume, and
-        // the Time Machine flag is an xattr on it: both on the command queue.
+        // The engine probes the source volume for data off its own thread;
+        // the Time Machine flag is an xattr on it and goes to the command queue.
+        dispatch_queue_t diskQueue = self.fTorrentCommandQueue;
         [self runTorrentCommand:TorrentPendingCommandRelocate onTorrents:movable
                           block:^(Torrent* torrent, tr_torrent* torrentStruct) {
-                              [torrent moveTorrentStruct:torrentStruct dataFileTo:folder];
+                              if (dispatch_block_t diskWork = [torrent moveTorrentStruct:torrentStruct dataFileTo:folder])
+                              {
+                                  dispatch_async(diskQueue, diskWork);
+                              }
                           }
                      completion:nil];
     }];
@@ -3003,17 +3008,17 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
     [self.fTableView reloadVisibleRows]; // show the pending marker now
 
+    // The block runs on the session thread -- the engine's own, so the app
+    // never holds the session lock (blocking-taxonomy item 3). Anything that
+    // touches the disk belongs on fTorrentCommandQueue, before or after.
     tr_session* session = self.fLib;
-    dispatch_async(self.fTorrentCommandQueue, ^{
-        {
-            auto const lock = tr_sessionLock(session);
-            [ids enumerateObjectsUsingBlock:^(NSNumber* torrentId, NSUInteger idx, BOOL* /*stop*/) {
-                if (tr_torrent* torrentStruct = tr_torrentFindFromId(session, torrentId.intValue))
-                {
-                    block(targets[idx], torrentStruct);
-                }
-            }];
-        }
+    tr_sessionRunInSessionThread(session, ^{
+        [ids enumerateObjectsUsingBlock:^(NSNumber* torrentId, NSUInteger idx, BOOL* /*stop*/) {
+            if (tr_torrent* torrentStruct = tr_torrentFindFromId(session, torrentId.intValue))
+            {
+                block(targets[idx], torrentStruct);
+            }
+        }];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             for (Torrent* torrent in targets)
@@ -3037,43 +3042,75 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 
 - (void)startTorrents:(NSArray<Torrent*>*)torrents ignoringQueue:(BOOL)ignoreQueue
 {
-    // Two hops: the disk-space check (a statfs that can stall) runs on the
-    // command queue; only torrents that fail it come back to the main thread
-    // for the alert, and those the user waves through are started in a
-    // second command with the check skipped.
-    NSMutableArray<Torrent*>* needAlert = [NSMutableArray array];
+    // Three hops, none of which waits on another: the session thread reads
+    // what each torrent still needs; the command queue does the statfs (which
+    // can stall) for those; the main thread alerts for any that fall short.
+    // Torrents that need no check start in the first hop; the rest start in a
+    // second command once the check (or the user) has waved them through.
+    NSMutableDictionary<NSNumber*, NSDictionary*>* needs = [NSMutableDictionary dictionary];
+    NSMutableArray<Torrent*>* checked = [NSMutableArray array];
     [self runTorrentCommand:TorrentPendingCommandStart onTorrents:torrents block:^(Torrent* torrent, tr_torrent* torrentStruct) {
-        if ([torrent hasEnoughRemainingDiskSpaceForStruct:torrentStruct])
+        if (NSDictionary* need = [torrent remainingDiskSpaceNeedForStruct:torrentStruct])
         {
-            ignoreQueue ? tr_torrentStartNow(torrentStruct) : tr_torrentStart(torrentStruct);
+            @synchronized(needs)
+            {
+                needs[@(torrent.torrentId)] = need;
+                [checked addObject:torrent];
+            }
         }
         else
         {
-            @synchronized(needAlert)
-            {
-                [needAlert addObject:torrent];
-            }
+            ignoreQueue ? tr_torrentStartNow(torrentStruct) : tr_torrentStart(torrentStruct);
         }
     } completion:^{
         //capture, specifically, stop-seeding settings changing to unlimited
         [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateOptions" object:nil];
 
-        NSMutableArray<Torrent*>* anyway = [NSMutableArray array];
-        for (Torrent* torrent in needAlert)
+        if (checked.count == 0)
         {
-            if ([torrent presentRemainingDiskSpaceAlert])
+            return;
+        }
+
+        for (Torrent* torrent in checked)
+        {
+            torrent.pendingCommand = TorrentPendingCommandStart; // still on its way
+        }
+        dispatch_async(self.fTorrentCommandQueue, ^{
+            NSMutableArray<Torrent*>* enough = [NSMutableArray array];
+            NSMutableArray<Torrent*>* needAlert = [NSMutableArray array];
+            for (Torrent* torrent in checked)
             {
-                [anyway addObject:torrent];
+                BOOL const ok = [Torrent hasEnoughRemainingDiskSpaceForNeed:needs[@(torrent.torrentId)]];
+                [ok ? enough : needAlert addObject:torrent];
             }
-        }
-        if (anyway.count > 0)
-        {
-            [self runTorrentCommand:TorrentPendingCommandStart onTorrents:anyway
-                              block:^(Torrent* /*torrent*/, tr_torrent* torrentStruct) {
-                                  ignoreQueue ? tr_torrentStartNow(torrentStruct) : tr_torrentStart(torrentStruct);
-                              }
-                         completion:nil];
-        }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSMutableArray<Torrent*>* anyway = [NSMutableArray arrayWithArray:enough];
+                for (Torrent* torrent in needAlert)
+                {
+                    if ([torrent presentRemainingDiskSpaceAlert])
+                    {
+                        [anyway addObject:torrent];
+                    }
+                    else
+                    {
+                        torrent.pendingCommand = TorrentPendingCommandNone;
+                    }
+                }
+                if (anyway.count > 0)
+                {
+                    [self runTorrentCommand:TorrentPendingCommandStart onTorrents:anyway
+                                      block:^(Torrent* /*torrent*/, tr_torrent* torrentStruct) {
+                                          ignoreQueue ? tr_torrentStartNow(torrentStruct) : tr_torrentStart(torrentStruct);
+                                      }
+                                 completion:nil];
+                }
+                else if (!self.fQuitting)
+                {
+                    [self fullUpdateUI];
+                }
+            });
+        });
     }];
 }
 
@@ -3137,7 +3174,11 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     NSSet<NSString*>* inspectorTorrentHashes = [self inspectorTorrentHashes];
     tr_session* session = self.fLib;
 
-    dispatch_async(self.fMainWindowSampleQueue, ^{
+    // Sampled on the session thread itself rather than under the session lock
+    // from a queue of our own: the cost to the engine is the same (it could
+    // not run while we held its lock either) and the app no longer holds the
+    // lock at all. Nothing here waits; the result is posted straight to main.
+    tr_sessionRunInSessionThread(session, ^{
         ControllerMainWindowSampleResult* sample = [ControllerMainWindowSampleResult new];
         sample.generation = generation;
 
@@ -3149,7 +3190,6 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         InternetStateEvidence internetStateEvidence = {};
 
         {
-            auto const lock = tr_sessionLock(session);
             auto const torrentCount = tr_sessionGetAllTorrents(session, nullptr, 0);
             auto torrents = std::vector<tr_torrent*>(torrentCount);
             if (torrentCount != 0)
@@ -3678,6 +3718,9 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         item.hashString = torrent.hashString;
         item.groupValue = torrent.groupValue;
         item.removeWhenFinishSeeding = torrent.removeWhenFinishSeeding;
+        // from the sampled stat the wrapper already holds: no engine access
+        item.waitToStart = torrent.waitingToStart;
+        item.active = torrent.active && !item.waitToStart;
         [metadata addObject:item];
     }
 
@@ -3692,24 +3735,13 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
     }
 
     NSMutableArray<NSDictionary*>* history = [NSMutableArray arrayWithCapacity:metadata.count];
-    auto const lock = tr_sessionLock(self.fLib);
 
     for (ControllerTorrentHistoryMetadata* item in metadata)
     {
-        tr_torrent* torrentStruct = tr_torrentFindFromId(self.fLib, item.torrentId);
-        if (torrentStruct == nullptr)
-        {
-            continue;
-        }
-
-        tr_stat const* stat = tr_torrentStat(torrentStruct);
-        BOOL const waitToStart = stat->activity == TR_STATUS_DOWNLOAD_WAIT || stat->activity == TR_STATUS_SEED_WAIT;
-        BOOL const active = stat->activity != TR_STATUS_STOPPED && !waitToStart;
-
         [history addObject:@{
             @"TorrentHash" : item.hashString,
-            @"Active" : @(active),
-            @"WaitToStart" : @(waitToStart),
+            @"Active" : @(item.active),
+            @"WaitToStart" : @(item.waitToStart),
             @"GroupValue" : @(item.groupValue),
             @"RemoveWhenFinishSeeding" : @(item.removeWhenFinishSeeding)
         }];
@@ -6720,9 +6752,13 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
 - (void)rpcMovedTorrent:(Torrent*)torrent
 {
     [self requestMainWindowSample];
+    dispatch_queue_t diskQueue = self.fTorrentCommandQueue;
     [self runTorrentCommand:TorrentPendingCommandNone onTorrents:@[ torrent ]
                       block:^(Torrent* /*torrent*/, tr_torrent* torrentStruct) {
-                          [Torrent updateTimeMachineExcludeForStruct:torrentStruct];
+                          if (dispatch_block_t diskWork = [Torrent timeMachineExcludeUpdateForStruct:torrentStruct])
+                          {
+                              dispatch_async(diskQueue, diskWork);
+                          }
                       }
                  completion:nil];
 }

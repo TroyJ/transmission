@@ -1443,8 +1443,25 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
 
     // close the low-hanging fruit that can be closed immediately w/o consequences
     utp_timer.reset();
-    relocator_.reset();
     verifier_.reset();
+
+    // The relocate thread, like the write worker below, may be inside a write
+    // that a stalled volume holds for minutes. Ask it to stop now (it saves the
+    // journal at the next chunk boundary, which is what lets the relocation
+    // resume next start), let it share the write worker's grace, and if it has
+    // still not stopped, abandon it: its state is shared with the thread and
+    // its mediator no-ops once live_handle_ is closed in closeImplPart2.
+    auto const grace_deadline = std::min(std::chrono::steady_clock::now() + ShutdownDiskGrace, deadline);
+    auto const grace_left = [grace_deadline]()
+    {
+        return std::max(
+            std::chrono::milliseconds{ 0 },
+            std::chrono::duration_cast<std::chrono::milliseconds>(grace_deadline - std::chrono::steady_clock::now()));
+    };
+    if (relocator_)
+    {
+        relocator_->prepare_shutdown();
+    }
 
     // Everything the cache handed to the write worker should reach the disk
     // before anything else is torn down -- but a stalled volume can hold a
@@ -1456,13 +1473,20 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     if (this->cache)
     {
         this->cache->flush_all();
-        auto const grace = std::min(
-            ShutdownDiskGrace,
-            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
-        if (!this->cache->drain_for(std::max(grace, std::chrono::milliseconds{ 0 })))
+        if (!this->cache->drain_for(grace_left()))
         {
             abandon_unwritten_blocks();
         }
+    }
+
+    if (relocator_)
+    {
+        if (!relocator_->wait_for_idle(grace_left()))
+        {
+            tr_logAddWarn(_("A relocation is still waiting on its volume; giving up on it. It will resume on the next start."));
+            relocator_->abandon();
+        }
+        relocator_.reset();
     }
 
     piece_checker_.reset();
@@ -1556,6 +1580,13 @@ void tr_session::closeImplPart2(std::promise<void>* closed_promise, std::chrono:
     tr_utp_close(this);
     this->udp_core_.reset();
 
+    // From here nothing may post to the session thread: a relocate thread
+    // abandoned in closeImplPart1 finds the handle closed and does nothing.
+    {
+        auto const lock = std::scoped_lock{ live_handle_->mutex };
+        live_handle_->session = nullptr;
+    }
+
     // tada we are done!
     closed_promise->set_value();
 }
@@ -1582,6 +1613,12 @@ void tr_sessionCheckpointRelocations(tr_session* session)
 {
     TR_ASSERT(session != nullptr);
     session->checkpoint_relocations_for_shutdown();
+}
+
+void tr_sessionRunInSessionThread(tr_session* session, std::function<void()> func)
+{
+    TR_ASSERT(session != nullptr);
+    session->run_in_session_thread(std::move(func));
 }
 
 namespace
@@ -2505,6 +2542,8 @@ tr_session_disk_stats tr_sessionGetDiskStats(tr_session const* session)
     auto out = tr_session_disk_stats{};
     out.pending_write_bytes = session->cache ? session->cache->pending_write_bytes() : 0U;
     out.lock_hold_max_msec = snap.lock_hold_max_usec / 1000U;
+    out.lock_hold_worst_site = tr_io_trace::worst_hold_site_string();
+    out.lock_hold_worst_ops = snap.lock_hold_worst_ops;
     out.slow_op_count = snap.slow_op_count;
     out.worst_op_msec = snap.worst_op_usec / 1000U;
     out.worst_op = tr_io_trace::op_name(snap.worst_op);
@@ -2575,6 +2614,7 @@ tr_session::tr_session(std::string_view config_dir, tr_variant const& settings_d
     , queue_timer_{ timer_maker_->create([this]() { on_queue_timer(); }) }
     , save_timer_{ timer_maker_->create([this]() { on_save_timer(); }) }
 {
+    live_handle_->session = this;
     tr_io_trace::set_session_thread_timing_enabled(true); // a previous session's shutdown turned it off
     now_timer_->start_repeating(1s);
     queue_timer_->start_repeating(QueueInterval);

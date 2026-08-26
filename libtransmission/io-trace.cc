@@ -63,6 +63,17 @@ auto stats = std::array<OpStats, NumOps>{};
 auto locked_stats = std::array<OpStats, NumOps>{};
 
 auto locked_backtraces_per_site = std::uint64_t{ 3U };
+auto hold_backtraces_per_site = std::uint64_t{ 3U };
+
+// The slowest session-lock hold so far: where it was taken and how many disk
+// ops began under it. Updated on the rare slow path, so a mutex is fine.
+std::mutex worst_hold_mutex;
+auto worst_hold_usec = std::uint64_t{};
+auto worst_hold_ops = std::uint64_t{};
+char const* worst_hold_file = "";
+auto worst_hold_line = 0;
+
+thread_local auto ops_in_hold = std::uint64_t{};
 auto abort_on_locked_io = false;
 
 struct Gauge
@@ -276,6 +287,7 @@ struct Initializer
         }
 
         locked_backtraces_per_site = env_number("TR_TRACE_IO_LOCKED_BT", 3U);
+        hold_backtraces_per_site = env_number("TR_TRACE_IO_HOLD_BT", 3U);
         abort_on_locked_io = env_is_on("TR_TRACE_IO_ABORT");
 
         dump_interval = std::chrono::seconds{ static_cast<long long>(env_number("TR_TRACE_IO_DUMP_SEC", 60U)) };
@@ -412,6 +424,87 @@ bool session_lock_held() noexcept
     return tr_session_lock_depth() > 0U;
 }
 
+void on_lock_hold_begin() noexcept
+{
+    ops_in_hold = 0U;
+}
+
+void count_op_under_lock() noexcept
+{
+    ++ops_in_hold;
+}
+
+std::uint64_t ops_in_current_hold() noexcept
+{
+    return ops_in_hold;
+}
+
+[[nodiscard]] std::string site_string(char const* file, int line)
+{
+    if (file == nullptr)
+    {
+        return "?";
+    }
+    auto const* const sep = std::strrchr(file, '/');
+    return fmt::format("{:s}:{:d}", sep != nullptr ? sep + 1 : file, line);
+}
+
+// `file` is the __builtin_FILE() literal of the lock site -- static storage,
+// so the pointer itself is kept for the snapshot.
+void report_lock_hold(char const* file, int const line, std::uint64_t const elapsed_usec, std::uint64_t const ops_inside)
+{
+    {
+        auto const lock = std::lock_guard{ worst_hold_mutex };
+        if (elapsed_usec > worst_hold_usec)
+        {
+            worst_hold_usec = elapsed_usec;
+            worst_hold_ops = ops_inside;
+            worst_hold_file = file != nullptr ? file : "";
+            worst_hold_line = line;
+        }
+    }
+
+    record(Op::LockHold, elapsed_usec, -1, 0U, 0U, {});
+
+    if (!enabled() || elapsed_usec < threshold_usec())
+    {
+        return;
+    }
+
+    auto const site = site_string(file, line);
+    auto line_out = fmt::format(
+        "[io-trace] slow lock-hold: {:.3f}s held from {:s}, {:d} disk op{:s} began inside it",
+        elapsed_usec / 1e6,
+        site,
+        ops_inside,
+        ops_inside == 1U ? "" : "s");
+
+    static std::mutex seen_mutex;
+    static std::map<std::string, std::uint64_t> seen;
+    auto n_seen = std::uint64_t{};
+    {
+        auto const lock = std::lock_guard{ seen_mutex };
+        n_seen = ++seen[site];
+    }
+#ifndef _WIN32
+    if (n_seen <= hold_backtraces_per_site)
+    {
+        auto frames = std::array<void*, 48>{};
+        auto const n_frames = backtrace(std::data(frames), static_cast<int>(std::size(frames)));
+        if (auto** symbols = backtrace_symbols(std::data(frames), n_frames); symbols != nullptr)
+        {
+            line_out += fmt::format(" (released at, #{}):", n_seen);
+            for (auto i = 1; i < n_frames; ++i) // frame 0 is this function
+            {
+                line_out += fmt::format("\n    {:s}", demangle_frame(symbols[i]));
+            }
+            std::free(symbols);
+        }
+    }
+#endif
+    write_line(line_out);
+}
+
 // I/O on the config dir -- resume files, .torrent copies, blocklists,
 // dht.dat -- is on the boot volume, is small, and has always been done under
 // the lock. It is not what freezes the app, and it drowns the report. It is
@@ -546,14 +639,7 @@ void record(
             where = path_for_fd(fd);
         }
 
-        if (op == Op::LockHold)
-        {
-            write_line(
-                std::empty(where) ?
-                    fmt::format("[io-trace] slow lock-hold: {:.3f}s", elapsed_usec / 1e6) :
-                    fmt::format("[io-trace] slow lock-hold: {:.3f}s held from {:s}", elapsed_usec / 1e6, where));
-        }
-        else
+        if (op != Op::LockHold) // holds are reported by report_lock_hold(), with what happened inside them
         {
             write_line(
                 fmt::format(
@@ -585,10 +671,35 @@ std::uint64_t locked_count(Op const op) noexcept
     return idx < NumOps ? locked_stats[idx].count.load(std::memory_order_relaxed) : 0U;
 }
 
+char const* worst_hold_site_string()
+{
+    static std::mutex string_mutex;
+    static std::string storage;
+    static auto storage_line = -1;
+    static char const* storage_file = nullptr;
+
+    auto const lock = std::lock_guard{ string_mutex };
+    auto const hold_lock = std::lock_guard{ worst_hold_mutex };
+    if (worst_hold_file != storage_file || worst_hold_line != storage_line)
+    {
+        storage_file = worst_hold_file;
+        storage_line = worst_hold_line;
+        storage = std::empty(std::string_view{ worst_hold_file }) ? std::string{} :
+                                                                    site_string(worst_hold_file, worst_hold_line);
+    }
+    return storage.c_str();
+}
+
 Snapshot snapshot() noexcept
 {
     auto out = Snapshot{};
     out.lock_hold_max_usec = stats[static_cast<std::size_t>(Op::LockHold)].max_usec.load(std::memory_order_relaxed);
+    {
+        auto const lock = std::lock_guard{ worst_hold_mutex };
+        out.lock_hold_worst_ops = worst_hold_ops;
+        out.lock_hold_worst_site = worst_hold_file;
+        out.lock_hold_worst_line = worst_hold_line;
+    }
 
     {
         auto const& st = stats[static_cast<std::size_t>(Op::SessionThreadWait)];

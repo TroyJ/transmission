@@ -2066,6 +2066,8 @@ void add_strings_from_var(std::set<std::string_view>& strings, tr_variant const&
     // 11 minutes", and a lock-hold max above a second or so is a bug report.
     auto const disk = tr_io_trace::snapshot();
     args_out.try_emplace(TR_KEY_disk_lock_hold_max_msec, static_cast<int64_t>(disk.lock_hold_max_usec / 1000U));
+    args_out.try_emplace(TR_KEY_disk_lock_hold_worst_ops, static_cast<int64_t>(disk.lock_hold_worst_ops));
+    args_out.try_emplace(TR_KEY_disk_lock_hold_worst_site, std::string{ tr_io_trace::worst_hold_site_string() });
     args_out.try_emplace(TR_KEY_disk_pending_write_bytes, static_cast<int64_t>(session->cache->pending_write_bytes()));
     args_out.try_emplace(TR_KEY_disk_request_cancels, static_cast<int64_t>(session->cache->backlog_cancel_count()));
     args_out.try_emplace(TR_KEY_disk_slow_op_count, static_cast<int64_t>(disk.slow_op_count));
