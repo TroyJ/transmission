@@ -704,6 +704,8 @@ namespace make_torrent_field_helpers
         return "failed"sv;
     case TR_RELOC_CANCELLED:
         return "cancelled"sv;
+    case TR_RELOC_CANCELLING:
+        return "cancelling"sv;
     }
 
     return "failed"sv;
@@ -2069,6 +2071,12 @@ void add_strings_from_var(std::set<std::string_view>& strings, tr_variant const&
     args_out.try_emplace(TR_KEY_disk_slow_op_count, static_cast<int64_t>(disk.slow_op_count));
     args_out.try_emplace(TR_KEY_disk_worst_op, std::string{ tr_io_trace::op_name(disk.worst_op) });
     args_out.try_emplace(TR_KEY_disk_worst_op_msec, static_cast<int64_t>(disk.worst_op_usec / 1000U));
+
+    // Blocking the session thread without holding the mutex -- joining a worker,
+    // waiting on a condition variable -- shows up in none of the disk counters,
+    // only in how long everything queued behind it waited.
+    args_out.try_emplace(TR_KEY_session_thread_wait_max_msec, static_cast<int64_t>(disk.session_thread_wait_max_usec / 1000U));
+    args_out.try_emplace(TR_KEY_session_thread_stall_count, static_cast<int64_t>(disk.session_thread_stall_count));
 
     return { JsonRpc::Error::SUCCESS, {} };
 }

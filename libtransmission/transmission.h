@@ -457,6 +457,13 @@ struct tr_session_disk_stats
     uint64_t slow_op_count; /* disk ops that took >= 1 s */
     uint64_t worst_op_msec; /* the slowest disk op so far... */
     char const* worst_op; /* ...and what it was: "write", "close", ... (static string) */
+
+    /* Longest a queued task waited for the session thread, and how many waited
+     * a second or more. This is what catches something blocking the session
+     * thread without holding the mutex -- a worker join or condition variable,
+     * which none of the counters above can see. */
+    uint64_t session_thread_wait_max_msec;
+    uint64_t session_thread_stall_count;
 };
 
 tr_session_disk_stats tr_sessionGetDiskStats(tr_session const* session);
@@ -948,7 +955,13 @@ enum tr_torrent_relocation_state : uint8_t
     TR_RELOC_RENAMING,
     TR_RELOC_DELETING_SOURCE,
     TR_RELOC_ERROR,
-    TR_RELOC_CANCELLED
+    TR_RELOC_CANCELLED,
+    /* A cancel has been asked for; the relocate thread is still inside its
+     * current chunk and will report TR_RELOC_CANCELLED once it notices. Never
+     * written to the journal -- it only exists so a GUI does not look ignored
+     * while a stalled volume takes its time. Appended last so the persisted
+     * numbering of the states above is untouched. */
+    TR_RELOC_CANCELLING
 };
 
 /**

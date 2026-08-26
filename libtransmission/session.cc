@@ -2292,11 +2292,15 @@ void tr_session::sweep_stale_relocations()
     }
 }
 
-void tr_session::relocate_remove(tr_torrent const* const tor)
+void tr_session::relocate_remove(tr_torrent const* const tor, std::function<void()> on_stopped)
 {
     if (relocator_)
     {
-        relocator_->remove(tor->info_hash());
+        relocator_->remove(tor->info_hash(), std::move(on_stopped));
+    }
+    else if (on_stopped)
+    {
+        on_stopped();
     }
 }
 
@@ -2499,6 +2503,8 @@ tr_session_disk_stats tr_sessionGetDiskStats(tr_session const* session)
     out.slow_op_count = snap.slow_op_count;
     out.worst_op_msec = snap.worst_op_usec / 1000U;
     out.worst_op = tr_io_trace::op_name(snap.worst_op);
+    out.session_thread_wait_max_msec = snap.session_thread_wait_max_usec / 1000U;
+    out.session_thread_stall_count = snap.session_thread_stall_count;
     return out;
 }
 

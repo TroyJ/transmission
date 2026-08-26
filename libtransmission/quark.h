@@ -593,6 +593,8 @@ enum // NOLINT(performance-enum-size)
     TR_KEY_session_id,
     TR_KEY_session_set,
     TR_KEY_session_stats,
+    TR_KEY_session_thread_stall_count,
+    TR_KEY_session_thread_wait_max_msec,
     TR_KEY_show_backup_trackers_kebab_APICOMPAT,
     TR_KEY_show_extra_peer_details_kebab_APICOMPAT,
     TR_KEY_show_filterbar_kebab_APICOMPAT,

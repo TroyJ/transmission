@@ -67,9 +67,10 @@ enum class Op : std::uint8_t
     Path, // stat/rename/remove/mkdir/opendir: metadata ops, which queue behind writes on a stalled volume
     Wait, // the session thread blocking on the write worker (Cache::drain)
     LockHold,
+    SessionThreadWait, // how long a queued task waited before the session thread ran it
 };
 
-inline auto constexpr NumOps = std::size_t{ 9U };
+inline auto constexpr NumOps = std::size_t{ 10U };
 
 namespace detail
 {
@@ -93,6 +94,13 @@ struct Snapshot
     std::uint64_t worst_op_usec = 0U; // the slowest disk op so far...
     Op worst_op = Op::Open; // ...and what it was
     std::uint64_t pending_write_bytes = 0U; // queued for the write worker right now
+
+    /* How long the session thread made a queued task wait. A disk op that
+     * blocks the session thread without holding the mutex -- a worker join, a
+     * condition variable -- is invisible to every counter above, but it shows
+     * up here, because everything queued behind it waited. */
+    std::uint64_t session_thread_wait_max_usec = 0U;
+    std::uint64_t session_thread_stall_count = 0U; // queued tasks that waited >= 1 s
 };
 
 [[nodiscard]] Snapshot snapshot() noexcept;

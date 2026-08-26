@@ -269,7 +269,7 @@ auto const initializer = Initializer{};
 char const* op_name(Op op) noexcept
 {
     static auto constexpr Names = std::array<char const*, NumOps>{
-        "open", "close", "read", "write", "truncate", "preallocate", "path", "wait", "lock-hold",
+        "open", "close", "read", "write", "truncate", "preallocate", "path", "wait", "lock-hold", "session-thread-wait",
     };
 
     auto const idx = static_cast<std::size_t>(op);
@@ -476,9 +476,19 @@ Snapshot snapshot() noexcept
     auto out = Snapshot{};
     out.lock_hold_max_usec = stats[static_cast<std::size_t>(Op::LockHold)].max_usec.load(std::memory_order_relaxed);
 
+    {
+        auto const& st = stats[static_cast<std::size_t>(Op::SessionThreadWait)];
+        out.session_thread_wait_max_usec = st.max_usec.load(std::memory_order_relaxed);
+        for (auto i = std::size_t{ 21U }; i < NumBuckets; ++i) // 1 s = 2^20 usec is bucket 21
+        {
+            out.session_thread_stall_count += st.buckets[i].load(std::memory_order_relaxed);
+        }
+    }
+
     for (auto op = std::size_t{ 0U }; op < NumOps; ++op)
     {
-        if (op == static_cast<std::size_t>(Op::LockHold) || op == static_cast<std::size_t>(Op::Wait))
+        if (op == static_cast<std::size_t>(Op::LockHold) || op == static_cast<std::size_t>(Op::Wait) ||
+            op == static_cast<std::size_t>(Op::SessionThreadWait))
         {
             continue; // not disk ops
         }

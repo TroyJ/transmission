@@ -580,6 +580,8 @@ auto constexpr MyStatic = std::array<std::string_view, TR_N_KEYS>{
     "session_id"sv, // rpc
     "session_set"sv, // rpc
     "session_stats"sv, // rpc
+    "session_thread_stall_count"sv, // rpc
+    "session_thread_wait_max_msec"sv, // rpc
     "show-backup-trackers"sv, // gtk app, qt app
     "show-extra-peer-details"sv, // gtk app
     "show-filterbar"sv, // gtk app, qt app

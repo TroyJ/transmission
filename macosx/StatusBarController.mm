@@ -185,6 +185,17 @@ static NSColor* colorForInternetState(InternetStateIndicatorState state)
                              diskStats.worst_op_msec / 1000.0];
     }
 
+    // Something blocking the session thread is a bug, and it is invisible in
+    // the numbers above -- it shows up only as everything else queueing behind it.
+    if (diskStats.session_thread_stall_count > 0)
+    {
+        NSString* const stallString = [NSString
+            stringWithFormat:NSLocalizedString(@"Backend stalled %llu times, longest %.1f s", "status bar -> disk tooltip"),
+                             diskStats.session_thread_stall_count,
+                             diskStats.session_thread_wait_max_msec / 1000.0];
+        diskToolTip = diskToolTip != nil ? [diskToolTip stringByAppendingFormat:@"\n%@", stallString] : stallString;
+    }
+
     if (![self.fStatusButton.title isEqualToString:statusString])
     {
         self.fStatusButton.title = statusString;

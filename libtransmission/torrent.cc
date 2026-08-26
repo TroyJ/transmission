@@ -168,6 +168,8 @@ struct RelocationJournalState
 
 [[nodiscard]] constexpr bool is_relocation_active(tr_torrent_relocation_state const state) noexcept
 {
+    // TR_RELOC_CANCELLING counts as active: the copy is still running until the
+    // relocate thread notices, and it resumes on restart if we never got there
     return state != TR_RELOC_NONE && state != TR_RELOC_ERROR && state != TR_RELOC_CANCELLED;
 }
 
@@ -898,8 +900,11 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
         tr_logAddInfoTor(tor, _("Removing torrent"));
     }
 
-    tor->session->relocate_remove(tor);
-    tor->discard_relocation_leftovers();
+    /* Build the cleanup while the torrent is still here, then let the relocate
+     * worker run it once it has stopped -- it may still be copying this
+     * torrent, and on a slow volume waiting for it here would hold the session
+     * lock for as long as the current chunk takes. */
+    tor->session->relocate_remove(tor, tor->make_relocation_leftover_discarder());
     tor->set_dirty(!tor->is_deleting_);
     tor->stop_now();
 
@@ -2333,13 +2338,13 @@ bool tr_torrent::can_cancel_relocation() const noexcept
         relocation_state() == TR_RELOC_VERIFYING;
 }
 
-void tr_torrent::discard_relocation_leftovers()
+std::function<void()> tr_torrent::make_relocation_leftover_discarder()
 {
     forget_found_paths();
-    auto const journal_file = relocation_journal_file();
+    auto journal_file = relocation_journal_file();
     if (!tr_sys_path_exists(journal_file))
     {
-        return;
+        return {};
     }
 
     auto const journal = load_relocation_journal_state(journal_file);
@@ -2349,13 +2354,17 @@ void tr_torrent::discard_relocation_leftovers()
         auto const mediator = RelocateMediator{ this, target_root, nullptr, {} };
         // The staged files live on the target volume; deleting them is disk
         // work and runs on the disk thread. The snapshot is self-contained.
-        session->cache->run_after_pending_writes_on_worker([snapshot = mediator.snapshot()]()
-                                                           { tr_relocate_worker::discard_staged_files(snapshot); });
+        return [session = this->session, snapshot = mediator.snapshot()]()
+        {
+            session->cache->run_after_pending_writes_on_worker([snapshot]()
+                                                               { tr_relocate_worker::discard_staged_files(snapshot); });
+        };
     }
-    else
+
+    return [journal_file = std::move(journal_file)]()
     {
         tr_sys_path_remove(journal_file, nullptr); // discard_staged_files() removes it otherwise
-    }
+    };
 }
 
 void tr_torrent::retry_relocation()

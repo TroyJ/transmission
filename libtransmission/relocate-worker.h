@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +25,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "libtransmission/torrent-metainfo.h"
 #include "libtransmission/transmission.h"
@@ -75,7 +77,11 @@ public:
     tr_relocate_worker& operator=(tr_relocate_worker&&) = delete;
 
     [[nodiscard]] bool add(std::unique_ptr<Mediator> mediator, tr_priority_t priority);
-    void remove(tr_sha1_digest_t const& info_hash);
+    // Stop relocating `info_hash` and forget it. Never waits: if the relocate
+    // thread is on that torrent it is asked to stop and `on_stopped` runs on
+    // the relocate thread once it has, so a caller can safely delete the staged
+    // files from there. Otherwise `on_stopped` runs inline.
+    void remove(tr_sha1_digest_t const& info_hash, std::function<void()> on_stopped = {});
     bool cancel(tr_sha1_digest_t const& info_hash);
     void prepare_shutdown();
 
@@ -131,6 +137,7 @@ private:
     std::atomic<bool> stop_current_ = false;
     std::atomic<bool> cancel_current_ = false;
     bool shutdown_requested_ = false;
+    std::vector<std::function<void()>> stopped_callbacks_;
     std::condition_variable stop_current_cv_;
     std::condition_variable state_cv_;
 };

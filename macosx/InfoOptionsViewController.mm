@@ -30,6 +30,7 @@ static NSInteger const kInvalidValue = -99;
 
 static CGFloat const kStackViewInset = 12.0;
 static CGFloat const kStackViewSpacing = 8.0;
+static CGFloat const kRelocationButtonSpacing = 6.0;
 
 @interface InfoOptionsViewController ()
 
@@ -66,6 +67,8 @@ static CGFloat const kStackViewSpacing = 8.0;
 @property(nonatomic, readonly) CGFloat fHorizLayoutWidth;
 @property(nonatomic, readonly) CGFloat fVertLayoutHeight;
 @property(nonatomic) NSButton* fRelocationActionButton;
+@property(nonatomic) NSLayoutConstraint* fSeedingViewHeightConstraint;
+@property(nonatomic) CGFloat fSeedingViewBaseHeight;
 @property(nonatomic) RelocationActionType fRelocationActionType;
 
 @end
@@ -95,9 +98,27 @@ static CGFloat const kStackViewSpacing = 8.0;
     [self.fSeedingView addSubview:self.fRelocationActionButton];
     [NSLayoutConstraint activateConstraints:@[
         [self.fRelocationActionButton.leadingAnchor constraintEqualToAnchor:self.fRemoveSeedingCompleteCheck.leadingAnchor],
-        [self.fRelocationActionButton.topAnchor constraintEqualToAnchor:self.fRemoveSeedingCompleteCheck.bottomAnchor constant:6.0],
+        // under everything else in this column, not just under the checkbox it
+        // is aligned with -- the Advanced rows sit below that checkbox
+        [self.fRelocationActionButton.topAnchor constraintEqualToAnchor:self.fPeersConnectField.bottomAnchor
+                                                               constant:kRelocationButtonSpacing],
+        [self.fRelocationActionButton.topAnchor constraintGreaterThanOrEqualToAnchor:self.fRemoveSeedingCompleteCheck.bottomAnchor
+                                                                            constant:kRelocationButtonSpacing],
         [self.fRelocationActionButton.trailingAnchor constraintLessThanOrEqualToAnchor:self.fSeedingView.trailingAnchor constant:-12.0],
     ]];
+
+    // The seeding view has a fixed height in the xib and clips its contents, so
+    // a button added under the last row is invisible until that height makes
+    // room for it. Keep the constraint so it can be grown while the button is up.
+    for (NSLayoutConstraint* constraint in self.fSeedingView.constraints)
+    {
+        if (constraint.firstAttribute == NSLayoutAttributeHeight && constraint.secondItem == nil && constraint.firstItem == self.fSeedingView)
+        {
+            self.fSeedingViewHeightConstraint = constraint;
+            self.fSeedingViewBaseHeight = constraint.constant;
+            break;
+        }
+    }
 
     [self setGlobalLabels];
 
@@ -109,7 +130,9 @@ static CGFloat const kStackViewSpacing = 8.0;
 
 - (CGFloat)fHorizLayoutHeight
 {
-    return NSHeight(self.fPriorityView.frame) + 2 * kStackViewInset;
+    // side by side, so the taller column sets the height -- the seeding column
+    // is the taller one whenever the relocation action button is showing
+    return MAX(NSHeight(self.fPriorityView.frame), NSHeight(self.fSeedingView.frame)) + 2 * kStackViewInset;
 }
 
 - (CGFloat)fHorizLayoutWidth
@@ -855,7 +878,14 @@ static CGFloat const kStackViewSpacing = 8.0;
 
     if (wasHidden != self.fRelocationActionButton.hidden)
     {
-        [self.view setNeedsLayout:YES];
+        if (self.fSeedingViewHeightConstraint != nil)
+        {
+            CGFloat const extra = self.fRelocationActionButton.hidden ? 0.0 : self.fRelocationActionButton.fittingSize.height + kRelocationButtonSpacing;
+            self.fSeedingViewHeightConstraint.constant = self.fSeedingViewBaseHeight + extra;
+        }
+
+        [self.view layoutSubtreeIfNeeded];
+        [self checkWindowSize]; // the inspector window is sized from the two columns
     }
 }
 

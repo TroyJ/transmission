@@ -37,6 +37,7 @@
         return NSColor.systemRedColor;
 
     case TR_RELOC_CANCELLED:
+    case TR_RELOC_CANCELLING:
         return NSColor.systemOrangeColor;
 
     case TR_RELOC_NONE:

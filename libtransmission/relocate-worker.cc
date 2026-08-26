@@ -68,6 +68,8 @@ auto constexpr VerifyRelocatedDataByDefault = false;
         return "failed"sv;
     case TR_RELOC_CANCELLED:
         return "cancelled"sv;
+    case TR_RELOC_CANCELLING:
+        return "cancelling"sv;
     }
 
     return "failed"sv;
@@ -106,6 +108,10 @@ auto constexpr VerifyRelocatedDataByDefault = false;
     if (phase == "cancelled"sv)
     {
         return TR_RELOC_CANCELLED;
+    }
+    if (phase == "cancelling"sv)
+    {
+        return TR_RELOC_CANCELLING;
     }
 
     return {};
@@ -1255,22 +1261,41 @@ bool tr_relocate_worker::add(std::unique_ptr<Mediator> mediator, tr_priority_t c
     return true;
 }
 
-void tr_relocate_worker::remove(tr_sha1_digest_t const& info_hash)
+void tr_relocate_worker::remove(tr_sha1_digest_t const& info_hash, std::function<void()> on_stopped)
 {
     auto lock = std::unique_lock{ relocate_mutex_ };
 
     if (current_node_ && current_node_->matches(info_hash))
     {
+        /* Ask the relocate thread to stop and hand it the cleanup. Waiting for
+         * the ack here would block the caller -- removal runs on the session
+         * thread holding the session lock, so on a stalled volume the whole
+         * session waited for as long as the current chunk took. Running the
+         * cleanup on the relocate thread keeps the ordering that wait bought:
+         * the staged files are deleted only once nothing is copying to them. */
         stop_current_ = true;
-        stop_current_cv_.wait(lock, [this]() { return !stop_current_; });
+        if (on_stopped)
+        {
+            stopped_callbacks_.emplace_back(std::move(on_stopped));
+        }
+
+        return;
     }
-    else if (auto const iter = std::find_if(
-                 std::begin(todo_),
-                 std::end(todo_),
-                 [&info_hash](auto const& node) { return node.matches(info_hash); });
-             iter != std::end(todo_))
+
+    if (auto const iter = std::find_if(
+            std::begin(todo_),
+            std::end(todo_),
+            [&info_hash](auto const& node) { return node.matches(info_hash); });
+        iter != std::end(todo_))
     {
         todo_.erase(iter);
+    }
+
+    lock.unlock();
+
+    if (on_stopped)
+    {
+        on_stopped(); // nothing is copying this torrent, so cleaning up now is safe
     }
 }
 
@@ -1286,9 +1311,16 @@ bool tr_relocate_worker::cancel(tr_sha1_digest_t const& info_hash)
             return false;
         }
 
+        /* Ask and return: the relocate thread notices the flags between chunks,
+         * writes the CANCELLED journal and reports it through the mediator.
+         * Waiting for that ack here would block the caller -- and cancel is
+         * called from the session thread, so on a stalled volume the whole
+         * session waited for as long as the current chunk took (42 s measured
+         * on the SD card, see docs/gui-clickthrough-validation.md D1). */
         cancel_current_ = true;
         stop_current_ = true;
-        stop_current_cv_.wait(lock, [this]() { return !stop_current_; });
+        current_node_->mediator_
+            ->on_relocate_state_changed(TR_RELOC_CANCELLING, journal->bytes_copied, journal->bytes_total, 0U, {});
         return true;
     }
 
@@ -1362,9 +1394,16 @@ void tr_relocate_worker::relocate_thread_func()
             current_node_.reset();
             stop_current_ = false;
             cancel_current_ = false;
+            auto stopped_callbacks = std::exchange(stopped_callbacks_, {});
             lock.unlock();
             stop_current_cv_.notify_all();
             state_cv_.notify_all();
+
+            // whoever asked us to stop can now touch this torrent's staged files
+            for (auto const& on_stopped : stopped_callbacks)
+            {
+                on_stopped();
+            }
         };
 
         if (journal.phase == TR_RELOC_DELETING_SOURCE && all_final_files_ready(snapshot))

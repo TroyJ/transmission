@@ -22,6 +22,10 @@
 NSString* const kTorrentDidChangeGroupNotification = @"TorrentDidChangeGroup";
 
 static int const kETAIdleDisplaySec = 2 * 60;
+// Past this the number is noise, not an estimate: a stalled disk cancels the
+// peers' outstanding requests, the rate falls to a trickle, and the honest
+// arithmetic produces "6 yrs, 3 m. remaining".
+static time_t const kETADisplayMaxSec = 365 * 24 * 60 * 60;
 static NSInteger const kMainWindowMaxPieces = 18 * 18;
 
 static dispatch_queue_t timeMachineExcludeQueue;
@@ -1815,6 +1819,11 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
         case TR_RELOC_DELETING_SOURCE:
             phaseString = NSLocalizedString(@"Cleaning old data", "Torrent -> status string");
             break;
+        case TR_RELOC_CANCELLING:
+            // the copy keeps running until it reaches its next stopping point,
+            // which on a stalled volume can be a while
+            phaseString = NSLocalizedString(@"Cancelling move", "Torrent -> status string");
+            break;
         default:
             break;
         }
@@ -2974,8 +2983,9 @@ static bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* e
         eta = self.fStat->etaIdle;
         fromIdle = YES;
     }
-    // Foundation undocumented behavior: values above INT32_MAX (68 years) are interpreted as negative values by `stringFromTimeInterval` (#3451)
-    if (eta < 0 || eta > INT32_MAX || (fromIdle && eta >= kETAIdleDisplaySec))
+    // Anything past a year reads as noise; Foundation also mis-renders values
+    // above INT32_MAX (68 years) as negative (#3451), which this bound covers.
+    if (eta < 0 || eta > kETADisplayMaxSec || (fromIdle && eta >= kETAIdleDisplaySec))
     {
         return NSLocalizedString(@"remaining time unknown", "Torrent -> eta string");
     }

@@ -4,7 +4,11 @@
 // License text can be found in the licenses/ folder.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,6 +20,7 @@
 #include <libtransmission/file.h> // tr_sys_path_*()
 #include <libtransmission/io-trace.h>
 #include <libtransmission/quark.h>
+#include <libtransmission/relocate-worker.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/torrent-files.h>
 #include <libtransmission/tr-strbuf.h>
@@ -295,6 +300,12 @@ TEST_F(MoveTest, relocationControlPredicates)
     EXPECT_FALSE(tr_torrentCanResumeRelocation(tor));
     EXPECT_TRUE(tr_torrentCanCancelRelocation(tor));
 
+    // a cancel that has been asked for but not yet noticed by the relocate thread
+    tor->set_relocation_state(TR_RELOC_CANCELLING, 1U, 2U, 0U, {});
+    EXPECT_FALSE(tr_torrentCanRetryRelocation(tor));
+    EXPECT_FALSE(tr_torrentCanResumeRelocation(tor));
+    EXPECT_FALSE(tr_torrentCanCancelRelocation(tor)); // no second cancel while one is pending
+
     tor->set_relocation_state(TR_RELOC_CANCELLED, 1U, 2U, 0U, {});
     EXPECT_FALSE(tr_torrentCanRetryRelocation(tor));
     EXPECT_TRUE(tr_torrentCanResumeRelocation(tor));
@@ -347,6 +358,171 @@ TEST_F(MoveTest, failedRelocationKeepsPausedTorrentStopped)
     ASSERT_TRUE(waitFor([&state]() { return state == TR_LOC_ERROR; }, MaxWaitMsec));
     ASSERT_TRUE(waitForRelocationState(tor, TR_RELOC_ERROR, MaxWaitMsec));
     EXPECT_FALSE(tor->is_running());
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+// A mediator whose first "copying" notification blocks, standing in for the
+// relocate thread being stuck inside a slow chunk on a stalled volume. The
+// worker owns and destroys the mediator, so what the test observes lives in a
+// shared state object that outlives it.
+struct BlockedRelocateState
+{
+    std::atomic<bool> copying = false;
+    std::atomic<bool> cancelled = false;
+    std::atomic<tr_torrent_relocation_state> last_state = TR_RELOC_NONE;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool released = false;
+
+    void release()
+    {
+        {
+            auto const lock = std::scoped_lock{ mutex };
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
+class BlockingRelocateMediator final : public tr_relocate_worker::Mediator
+{
+public:
+    BlockingRelocateMediator(tr_relocate_worker::Snapshot snapshot, std::shared_ptr<BlockedRelocateState> state)
+        : snapshot_{ std::move(snapshot) }
+        , state_{ std::move(state) }
+    {
+    }
+
+    [[nodiscard]] tr_relocate_worker::Snapshot const& snapshot() const override
+    {
+        return snapshot_;
+    }
+
+    void on_relocate_state_changed(
+        tr_torrent_relocation_state const state,
+        uint64_t /*bytes_copied*/,
+        uint64_t /*bytes_total*/,
+        uint64_t /*rate_bps*/,
+        std::string_view /*error*/) override
+    {
+        state_->last_state.store(state);
+
+        if (state == TR_RELOC_CANCELLED)
+        {
+            state_->cancelled.store(true);
+            return;
+        }
+
+        if (state != TR_RELOC_COPYING || state_->copying.exchange(true))
+        {
+            return;
+        }
+
+        auto lock = std::unique_lock{ state_->mutex };
+        state_->cv.wait_for(lock, std::chrono::seconds{ 5 }, [this]() { return state_->released; });
+    }
+
+    [[nodiscard]] bool on_verified_location_ready() override
+    {
+        return false;
+    }
+
+    void on_source_deleted() override
+    {
+    }
+
+private:
+    tr_relocate_worker::Snapshot snapshot_;
+    std::shared_ptr<BlockedRelocateState> state_;
+};
+
+class RelocateWorkerTest : public SessionTest
+{
+protected:
+    [[nodiscard]] tr_relocate_worker::Snapshot makeSnapshot(tr_torrent const* tor, std::string_view target_root) const
+    {
+        auto snapshot = tr_relocate_worker::Snapshot{};
+        snapshot.torrent_id = tor->id();
+        snapshot.info_hash = tor->info_hash();
+        snapshot.info_hash_string = std::string{ tor->info_hash_string() };
+        snapshot.name = std::string{ tor->name() };
+        snapshot.metainfo = tor->metainfo();
+        snapshot.source_root = std::string{ tor->current_dir() };
+        snapshot.target_root = std::string{ target_root };
+        snapshot.previous_download_dir = std::string{ tor->download_dir() };
+        snapshot.journal_file = tor->relocation_journal_file();
+        return snapshot;
+    }
+
+    // Parks the relocate thread inside its first "copying" notification.
+    [[nodiscard]] std::shared_ptr<BlockedRelocateState> startBlockedRelocation(
+        tr_relocate_worker& worker,
+        tr_torrent const* tor,
+        std::string_view target_dir)
+    {
+        auto state = std::make_shared<BlockedRelocateState>();
+        auto mediator = std::make_unique<BlockingRelocateMediator>(makeSnapshot(tor, target_dir), state);
+        if (!worker.add(std::move(mediator), TR_PRI_NORMAL) ||
+            !waitFor([&state]() { return state->copying.load(); }, MaxWaitMsec))
+        {
+            return {};
+        }
+
+        return state;
+    }
+
+    static auto constexpr PromptMsec = 500; // a call that does not wait has no excuse for taking this long
+};
+
+TEST_F(RelocateWorkerTest, cancelDoesNotWaitForTheCurrentChunk)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/cancel-target"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    auto worker = tr_relocate_worker{};
+    auto const state = startBlockedRelocation(worker, tor, target_dir.sv());
+    ASSERT_NE(nullptr, state);
+
+    // the relocate thread is stuck mid-copy; cancelling must not join it
+    auto const began = std::chrono::steady_clock::now();
+    EXPECT_TRUE(worker.cancel(tor->info_hash()));
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+    EXPECT_LT(elapsed.count(), PromptMsec);
+
+    // ...and it says so straight away, rather than looking ignored
+    EXPECT_EQ(TR_RELOC_CANCELLING, state->last_state.load());
+
+    state->release();
+    EXPECT_TRUE(waitFor([&state]() { return state->cancelled.load(); }, MaxWaitMsec));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(RelocateWorkerTest, removeDoesNotWaitButStillCleansUpAfterTheCopyStops)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/remove-target"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    auto worker = tr_relocate_worker{};
+    auto const state = startBlockedRelocation(worker, tor, target_dir.sv());
+    ASSERT_NE(nullptr, state);
+
+    auto cleaned_up = std::make_shared<std::atomic<bool>>(false);
+    auto const began = std::chrono::steady_clock::now();
+    worker.remove(tor->info_hash(), [cleaned_up]() { cleaned_up->store(true); });
+    auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - began);
+    EXPECT_LT(elapsed.count(), PromptMsec);
+
+    // ...and the staged files are not touched while the copy is still running
+    EXPECT_FALSE(cleaned_up->load());
+
+    state->release();
+    EXPECT_TRUE(waitFor([&cleaned_up]() { return cleaned_up->load(); }, MaxWaitMsec));
 
     tr_torrentRemove(tor, false, nullptr, nullptr);
 }

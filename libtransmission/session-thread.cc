@@ -3,9 +3,11 @@
 // or any future license endorsed by Mnemosyne LLC.
 // License text can be found in the licenses/ folder.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <list>
 #include <memory>
@@ -22,6 +24,7 @@
 #include <event2/event.h>
 #include <event2/thread.h>
 
+#include "libtransmission/io-trace.h"
 #include "libtransmission/session-thread.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/utils-ev.h"
@@ -205,7 +208,7 @@ public:
     void queue(std::function<void(void)>&& func) override
     {
         work_queue_mutex_.lock();
-        work_queue_.emplace_back(std::move(func));
+        work_queue_.emplace_back(std::chrono::steady_clock::now(), std::move(func));
         work_queue_mutex_.unlock();
 
         event_active(work_queue_event_.get(), 0, {});
@@ -224,7 +227,9 @@ public:
     }
 
 private:
-    using callback = std::function<void(void)>;
+    // Each task is stamped when it is queued so on_work_available() can report
+    // how long the session thread made it wait; see Op::SessionThreadWait.
+    using callback = std::pair<std::chrono::steady_clock::time_point, std::function<void(void)>>;
     using work_queue_t = std::list<callback>;
 
     void session_thread_func(struct event_base* evbase)
@@ -276,8 +281,20 @@ private:
         work_queue_lock.unlock();
 
         // process the work queue
-        for (auto const& func : work_queue)
+        for (auto const& [queued_at, func] : work_queue)
         {
+            // measured per task, not per batch: a task that blocks the session
+            // thread shows up as the wait of everything queued behind it
+            auto const waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - queued_at)
+                                    .count();
+            tr_io_trace::record(
+                tr_io_trace::Op::SessionThreadWait,
+                static_cast<std::uint64_t>(std::max(decltype(waited){ 0 }, waited)),
+                -1,
+                0U,
+                0U,
+                {});
             func();
         }
     }
