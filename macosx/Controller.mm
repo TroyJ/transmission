@@ -120,6 +120,9 @@ static CGFloat const kStatusBarHeight = 24.0;
 static CGFloat const kFilterBarHeight = 24.0;
 static CGFloat const kBottomBarHeight = 24.0;
 
+// how long a start waits for the free-space statfs before starting regardless
+static NSTimeInterval const kDiskSpaceCheckDeadline = 1.0;
+
 static NSTimeInterval const kUpdateUISeconds = 1.0;
 static NSTimeInterval const kInternetStateGreenFreshSeconds = 5.0 * 60.0;
 static NSTimeInterval const kInternetStateIncomingProofFreshSeconds = 10.0 * 60.0;
@@ -3075,7 +3078,48 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
         {
             torrent.pendingCommand = TorrentPendingCommandStart; // still on its way
         }
-        dispatch_async(self.fTorrentCommandQueue, ^{
+
+        // The statfs is advisory: on a stalled volume it can take a minute,
+        // and a torrent left on "Starting…" for that long reads as ignored.
+        // So it gets its own (concurrent) queue and a deadline; whichever
+        // answers first decides, and a late answer is dropped -- the torrent
+        // is running by then, and a write that fails still surfaces as a
+        // torrent error.
+        __block BOOL decided = NO;
+        void (^decide)(NSArray<Torrent*>*, NSArray<Torrent*>*) = ^(NSArray<Torrent*>* enough, NSArray<Torrent*>* needAlert) {
+            if (decided)
+            {
+                return;
+            }
+            decided = YES;
+
+            NSMutableArray<Torrent*>* anyway = [NSMutableArray arrayWithArray:enough];
+            for (Torrent* torrent in needAlert)
+            {
+                if ([torrent presentRemainingDiskSpaceAlert])
+                {
+                    [anyway addObject:torrent];
+                }
+                else
+                {
+                    torrent.pendingCommand = TorrentPendingCommandNone;
+                }
+            }
+            if (anyway.count > 0)
+            {
+                [self runTorrentCommand:TorrentPendingCommandStart onTorrents:anyway
+                                  block:^(Torrent* /*torrent*/, tr_torrent* torrentStruct) {
+                                      ignoreQueue ? tr_torrentStartNow(torrentStruct) : tr_torrentStart(torrentStruct);
+                                  }
+                             completion:nil];
+            }
+            else if (!self.fQuitting)
+            {
+                [self fullUpdateUI];
+            }
+        };
+
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             NSMutableArray<Torrent*>* enough = [NSMutableArray array];
             NSMutableArray<Torrent*>* needAlert = [NSMutableArray array];
             for (Torrent* torrent in checked)
@@ -3083,33 +3127,19 @@ void onTorrentCompletenessChanged(tr_torrent* tor, tr_completeness status, bool 
                 BOOL const ok = [Torrent hasEnoughRemainingDiskSpaceForNeed:needs[@(torrent.torrentId)]];
                 [ok ? enough : needAlert addObject:torrent];
             }
-
             dispatch_async(dispatch_get_main_queue(), ^{
-                NSMutableArray<Torrent*>* anyway = [NSMutableArray arrayWithArray:enough];
-                for (Torrent* torrent in needAlert)
-                {
-                    if ([torrent presentRemainingDiskSpaceAlert])
-                    {
-                        [anyway addObject:torrent];
-                    }
-                    else
-                    {
-                        torrent.pendingCommand = TorrentPendingCommandNone;
-                    }
-                }
-                if (anyway.count > 0)
-                {
-                    [self runTorrentCommand:TorrentPendingCommandStart onTorrents:anyway
-                                      block:^(Torrent* /*torrent*/, tr_torrent* torrentStruct) {
-                                          ignoreQueue ? tr_torrentStartNow(torrentStruct) : tr_torrentStart(torrentStruct);
-                                      }
-                                 completion:nil];
-                }
-                else if (!self.fQuitting)
-                {
-                    [self fullUpdateUI];
-                }
+                decide(enough, needAlert);
             });
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDiskSpaceCheckDeadline * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!decided)
+            {
+                NSLog(
+                    @"free-space check did not answer within %.1fs (volume stalled?); starting %lu torrent(s) without it",
+                    kDiskSpaceCheckDeadline,
+                    (unsigned long)checked.count);
+                decide(checked, @[]);
+            }
         });
     }];
 }
