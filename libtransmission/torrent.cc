@@ -2217,6 +2217,43 @@ void tr_torrent::RelocateMediator::on_relocate_state_changed(
         });
 }
 
+bool tr_torrent::RelocateMediator::wait_for_pending_writes(std::atomic<bool> const& abort_flag)
+{
+    /* stop_now() queues the torrent's writes and closes without waiting for
+     * them, because pausing must not wait on the disk. A copy that started
+     * before they landed would miss the last blocks written -- and the source
+     * it missed them in is deleted afterwards. So the relocate thread waits for
+     * them here, on its own thread, before reading anything. */
+    auto const done_promise = std::make_shared<std::promise<bool>>();
+    auto done_future = done_promise->get_future();
+
+    auto const posted = session_->post(
+        [torrent_id = torrent_id_, done_promise](tr_session* const session)
+        {
+            if (auto* const tor = session->torrents().get(torrent_id); tor == nullptr || tor->is_deleting_)
+            {
+                done_promise->set_value(false);
+                return;
+            }
+
+            session->close_torrent_files_async(torrent_id, [done_promise]() { done_promise->set_value(true); });
+        });
+    if (!posted)
+    {
+        return false;
+    }
+
+    while (done_future.wait_for(std::chrono::milliseconds{ 100 }) != std::future_status::ready)
+    {
+        if (abort_flag || !session_->is_alive())
+        {
+            return false;
+        }
+    }
+
+    return done_future.get();
+}
+
 bool tr_torrent::RelocateMediator::on_verified_location_ready()
 {
     // The answer arrives through a promise that the posted task owns jointly

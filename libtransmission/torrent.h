@@ -10,6 +10,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef> // size_t
 #include <cstdint> // uint64_t, uint16_t
 #include <ctime>
@@ -198,6 +199,7 @@ struct tr_torrent
             uint64_t rate_bps,
             std::string_view error) override;
 
+        [[nodiscard]] bool wait_for_pending_writes(std::atomic<bool> const& abort_flag) override;
         [[nodiscard]] bool on_verified_location_ready() override;
         void on_source_deleted() override;
 

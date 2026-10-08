@@ -342,33 +342,25 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     return std::string{ base };
 }
 
-[[nodiscard]] auto existing_completed_bytes(tr_relocate_worker::Snapshot const& snapshot)
+/* How much of a file there is to move: what is on disk. For a torrent with
+ * unwanted or unfinished files that can stop short of the file's length in the
+ * torrent, or be nothing at all (nullopt). Like upstream's synchronous move,
+ * the relocation moves what is there; the torrent's piece bookkeeping already
+ * says which of those bytes are good. */
+[[nodiscard]] std::optional<uint64_t> source_length(
+    tr_relocate_worker::Snapshot const& snapshot,
+    Journal const& journal,
+    tr_file_index_t const file_index)
 {
-    auto bytes = uint64_t{};
-    for (tr_file_index_t file_index = 0, n_files = snapshot.metainfo.file_count(); file_index < n_files; ++file_index)
+    if (auto const size = file_size_if_exists(source_path(snapshot, journal, file_index)); size)
     {
-        auto const file_size = snapshot.metainfo.file_size(file_index);
-        if (file_size == 0U)
-        {
-            continue;
-        }
-
-        if (auto const size = file_size_if_exists(final_path(snapshot, file_index)); size && *size == file_size)
-        {
-            bytes += file_size;
-            continue;
-        }
-
-        if (auto const size = file_size_if_exists(temp_path(snapshot, file_index)); size)
-        {
-            bytes += std::min(*size, file_size);
-        }
+        return std::min(*size, snapshot.metainfo.file_size(file_index));
     }
 
-    return bytes;
+    return {};
 }
 
-[[nodiscard]] bool all_final_files_ready(tr_relocate_worker::Snapshot const& snapshot)
+[[nodiscard]] bool all_final_files_ready(tr_relocate_worker::Snapshot const& snapshot, Journal const& journal)
 {
     for (tr_file_index_t file_index = 0, n_files = snapshot.metainfo.file_count(); file_index < n_files; ++file_index)
     {
@@ -384,7 +376,14 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             return false;
         }
 
-        if (auto const size = file_size_if_exists(final); !size || *size != file_size)
+        // no source: nothing was there to move, or it was moved and its source already deleted
+        auto const length = source_length(snapshot, journal, file_index);
+        if (!length)
+        {
+            continue;
+        }
+
+        if (auto const size = file_size_if_exists(final); !size || *size != *length)
         {
             return false;
         }
@@ -412,12 +411,13 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     return probe;
 }
 
-[[nodiscard]] bool preflight_target_capacity(tr_relocate_worker::Snapshot const& snapshot, tr_error* const error)
+// Runs after recover_copy_state(), so the journal's totals count only what is on disk to move.
+[[nodiscard]] bool preflight_target_capacity(
+    tr_relocate_worker::Snapshot const& snapshot,
+    Journal const& journal,
+    tr_error* const error)
 {
-    auto const already_present = existing_completed_bytes(snapshot);
-    auto const bytes_needed = snapshot.metainfo.total_size() > already_present ?
-        snapshot.metainfo.total_size() - already_present :
-        0U;
+    auto const bytes_needed = journal.bytes_total > journal.bytes_copied ? journal.bytes_total - journal.bytes_copied : 0U;
     if (bytes_needed == 0U)
     {
         return true;
@@ -500,18 +500,31 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     tr_relocate_worker::Snapshot const& snapshot,
     Journal const& journal,
     tr_file_index_t const file_index,
+    uint64_t const length,
     tr_error* const error)
 {
-    auto const file_size = snapshot.metainfo.file_size(file_index);
     auto const dst = temp_path(snapshot, file_index);
-    auto const existing_size = file_size_if_exists(dst);
-    if (!existing_size)
+    auto const dst_info = tr_sys_path_get_info(dst, 0);
+    if (!dst_info || !dst_info->isFile())
     {
         return 0U;
     }
 
-    auto candidate_size = std::min(*existing_size, file_size);
-    if (*existing_size > file_size && !truncate_file_to(dst, file_size, error))
+    /* A staged copy that is not newer than its source was taken before the
+     * source's last write. That is the normal case after a failed relocation:
+     * the torrent resumes and keeps downloading into the source, and the
+     * one-chunk comparison below can't see a block written in the middle of
+     * the file. Start such a file over. */
+    auto const src = source_path(snapshot, journal, file_index);
+    if (auto const src_info = tr_sys_path_get_info(src, 0);
+        !src_info || src_info->last_modified_at >= dst_info->last_modified_at)
+    {
+        return 0U;
+    }
+
+    auto const existing_size = dst_info->size;
+    auto candidate_size = std::min(existing_size, length);
+    if (existing_size > length && !truncate_file_to(dst, length, error))
     {
         return 0U;
     }
@@ -521,7 +534,6 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         return 0U;
     }
 
-    auto const src = source_path(snapshot, journal, file_index);
     auto const source_fd = tr_sys_file_open(src.c_str(), TR_SYS_FILE_READ | TR_SYS_FILE_SEQUENTIAL, 0, error);
     if (source_fd == TR_BAD_SYS_FILE)
     {
@@ -542,7 +554,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
 
     if (candidate_size < CopyChunkSize)
     {
-        if (candidate_size == file_size &&
+        if (candidate_size == length &&
             compare_file_region(source_fd, dest_fd, 0U, candidate_size, source_buffer, dest_buffer, error))
         {
             validated_size = candidate_size;
@@ -572,18 +584,34 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
 
 [[nodiscard]] bool recover_copy_state(tr_relocate_worker::Snapshot const& snapshot, Journal& journal, tr_error* const error)
 {
-    journal.bytes_total = snapshot.metainfo.total_size();
+    auto const n_files = snapshot.metainfo.file_count();
+    auto lengths = std::vector<std::optional<uint64_t>>(n_files);
+    journal.bytes_total = 0U;
+    for (tr_file_index_t file_index = 0; file_index < n_files; ++file_index)
+    {
+        lengths[file_index] = source_length(snapshot, journal, file_index);
+        journal.bytes_total += lengths[file_index].value_or(0U);
+    }
+
     journal.bytes_copied = 0U;
     journal.file_index = 0U;
     journal.file_offset = 0U;
 
+    // Every file is checked, not just up to the first unfinished one:
+    // copy_file() resumes from whatever staged copy it finds, so a stale one
+    // left past that point would otherwise be trusted unchecked.
     auto found_partial = false;
-    for (tr_file_index_t file_index = 0, n_files = snapshot.metainfo.file_count(); file_index < n_files; ++file_index)
+    for (tr_file_index_t file_index = 0; file_index < n_files; ++file_index)
     {
         auto const file_size = snapshot.metainfo.file_size(file_index);
 
         if (file_size == 0U)
         {
+            if (found_partial)
+            {
+                continue;
+            }
+
             if (tr_sys_path_exists(final_path(snapshot, file_index)) || tr_sys_path_exists(temp_path(snapshot, file_index)))
             {
                 journal.file_index = file_index + 1U;
@@ -595,15 +623,27 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             continue;
         }
 
-        if (auto const final_size = file_size_if_exists(final_path(snapshot, file_index));
-            final_size && *final_size == file_size)
+        auto const length = lengths[file_index];
+        if (!length)
         {
-            journal.bytes_copied += file_size;
-            journal.file_index = file_index + 1U;
+            if (!found_partial)
+            {
+                journal.file_index = file_index + 1U;
+            }
+            continue; // nothing on disk to move
+        }
+
+        if (auto const final_size = file_size_if_exists(final_path(snapshot, file_index)); final_size && *final_size == *length)
+        {
+            journal.bytes_copied += *length;
+            if (!found_partial)
+            {
+                journal.file_index = file_index + 1U;
+            }
             continue;
         }
 
-        auto const recovered_size = validated_temp_boundary(snapshot, journal, file_index, error);
+        auto const recovered_size = validated_temp_boundary(snapshot, journal, file_index, *length, error);
         if (error != nullptr && *error)
         {
             return false;
@@ -616,7 +656,12 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         }
 
         journal.bytes_copied += recovered_size;
-        if (recovered_size >= file_size)
+        if (found_partial)
+        {
+            continue;
+        }
+
+        if (recovered_size >= *length)
         {
             journal.file_index = file_index + 1U;
             journal.file_offset = 0U;
@@ -626,12 +671,11 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         journal.file_index = file_index;
         journal.file_offset = recovered_size;
         found_partial = true;
-        break;
     }
 
     if (!found_partial)
     {
-        journal.file_index = snapshot.metainfo.file_count();
+        journal.file_index = n_files;
         journal.file_offset = 0U;
     }
 
@@ -653,6 +697,16 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     tr_error* const error)
 {
     auto const file_size = snapshot.metainfo.file_size(file_index);
+    auto const length = source_length(snapshot, journal, file_index);
+    if (file_size != 0U && !length)
+    {
+        // nothing on disk to move
+        journal.file_index = file_index + 1U;
+        journal.file_offset = 0U;
+        return true;
+    }
+
+    auto const bytes_to_copy = length.value_or(0U);
     auto const src = source_path(snapshot, journal, file_index);
     auto const dst = temp_path(snapshot, file_index);
 
@@ -662,19 +716,19 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
     }
 
     auto offset = uint64_t{};
-    if (auto const size = file_size_if_exists(final_path(snapshot, file_index)); size && *size == file_size)
+    if (auto const size = file_size_if_exists(final_path(snapshot, file_index)); size && *size == bytes_to_copy)
     {
         journal.file_index = file_index + 1U;
         journal.file_offset = 0U;
         return true;
     }
 
-    if (auto const existing_size = file_size_if_exists(dst); existing_size && *existing_size <= file_size)
+    if (auto const existing_size = file_size_if_exists(dst); existing_size && *existing_size <= bytes_to_copy)
     {
         offset = *existing_size;
     }
     else if (auto const oversized_existing_size = file_size_if_exists(dst);
-             oversized_existing_size && *oversized_existing_size > file_size)
+             oversized_existing_size && *oversized_existing_size > bytes_to_copy)
     {
         tr_sys_path_remove(dst, nullptr);
     }
@@ -710,7 +764,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         return false;
     }
 
-    while (offset < file_size)
+    while (offset < bytes_to_copy)
     {
         if (abort_flag)
         {
@@ -720,7 +774,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             return false;
         }
 
-        auto const this_pass = std::min<uint64_t>(file_size - offset, std::size(buffer));
+        auto const this_pass = std::min<uint64_t>(bytes_to_copy - offset, std::size(buffer));
         auto bytes_read = uint64_t{};
         if (!tr_sys_file_read_at(in, std::data(buffer), this_pass, offset, &bytes_read, error) || bytes_read == 0U)
         {
@@ -792,7 +846,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         }
     }
 
-    if (!tr_sys_file_truncate(out, file_size, error) || !tr_sys_file_close(out, error) || !tr_sys_file_close(in, error))
+    if (!tr_sys_file_truncate(out, bytes_to_copy, error) || !tr_sys_file_close(out, error) || !tr_sys_file_close(in, error))
     {
         return false;
     }
@@ -815,7 +869,7 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
         return false;
     }
 
-    if (!preflight_target_capacity(snapshot, error))
+    if (!preflight_target_capacity(snapshot, journal, error))
     {
         return false;
     }
@@ -1038,13 +1092,19 @@ void remove_journal(tr_relocate_worker::Snapshot const& snapshot)
             continue;
         }
 
-        if (auto const size = file_size_if_exists(final); size && *size == file_size)
+        auto const length = source_length(snapshot, journal, file_index);
+        if (auto const size = file_size_if_exists(final); size && length && *size == *length)
         {
             continue;
         }
 
         if (!tr_sys_path_exists(tmp))
         {
+            if (!length)
+            {
+                continue; // nothing on disk to move, or an earlier attempt moved it and deleted its source
+            }
+
             if (error != nullptr)
             {
                 error->set(ENOENT, fmt::format("Missing relocation temporary file '{}'", tmp));
@@ -1436,7 +1496,7 @@ void tr_relocate_worker::relocate_thread_func(std::shared_ptr<State> const state
             }
         };
 
-        if (journal.phase == TR_RELOC_DELETING_SOURCE && all_final_files_ready(snapshot))
+        if (journal.phase == TR_RELOC_DELETING_SOURCE && all_final_files_ready(snapshot, journal))
         {
             if (!mediator.on_verified_location_ready())
             {
@@ -1466,7 +1526,11 @@ void tr_relocate_worker::relocate_thread_func(std::shared_ptr<State> const state
             continue;
         }
 
-        auto ok = copy_files(snapshot, journal, mediator, st.stop_current, &error);
+        auto ok = mediator.wait_for_pending_writes(st.stop_current);
+        if (ok)
+        {
+            ok = copy_files(snapshot, journal, mediator, st.stop_current, &error);
+        }
         if (ok && VerifyRelocatedDataByDefault)
         {
             ok = verify_files(snapshot, journal, mediator, st.stop_current, &error);

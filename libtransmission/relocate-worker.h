@@ -64,6 +64,10 @@ public:
             uint64_t rate_bps,
             std::string_view error) = 0;
 
+        // Returns once the torrent's queued writes are on disk, so the copy
+        // reads whole source files. False if the wait was given up on.
+        [[nodiscard]] virtual bool wait_for_pending_writes(std::atomic<bool> const& abort_flag) = 0;
+
         [[nodiscard]] virtual bool on_verified_location_ready() = 0;
         virtual void on_source_deleted() = 0;
     };

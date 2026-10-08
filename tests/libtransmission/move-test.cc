@@ -7,12 +7,15 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <libtransmission/transmission.h>
 
@@ -286,6 +289,121 @@ TEST_F(MoveTest, setLocationWithMoveProbesForLocalDataOffTheSessionLock)
     tr_torrentRemove(tor, true, nullptr, nullptr);
 }
 
+TEST_F(MoveTest, setLocationMovesWhatIsOnDiskOfATorrentWithUnwantedFiles)
+{
+    // What a torrent with deselected files looks like on disk: a file that
+    // stops where the last piece it shares with a wanted file ends, and a file
+    // never created. Live, the move failed with "Couldn't read ... at N bytes".
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/target-unwanted"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    auto const source_dir = std::string{ tor->current_dir().sv() };
+    auto const source_path = [&](tr_file_index_t const i)
+    {
+        return tr_pathbuf{ source_dir, '/', tr_torrentFile(tor, i).name };
+    };
+    auto const target_path = [&](tr_file_index_t const i)
+    {
+        return tr_pathbuf{ target_dir, '/', tr_torrentFile(tor, i).name };
+    };
+
+    static auto constexpr ShortLength = uint64_t{ 40000U };
+    ASSERT_LT(ShortLength, tr_torrentFile(tor, 0).length);
+    {
+        auto const fd = tr_sys_file_open(source_path(0), TR_SYS_FILE_WRITE, 0);
+        ASSERT_NE(TR_BAD_SYS_FILE, fd);
+        ASSERT_TRUE(tr_sys_file_truncate(fd, ShortLength));
+        ASSERT_TRUE(tr_sys_file_close(fd));
+    }
+    ASSERT_TRUE(tr_sys_path_remove(source_path(2)));
+    blockingTorrentVerify(tor);
+    auto const have_valid = tr_torrentStat(tor)->haveValid;
+    ASSERT_LT(0U, have_valid);
+    ASSERT_LT(0U, tr_torrentStat(tor)->leftUntilDone);
+
+    auto state = -1;
+    tr_torrentSetLocation(tor, target_dir, true, &state);
+    ASSERT_TRUE(waitFor([&state]() { return state == TR_LOC_DONE || state == TR_LOC_ERROR; }, MaxWaitMsec));
+    EXPECT_EQ(TR_LOC_DONE, state) << tr_torrentStat(tor)->relocationErrorString;
+    EXPECT_TRUE(waitForRelocationToFinish(tor, MaxWaitMsec));
+    EXPECT_EQ(std::string_view{ target_dir }, tor->download_dir().sv());
+
+    // what was there moved as it was, and nothing was made up for what wasn't
+    auto const short_info = tr_sys_path_get_info(target_path(0));
+    ASSERT_TRUE(short_info);
+    EXPECT_EQ(ShortLength, short_info->size);
+    auto const whole_info = tr_sys_path_get_info(target_path(1));
+    ASSERT_TRUE(whole_info);
+    EXPECT_EQ(tr_torrentFile(tor, 1).length, whole_info->size);
+    EXPECT_FALSE(tr_sys_path_exists(target_path(2)));
+    for (tr_file_index_t i = 0, n = tr_torrentFileCount(tor); i < n; ++i)
+    {
+        EXPECT_FALSE(tr_sys_path_exists(source_path(i))) << source_path(i);
+        EXPECT_FALSE(tr_sys_path_exists(tr_pathbuf{ target_path(i), ".trreloc."sv, tor->info_hash_string(), ".tmp"sv }));
+    }
+
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(have_valid, tr_torrentStat(tor)->haveValid);
+
+    tr_torrentRemove(tor, true, nullptr, nullptr);
+}
+
+TEST_F(MoveTest, relocationCopiesABlockStillQueuedForTheSource)
+{
+    // Pausing for a move does not wait for the torrent's queued writes, so the
+    // relocation has to: a block that lands in the source after its bytes were
+    // copied is lost when the source is deleted.
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial); // its first piece holds 0x01s, not zeroes
+    ASSERT_NE(nullptr, tor);
+    auto const source_dir = std::string{ tor->current_dir().sv() };
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/target-queued"sv };
+    tr_sys_dir_create(target_dir.data(), TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+    ASSERT_FALSE(tr_strv_starts_with(target_dir.sv(), source_dir));
+
+    // every write to the source is slow, so the block is still on its way when the move starts
+    tr_io_trace::set_injected_delay(
+        std::chrono::milliseconds{ 500 },
+        1U << static_cast<unsigned>(tr_io_trace::Op::Write),
+        source_dir);
+
+    // one block of zeroes for the first piece -- not the whole piece, so the file doesn't complete
+    auto block_written = std::atomic<bool>{ false };
+    session_->run_in_session_thread(
+        [tor, &block_written]()
+        {
+            auto buf = std::make_unique<Cache::BlockData>(tr_block_info::BlockSize);
+            std::fill_n(std::data(*buf), tr_block_info::BlockSize, '\0');
+            tor->session->cache->write_block(tor->id(), 0U, std::move(buf));
+            tor->on_block_received(0U);
+            block_written = true;
+        });
+    ASSERT_TRUE(waitFor([&block_written]() { return block_written.load(); }, MaxWaitMsec));
+
+    auto state = -1;
+    tr_torrentSetLocation(tor, target_dir, true, &state);
+    auto const settled = waitFor([&state]() { return state == TR_LOC_DONE || state == TR_LOC_ERROR; }, MaxWaitMsec * 3);
+    tr_io_trace::set_injected_delay(std::chrono::milliseconds{ 0 });
+    ASSERT_TRUE(settled);
+    EXPECT_EQ(TR_LOC_DONE, state) << tr_torrentStat(tor)->relocationErrorString;
+    ASSERT_TRUE(waitForRelocationToFinish(tor, MaxWaitMsec));
+
+    auto const moved = tr_torrentFindFile(tor, 0);
+    ASSERT_FALSE(std::empty(moved));
+    auto const fd = tr_sys_file_open(moved.c_str(), TR_SYS_FILE_READ, 0);
+    ASSERT_NE(TR_BAD_SYS_FILE, fd);
+    auto buf = std::vector<char>(tr_block_info::BlockSize, '\1');
+    auto n_read = uint64_t{};
+    EXPECT_TRUE(tr_sys_file_read(fd, std::data(buf), std::size(buf), &n_read));
+    tr_sys_file_close(fd);
+    EXPECT_EQ(std::size(buf), n_read);
+    EXPECT_TRUE(std::all_of(std::begin(buf), std::end(buf), [](char const ch) { return ch == '\0'; }))
+        << "the moved file is missing the block that was queued when the move started";
+
+    tr_torrentRemove(tor, true, nullptr, nullptr);
+}
+
 TEST_F(MoveTest, relocationControlPredicates)
 {
     auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
@@ -430,6 +548,11 @@ public:
         state_->cv.wait_for(lock, std::chrono::seconds{ 5 }, [this]() { return state_->released; });
     }
 
+    [[nodiscard]] bool wait_for_pending_writes(std::atomic<bool> const& /*abort_flag*/) override
+    {
+        return true;
+    }
+
     [[nodiscard]] bool on_verified_location_ready() override
     {
         return false;
@@ -442,6 +565,66 @@ public:
 private:
     tr_relocate_worker::Snapshot snapshot_;
     std::shared_ptr<BlockedRelocateState> state_;
+};
+
+// What the relocate thread reported: how many bytes it counted as already
+// copied when it started copying, and whether it is done with the job.
+struct RecordedRelocation
+{
+    std::atomic<int64_t> first_copying_report = -1;
+    std::atomic<bool> finished = false;
+};
+
+// Lets the copy run, then stops the job before it touches the torrent.
+class RecordingRelocateMediator final : public tr_relocate_worker::Mediator
+{
+public:
+    RecordingRelocateMediator(tr_relocate_worker::Snapshot snapshot, std::shared_ptr<RecordedRelocation> recorded)
+        : snapshot_{ std::move(snapshot) }
+        , recorded_{ std::move(recorded) }
+    {
+    }
+
+    [[nodiscard]] tr_relocate_worker::Snapshot const& snapshot() const override
+    {
+        return snapshot_;
+    }
+
+    void on_relocate_state_changed(
+        tr_torrent_relocation_state const state,
+        uint64_t const bytes_copied,
+        uint64_t /*bytes_total*/,
+        uint64_t /*rate_bps*/,
+        std::string_view /*error*/) override
+    {
+        if (state == TR_RELOC_COPYING)
+        {
+            auto unset = int64_t{ -1 };
+            recorded_->first_copying_report.compare_exchange_strong(unset, static_cast<int64_t>(bytes_copied));
+        }
+        else if (state == TR_RELOC_ERROR || state == TR_RELOC_NONE || state == TR_RELOC_CANCELLED)
+        {
+            recorded_->finished.store(true);
+        }
+    }
+
+    [[nodiscard]] bool wait_for_pending_writes(std::atomic<bool> const& /*abort_flag*/) override
+    {
+        return true;
+    }
+
+    [[nodiscard]] bool on_verified_location_ready() override
+    {
+        return false;
+    }
+
+    void on_source_deleted() override
+    {
+    }
+
+private:
+    tr_relocate_worker::Snapshot snapshot_;
+    std::shared_ptr<RecordedRelocation> recorded_;
 };
 
 class RelocateWorkerTest : public SessionTest
@@ -563,6 +746,46 @@ TEST_F(RelocateWorkerTest, shutdownGivesUpOnAParkedCopyAndTheDestructorDoesNotWa
 
     // ...and the journal is still there for the next start to resume from
     EXPECT_TRUE(tr_sys_path_exists(tor->relocation_journal_file()));
+
+    tr_torrentRemove(tor, false, nullptr, nullptr);
+}
+
+TEST_F(RelocateWorkerTest, aStagedCopyOlderThanItsSourceIsCopiedAgain)
+{
+    // After a failed relocation the torrent resumes and keeps writing to the
+    // source, so a retry must not trust what was staged before that -- the
+    // one-chunk spot check can't see a block written in the middle. A staged
+    // copy newer than its source is still resumed from.
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+    auto const source = tr_pathbuf{ tor->current_dir().sv(), '/', tr_torrentFile(tor, 0).name };
+
+    auto const bytes_counted_as_copied = [&](std::string_view const target_name, std::chrono::hours const staged_vs_source)
+    {
+        auto const target_dir = tr_pathbuf{ session_->configDir(), target_name };
+        auto const staged = tr_pathbuf{
+            target_dir, '/', tr_torrentFile(tor, 0).name, ".trreloc."sv, tor->info_hash_string(), ".tmp"sv,
+        };
+        auto parent = tr_pathbuf{ staged.sv() };
+        parent.popdir();
+        tr_sys_dir_create(parent, TR_SYS_DIR_CREATE_PARENTS, 0777, nullptr);
+        std::filesystem::copy_file(source.c_str(), staged.c_str());
+        std::filesystem::last_write_time(staged.c_str(), std::filesystem::last_write_time(source.c_str()) + staged_vs_source);
+
+        auto recorded = std::make_shared<RecordedRelocation>();
+        {
+            auto worker = tr_relocate_worker{};
+            EXPECT_TRUE(worker.add(
+                std::make_unique<RecordingRelocateMediator>(makeSnapshot(tor, target_dir.sv()), recorded),
+                TR_PRI_NORMAL));
+            EXPECT_TRUE(waitFor([&recorded]() { return recorded->finished.load(); }, MaxWaitMsec));
+        }
+        tr_sys_path_remove(tor->relocation_journal_file());
+        return recorded->first_copying_report.load();
+    };
+
+    EXPECT_EQ(0, bytes_counted_as_copied("/stale-staged"sv, -1h));
+    EXPECT_EQ(static_cast<int64_t>(tr_torrentFile(tor, 0).length), bytes_counted_as_copied("/fresh-staged"sv, 1h));
 
     tr_torrentRemove(tor, false, nullptr, nullptr);
 }
